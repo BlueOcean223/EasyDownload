@@ -1,0 +1,109 @@
+# =========================
+# Build outputs
+# =========================
+build/bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# =========================
+# Frontend
+# =========================
+frontend/node_modules/
+frontend/dist/
+frontend/package-lock.json
+
+# =========================
+# Go
+# =========================
+# Go module cache
+go.sum
+
+# Test binary
+*.test
+
+# Output of go coverage
+*.out
+
+# =========================
+# IDE and Editors
+# =========================
+# VS Code
+.vscode/
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# JetBrains IDEs
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# =========================
+# OS generated files
+# =========================
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Linux
+*~
+
+# =========================
+# Logs and temp files
+# =========================
+*.log
+*.tmp
+*.temp
+*.swp
+*.swo
+logs/
+
+# =========================
+# Wails specific
+# =========================
+# Wails dev mode files
+wails.json.bak
+
+# =========================
+# Project specific
+# =========================
+# Config files with sensitive data
+config.json
+config.yaml
+config.yml
+
+# FFmpeg binaries (should be downloaded separately)
+assets/ffmpeg/*.exe
+assets/ffmpeg/*.dll
+assets/ffmpeg/ffmpeg
+assets/ffmpeg/ffprobe
+
+# Downloaded files
+downloads/
+
+# Certificates (if generated locally)
+*.pem
+*.crt
+*.key
+certs/
+
+# AI/IDE assistant folders
+.kiro/
+.cursor/
+.aider*
+
+# Reference folder (if you don't want to track it)
+# reference/

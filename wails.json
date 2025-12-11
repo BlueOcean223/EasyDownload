@@ -1,0 +1,20 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "EasyDownload",
+  "outputfilename": "EasyDownload",
+  "frontend:install": "npm install",
+  "frontend:build": "npm run build",
+  "frontend:dev:watcher": "npm run dev",
+  "frontend:dev:serverUrl": "auto",
+  "author": {
+    "name": "BlueOcean223",
+    "email": "1751259208@qq.com"
+  },
+  "info": {
+    "companyName": "BlueOcean223",
+    "productName": "EasyDownload",
+    "productVersion": "1.0.0",
+    "copyright": "Copyright © 2024 BlueOcean223",
+    "comments": "视频下载工具 - 支持微信视频号嗅探和B站视频下载"
+  }
+}
