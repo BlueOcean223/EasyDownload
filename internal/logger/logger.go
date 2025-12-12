@@ -135,6 +135,11 @@ func (l *Logger) Info(format string, args ...interface{}) {
 	l.log(LevelInfo, "INFO", format, args...)
 }
 
+// Warn logs a warning message
+func (l *Logger) Warn(format string, args ...interface{}) {
+	l.log(LevelInfo, "WARN", format, args...)
+}
+
 // Error logs an error message
 func (l *Logger) Error(format string, args ...interface{}) {
 	l.log(LevelError, "ERROR", format, args...)
@@ -311,6 +316,11 @@ func SetGlobalLogger(logger *Logger) {
 // Info logs an informational message using the global logger
 func Info(format string, args ...interface{}) {
 	GetGlobalLogger().Info(format, args...)
+}
+
+// Warn logs a warning message using the global logger
+func Warn(format string, args ...interface{}) {
+	GetGlobalLogger().Warn(format, args...)
 }
 
 // Error logs an error message using the global logger

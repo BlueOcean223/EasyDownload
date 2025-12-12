@@ -3,6 +3,7 @@ module EasyDownload
 go 1.23
 
 require (
+	github.com/andybalholm/brotli v1.2.0
 	github.com/elazarl/goproxy v1.7.2
 	github.com/getlantern/systray v1.2.2
 	github.com/leanovate/gopter v0.2.11

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -334,6 +335,148 @@ func TestClearResetProperty(t *testing.T) {
 			return len(api.GetDetectedVideos()) == 0
 		},
 		gen.IntRange(0, 100),
+	))
+
+	properties.TestingRun(t)
+}
+
+// **Feature: video-capture-fix, Property 8: 图片代理请求头**
+// For any Bilibili image proxy request, the HTTP request should contain correct User-Agent and Referer headers
+// **Validates: Requirements 4.3**
+func TestImageProxyBilibiliHeadersProperty(t *testing.T) {
+	parameters := gopter.DefaultTestParameters()
+	parameters.MinSuccessfulTests = 100
+	properties := gopter.NewProperties(parameters)
+
+	// Generate Bilibili-like URLs
+	bilibiliDomains := []string{
+		"hdslb.com",
+		"bilibili.com",
+		"bilivideo.com",
+		"biliimg.com",
+	}
+
+	properties.Property("Bilibili URLs get correct headers", prop.ForAll(
+		func(domainIdx int, path string) bool {
+			domain := bilibiliDomains[domainIdx%len(bilibiliDomains)]
+			imageURL := "https://i0." + domain + "/" + path + ".jpg"
+
+			handler := NewImageProxyHandler()
+			req, err := http.NewRequest(http.MethodGet, imageURL, nil)
+			if err != nil {
+				return true // Skip invalid URLs
+			}
+
+			handler.SetRequestHeaders(req, imageURL)
+
+			// Check User-Agent is set
+			userAgent := req.Header.Get("User-Agent")
+			if userAgent == "" {
+				t.Logf("User-Agent is empty for URL: %s", imageURL)
+				return false
+			}
+
+			// Check Referer is set for Bilibili URLs
+			referer := req.Header.Get("Referer")
+			if referer != "https://www.bilibili.com/" {
+				t.Logf("Referer is not correct for Bilibili URL: %s, got: %s", imageURL, referer)
+				return false
+			}
+
+			// Check Origin is set for Bilibili URLs
+			origin := req.Header.Get("Origin")
+			if origin != "https://www.bilibili.com" {
+				t.Logf("Origin is not correct for Bilibili URL: %s, got: %s", imageURL, origin)
+				return false
+			}
+
+			return true
+		},
+		gen.IntRange(0, 3),
+		gen.AlphaString(),
+	))
+
+	properties.TestingRun(t)
+}
+
+// Test that non-Bilibili URLs don't get Bilibili-specific headers
+func TestImageProxyNonBilibiliHeadersProperty(t *testing.T) {
+	parameters := gopter.DefaultTestParameters()
+	parameters.MinSuccessfulTests = 100
+	properties := gopter.NewProperties(parameters)
+
+	properties.Property("Non-Bilibili URLs don't get Bilibili headers", prop.ForAll(
+		func(path string) bool {
+			// Use a non-Bilibili domain
+			imageURL := "https://example.com/" + path + ".jpg"
+
+			handler := NewImageProxyHandler()
+			req, err := http.NewRequest(http.MethodGet, imageURL, nil)
+			if err != nil {
+				return true // Skip invalid URLs
+			}
+
+			handler.SetRequestHeaders(req, imageURL)
+
+			// Check User-Agent is still set (common header)
+			userAgent := req.Header.Get("User-Agent")
+			if userAgent == "" {
+				t.Logf("User-Agent should be set for all URLs")
+				return false
+			}
+
+			// Check Referer is NOT set to Bilibili for non-Bilibili URLs
+			referer := req.Header.Get("Referer")
+			if referer == "https://www.bilibili.com/" {
+				t.Logf("Referer should not be Bilibili for non-Bilibili URL: %s", imageURL)
+				return false
+			}
+
+			return true
+		},
+		gen.AlphaString(),
+	))
+
+	properties.TestingRun(t)
+}
+
+// Test IsBilibiliURL function
+func TestIsBilibiliURLProperty(t *testing.T) {
+	parameters := gopter.DefaultTestParameters()
+	parameters.MinSuccessfulTests = 100
+	properties := gopter.NewProperties(parameters)
+
+	bilibiliDomains := []string{
+		"hdslb.com",
+		"bilibili.com",
+		"bilivideo.com",
+		"biliimg.com",
+	}
+
+	properties.Property("URLs containing Bilibili domains are detected", prop.ForAll(
+		func(domainIdx int, prefix, suffix string) bool {
+			domain := bilibiliDomains[domainIdx%len(bilibiliDomains)]
+			url := "https://" + prefix + "." + domain + "/" + suffix
+
+			return IsBilibiliURL(url)
+		},
+		gen.IntRange(0, 3),
+		gen.AlphaString(),
+		gen.AlphaString(),
+	))
+
+	properties.Property("URLs not containing Bilibili domains are not detected", prop.ForAll(
+		func(url string) bool {
+			// Skip if the random string happens to contain a Bilibili domain
+			for _, domain := range bilibiliDomains {
+				if strings.Contains(url, domain) {
+					return true // Skip this case
+				}
+			}
+
+			return !IsBilibiliURL(url)
+		},
+		gen.AnyString(),
 	))
 
 	properties.TestingRun(t)

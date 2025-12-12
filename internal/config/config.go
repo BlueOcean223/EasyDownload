@@ -37,6 +37,10 @@ type Config struct {
 	UpstreamProxy    string `json:"upstreamProxy"`    // Upstream proxy URL, e.g., http://127.0.0.1:7890
 	UseUpstreamProxy bool   `json:"useUpstreamProxy"` // Whether to use upstream proxy
 
+	// Diagnostics
+	ProxyDebug   bool `json:"proxyDebug"`   // Enable verbose proxy diagnostics logs
+	WeChatNoMITM bool `json:"wechatNoMITM"` // Force pass-through (no MITM) for WeChat Channels hosts
+
 	// Version info
 	Version string `json:"version"`
 }
@@ -61,6 +65,8 @@ func DefaultConfig() *Config {
 		Language:         "zh-CN",
 		UpstreamProxy:    "",
 		UseUpstreamProxy: false,
+		ProxyDebug:       false,
+		WeChatNoMITM:     false,
 		Version:          "1.0.0",
 	}
 }
@@ -293,6 +299,18 @@ func (cm *ConfigManager) Set(key string, value any) error {
 			cm.config.UseUpstreamProxy = v
 		} else {
 			return fmt.Errorf("invalid type for useUpstreamProxy")
+		}
+	case "proxyDebug":
+		if v, ok := value.(bool); ok {
+			cm.config.ProxyDebug = v
+		} else {
+			return fmt.Errorf("invalid type for proxyDebug")
+		}
+	case "wechatNoMITM":
+		if v, ok := value.(bool); ok {
+			cm.config.WeChatNoMITM = v
+		} else {
+			return fmt.Errorf("invalid type for wechatNoMITM")
 		}
 	default:
 		return fmt.Errorf("unknown config key: %s", key)

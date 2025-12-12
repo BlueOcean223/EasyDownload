@@ -8,7 +8,13 @@ export interface DetectedVideo {
   quality: string
   duration: number
   author: string
+  authorAvatar?: string  // Author avatar URL
   timestamp: number
+  decodeKey?: string  // Decryption key for WeChat videos
+  fileSize?: number   // File size in bytes
+  width?: number      // Video width in pixels
+  height?: number     // Video height in pixels
+  isCurrentVideo?: boolean
 }
 
 // Download task status
@@ -75,6 +81,8 @@ export interface AppInfo {
   minimizeToTray: boolean
   showNotification: boolean
   firstRunComplete: boolean
+  proxyDebug?: boolean
+  wechatNoMITM?: boolean
 }
 
 // App status

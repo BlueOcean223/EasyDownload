@@ -13,6 +13,8 @@ export function DownloadBilibiliVideo(arg1:string,arg2:number):Promise<string>;
 
 export function DownloadVideo(arg1:string,arg2:string,arg3:string,arg4:string,arg5:string,arg6:string):Promise<Record<string, any>>;
 
+export function DownloadVideoWithKey(arg1:string,arg2:string,arg3:string,arg4:string,arg5:string,arg6:string,arg7:string):Promise<Record<string, any>>;
+
 export function GetAppInfo():Promise<Record<string, any>>;
 
 export function GetBilibiliSessData():Promise<string>;
@@ -31,11 +33,15 @@ export function GetLanguage():Promise<string>;
 
 export function GetLogDir():Promise<string>;
 
+export function GetProxyDebug():Promise<boolean>;
+
 export function GetProxyPort():Promise<number>;
 
 export function GetTheme():Promise<string>;
 
 export function GetUpstreamProxy():Promise<string>;
+
+export function GetWeChatNoMITM():Promise<boolean>;
 
 export function InstallCert():Promise<void>;
 
@@ -83,6 +89,8 @@ export function SetLanguage(arg1:string):Promise<void>;
 
 export function SetMinimizeToTray(arg1:boolean):Promise<void>;
 
+export function SetProxyDebug(arg1:boolean):Promise<void>;
+
 export function SetShowNotification(arg1:boolean):Promise<void>;
 
 export function SetTheme(arg1:string):Promise<void>;
@@ -90,6 +98,8 @@ export function SetTheme(arg1:string):Promise<void>;
 export function SetUpstreamProxy(arg1:string):Promise<void>;
 
 export function SetUseUpstreamProxy(arg1:boolean):Promise<void>;
+
+export function SetWeChatNoMITM(arg1:boolean):Promise<void>;
 
 export function ShowNotification(arg1:string,arg2:string):Promise<void>;
 

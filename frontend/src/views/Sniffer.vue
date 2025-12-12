@@ -2,12 +2,15 @@
 import { ref, computed } from 'vue'
 import { useAppStore } from '@/stores/app'
 import { NCard, NButton, NEmpty, NSpin, NTag, NSpace, NTooltip, useMessage, NModal, NInput } from 'naive-ui'
+import ProxiedImage from '@/components/ProxiedImage.vue'
 import { 
   PlayCircleOutline, 
   CloudDownloadOutline, 
   TrashOutline,
   RefreshOutline,
-  SearchOutline
+  SearchOutline,
+  LockClosedOutline,
+  StarOutline
 } from '@vicons/ionicons5'
 import type { DetectedVideo } from '@/types'
 
@@ -16,16 +19,24 @@ const message = useMessage()
 const searchQuery = ref('')
 const downloading = ref<Set<string>>(new Set())
 
+// Keep list order as stored (WeChat newest first); only filter by search query
 const filteredVideos = computed(() => {
+  let videos = [...store.detectedVideos]
+  
   if (!searchQuery.value) {
-    return store.detectedVideos
+    return videos
   }
   const query = searchQuery.value.toLowerCase()
-  return store.detectedVideos.filter(v => 
+  return videos.filter(v => 
     v.title.toLowerCase().includes(query) || 
     v.author?.toLowerCase().includes(query)
   )
 })
+
+// Check if a video is the current one
+function isCurrentVideo(video: DetectedVideo) {
+  return !!video.isCurrentVideo
+}
 
 async function downloadVideo(video: DetectedVideo) {
   if (downloading.value.has(video.id)) return
@@ -47,6 +58,31 @@ function formatTime(timestamp: number) {
     hour: '2-digit', 
     minute: '2-digit' 
   })
+}
+
+function formatFileSize(bytes?: number) {
+  if (!bytes || bytes <= 0) return ''
+  const units = ['B', 'KB', 'MB', 'GB']
+  let unitIndex = 0
+  let size = bytes
+  while (size >= 1024 && unitIndex < units.length - 1) {
+    size /= 1024
+    unitIndex++
+  }
+  return `${size.toFixed(1)} ${units[unitIndex]}`
+}
+
+function formatDuration(ms?: number) {
+  if (!ms || ms <= 0) return ''
+  const totalSeconds = Math.floor(ms / 1000)
+  const hours = Math.floor(totalSeconds / 3600)
+  const minutes = Math.floor((totalSeconds % 3600) / 60)
+  const seconds = totalSeconds % 60
+  
+  if (hours > 0) {
+    return `${hours}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`
+  }
+  return `${minutes}:${seconds.toString().padStart(2, '0')}`
 }
 
 function clearAll() {
@@ -124,39 +160,64 @@ function clearAll() {
           v-for="video in filteredVideos" 
           :key="video.id"
           class="video-card cursor-pointer"
+          :class="{ 'current-video': isCurrentVideo(video) }"
           :bordered="false"
           content-style="padding: 0"
           hoverable
         >
           <!-- Thumbnail -->
           <div class="relative aspect-video bg-dark-300 overflow-hidden rounded-t-lg">
-            <img 
-              v-if="video.cover" 
-              :src="video.cover" 
+            <ProxiedImage
+              v-if="video.cover"
+              :src="video.cover"
               :alt="video.title"
-              class="w-full h-full object-cover"
-              loading="lazy"
+              class="w-full h-full"
             />
             <div v-else class="w-full h-full flex items-center justify-center">
               <PlayCircleOutline class="w-12 h-12 text-gray-600" />
             </div>
             
             <!-- Source Badge -->
-            <div class="absolute top-2 left-2">
+            <div class="absolute top-2 left-2 flex gap-1">
               <NTag 
                 :type="video.source === 'wechat' ? 'success' : 'info'" 
                 size="tiny"
               >
                 {{ video.source === 'wechat' ? '视频号' : 'B站' }}
               </NTag>
+              <!-- Current Video Badge -->
+              <NTooltip v-if="isCurrentVideo(video)">
+                <template #trigger>
+                  <NTag type="primary" size="tiny">
+                    <template #icon>
+                      <StarOutline class="w-3 h-3" />
+                    </template>
+                    当前
+                  </NTag>
+                </template>
+                当前正在播放的视频
+              </NTooltip>
+              <!-- Encrypted Badge -->
+              <NTooltip v-if="video.decodeKey">
+                <template #trigger>
+                  <NTag type="warning" size="tiny">
+                    <template #icon>
+                      <LockClosedOutline class="w-3 h-3" />
+                    </template>
+                    加密
+                  </NTag>
+                </template>
+                视频已加密，下载时将自动解密
+              </NTooltip>
             </div>
             
-            <!-- Time Badge -->
-            <div class="absolute bottom-2 right-2">
+            <!-- Duration Badge -->
+            <div v-if="video.duration" class="absolute bottom-2 left-2">
               <span class="text-xs bg-black/70 px-2 py-1 rounded">
-                {{ formatTime(video.timestamp) }}
+                {{ formatDuration(video.duration) }}
               </span>
             </div>
+          
           </div>
           
           <!-- Info -->
@@ -165,11 +226,21 @@ function clearAll() {
               {{ video.title || '未知标题' }}
             </h3>
             
-            <div class="flex items-center justify-between">
+            <div class="flex items-center justify-between mb-2">
               <span class="text-xs text-gray-500">
                 {{ video.author || '未知作者' }}
               </span>
-              
+              <div class="flex items-center gap-2">
+                <span v-if="video.width && video.height" class="text-xs text-gray-400">
+                  {{ video.width }}×{{ video.height }}
+                </span>
+                <span v-if="video.fileSize" class="text-xs text-gray-400">
+                  {{ formatFileSize(video.fileSize) }}
+                </span>
+              </div>
+            </div>
+            
+            <div class="flex items-center justify-end">
               <NButton 
                 type="primary" 
                 size="tiny"
@@ -193,8 +264,43 @@ function clearAll() {
 .line-clamp-2 {
   display: -webkit-box;
   -webkit-line-clamp: 2;
+  line-clamp: 2;
   -webkit-box-orient: vertical;
   overflow: hidden;
+}
+
+/* Current video highlight */
+.current-video {
+  border: 2px solid var(--primary-color, #18a058) !important;
+  box-shadow: 0 0 12px rgba(24, 160, 88, 0.3);
+}
+
+.current-video:hover {
+  box-shadow: 0 0 16px rgba(24, 160, 88, 0.4);
+}
+
+.status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+}
+
+.status-dot.running {
+  background-color: #18a058;
+  animation: pulse 2s infinite;
+}
+
+.status-dot.stopped {
+  background-color: #d03050;
+}
+
+@keyframes pulse {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
 }
 </style>
 

@@ -10,6 +10,7 @@ import (
 	"EasyDownload/assets"
 	"EasyDownload/assets/icons"
 	"EasyDownload/internal/api"
+	"EasyDownload/internal/config"
 	"EasyDownload/internal/downloader"
 	"EasyDownload/internal/ffmpeg"
 	"EasyDownload/internal/proxy"
@@ -30,6 +31,7 @@ type App struct {
 	bilibiliDownloader *downloader.BilibiliDownloader
 	trayManager        *tray.TrayManager
 	ffmpegManager      *ffmpeg.FFmpegManager
+	configManager      *config.ConfigManager
 
 	// Settings
 	proxyPort        int
@@ -42,6 +44,10 @@ type App struct {
 	language         string // "zh-CN" or "en-US"
 	upstreamProxy    string // Upstream proxy URL
 	useUpstreamProxy bool   // Whether to use upstream proxy
+
+	// Diagnostics
+	proxyDebug   bool
+	wechatNoMITM bool
 }
 
 // NewApp creates a new App application struct
@@ -64,12 +70,49 @@ func NewApp() *App {
 		language:         "zh-CN",
 		upstreamProxy:    "",
 		useUpstreamProxy: false,
+		proxyDebug:       false,
+		wechatNoMITM:     false,
 	}
 }
 
 // startup is called when the app starts
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
+
+	// Load persisted config (best-effort)
+	cfgPath := filepath.Join(utils.GetAppDataDir(), "config.json")
+	a.configManager = config.NewConfigManager(cfgPath)
+	if err := a.configManager.Load(); err != nil {
+		log.Printf("Failed to load config: %v", err)
+	}
+	if a.configManager != nil {
+		cfg := a.configManager.Get()
+		if cfg != nil {
+			// Apply config to app fields (only if non-zero/meaningful)
+			if cfg.ProxyPort > 0 {
+				a.proxyPort = cfg.ProxyPort
+			}
+			if cfg.APIPort > 0 {
+				a.apiPort = cfg.APIPort
+			}
+			if cfg.DownloadDir != "" {
+				a.downloadDir = cfg.DownloadDir
+			}
+			a.minimizeToTray = cfg.MinimizeToTray
+			a.showNotification = cfg.ShowNotification
+			a.firstRunComplete = cfg.FirstRunComplete
+			if cfg.Theme != "" {
+				a.theme = cfg.Theme
+			}
+			if cfg.Language != "" {
+				a.language = cfg.Language
+			}
+			a.upstreamProxy = cfg.UpstreamProxy
+			a.useUpstreamProxy = cfg.UseUpstreamProxy
+			a.proxyDebug = cfg.ProxyDebug
+			a.wechatNoMITM = cfg.WeChatNoMITM
+		}
+	}
 
 	// Initialize certificate manager
 	certDir := filepath.Join(utils.GetAppDataDir(), "certs")
@@ -85,7 +128,8 @@ func (a *App) startup(ctx context.Context) {
 
 	// Initialize proxy server
 	a.proxyServer = proxy.NewProxyServer(a.certManager, a.proxyPort)
-	a.proxyServer.SetInjectScript(utils.GetInjectScript(a.apiPort))
+	a.proxyServer.SetDebug(a.proxyDebug)
+	a.proxyServer.SetWeChatNoMITM(a.wechatNoMITM)
 
 	// Initialize system proxy
 	a.systemProxy = proxy.NewSystemProxy()
@@ -148,9 +192,59 @@ func (a *App) startup(ctx context.Context) {
 			Quality:   video.Quality,
 			Duration:  video.Duration,
 			Author:    video.Author,
+			AuthorAvatar: video.AuthorAvatar,
 			Timestamp: video.Timestamp,
+			DecodeKey: video.DecodeKey,
+			FileSize:  video.FileSize,
+			Width:     video.Width,
+			Height:    video.Height,
+			IsCurrent: video.IsCurrent,
 		}
 		runtime.EventsEmit(a.ctx, "video:detected", apiVideo)
+	})
+
+	// Set download callback for one-click download from video page
+	a.proxyServer.GetWeChatHandler().SetDownloadCallback(func(video proxy.WeChatVideoInfo) {
+		log.Printf("Download requested from video page: %s", video.Title)
+
+		// Create unique ID
+		id := fmt.Sprintf("wechat_%d", time.Now().UnixNano())
+
+		// Add to download manager with decodeKey
+		task, err := a.downloadManager.AddTaskWithDecodeKey(
+			id,
+			video.URL,
+			video.Title,
+			video.CoverURL,
+			"wechat",
+			"",
+			video.DecodeKey,
+		)
+		if err != nil {
+			log.Printf("Failed to add download task: %v", err)
+			runtime.EventsEmit(a.ctx, "download:error", map[string]interface{}{
+				"error": err.Error(),
+			})
+			return
+		}
+
+		// Start downloading immediately
+		if err := a.downloadManager.StartTask(id); err != nil {
+			log.Printf("Failed to start download task: %v", err)
+			runtime.EventsEmit(a.ctx, "download:error", map[string]interface{}{
+				"task":  task.TaskToJSON(),
+				"error": err.Error(),
+			})
+			return
+		}
+
+		// Notify frontend
+		runtime.EventsEmit(a.ctx, "download:start", task.TaskToJSON())
+
+		// Show notification
+		if a.trayManager != nil {
+			a.trayManager.ShowNotification("开始下载", video.Title)
+		}
 	})
 
 	// Start internal API server
@@ -314,7 +408,12 @@ func (a *App) RemoveDetectedVideo(id string) {
 
 // DownloadVideo adds a video to the download queue
 func (a *App) DownloadVideo(id, url, title, cover, source, quality string) (map[string]interface{}, error) {
-	task, err := a.downloadManager.AddTask(id, url, title, cover, source, quality)
+	return a.DownloadVideoWithKey(id, url, title, cover, source, quality, "")
+}
+
+// DownloadVideoWithKey adds a video to the download queue with optional decryption key
+func (a *App) DownloadVideoWithKey(id, url, title, cover, source, quality, decodeKey string) (map[string]interface{}, error) {
+	task, err := a.downloadManager.AddTaskWithDecodeKey(id, url, title, cover, source, quality, decodeKey)
 	if err != nil {
 		return nil, err
 	}
@@ -545,6 +644,8 @@ func (a *App) GetAppInfo() map[string]interface{} {
 		"language":         a.language,
 		"upstreamProxy":    a.upstreamProxy,
 		"useUpstreamProxy": a.useUpstreamProxy,
+		"proxyDebug":       a.proxyDebug,
+		"wechatNoMITM":     a.wechatNoMITM,
 	}
 }
 
@@ -659,6 +760,9 @@ func (a *App) SetUpstreamProxy(proxyURL string) {
 	if a.useUpstreamProxy && a.proxyServer != nil {
 		a.proxyServer.SetUpstreamProxy(proxyURL)
 	}
+	if a.configManager != nil {
+		_ = a.configManager.Set("upstreamProxy", proxyURL)
+	}
 }
 
 // IsUseUpstreamProxy returns whether upstream proxy is enabled
@@ -675,5 +779,38 @@ func (a *App) SetUseUpstreamProxy(enabled bool) {
 		} else {
 			a.proxyServer.SetUpstreamProxy("")
 		}
+	}
+	if a.configManager != nil {
+		_ = a.configManager.Set("useUpstreamProxy", enabled)
+	}
+}
+
+// ==================== Proxy Diagnostics Methods ====================
+
+func (a *App) GetProxyDebug() bool {
+	return a.proxyDebug
+}
+
+func (a *App) SetProxyDebug(enabled bool) {
+	a.proxyDebug = enabled
+	if a.proxyServer != nil {
+		a.proxyServer.SetDebug(enabled)
+	}
+	if a.configManager != nil {
+		_ = a.configManager.Set("proxyDebug", enabled)
+	}
+}
+
+func (a *App) GetWeChatNoMITM() bool {
+	return a.wechatNoMITM
+}
+
+func (a *App) SetWeChatNoMITM(enabled bool) {
+	a.wechatNoMITM = enabled
+	if a.proxyServer != nil {
+		a.proxyServer.SetWeChatNoMITM(enabled)
+	}
+	if a.configManager != nil {
+		_ = a.configManager.Set("wechatNoMITM", enabled)
 	}
 }

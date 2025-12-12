@@ -22,6 +22,10 @@ export function DownloadVideo(arg1, arg2, arg3, arg4, arg5, arg6) {
   return window['go']['main']['App']['DownloadVideo'](arg1, arg2, arg3, arg4, arg5, arg6);
 }
 
+export function DownloadVideoWithKey(arg1, arg2, arg3, arg4, arg5, arg6, arg7) {
+  return window['go']['main']['App']['DownloadVideoWithKey'](arg1, arg2, arg3, arg4, arg5, arg6, arg7);
+}
+
 export function GetAppInfo() {
   return window['go']['main']['App']['GetAppInfo']();
 }
@@ -58,6 +62,10 @@ export function GetLogDir() {
   return window['go']['main']['App']['GetLogDir']();
 }
 
+export function GetProxyDebug() {
+  return window['go']['main']['App']['GetProxyDebug']();
+}
+
 export function GetProxyPort() {
   return window['go']['main']['App']['GetProxyPort']();
 }
@@ -68,6 +76,10 @@ export function GetTheme() {
 
 export function GetUpstreamProxy() {
   return window['go']['main']['App']['GetUpstreamProxy']();
+}
+
+export function GetWeChatNoMITM() {
+  return window['go']['main']['App']['GetWeChatNoMITM']();
 }
 
 export function InstallCert() {
@@ -162,6 +174,10 @@ export function SetMinimizeToTray(arg1) {
   return window['go']['main']['App']['SetMinimizeToTray'](arg1);
 }
 
+export function SetProxyDebug(arg1) {
+  return window['go']['main']['App']['SetProxyDebug'](arg1);
+}
+
 export function SetShowNotification(arg1) {
   return window['go']['main']['App']['SetShowNotification'](arg1);
 }
@@ -176,6 +192,10 @@ export function SetUpstreamProxy(arg1) {
 
 export function SetUseUpstreamProxy(arg1) {
   return window['go']['main']['App']['SetUseUpstreamProxy'](arg1);
+}
+
+export function SetWeChatNoMITM(arg1) {
+  return window['go']['main']['App']['SetWeChatNoMITM'](arg1);
 }
 
 export function ShowNotification(arg1, arg2) {

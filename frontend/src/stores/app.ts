@@ -10,6 +10,7 @@ import {
   GetDetectedVideos,
   ClearDetectedVideos,
   DownloadVideo,
+  DownloadVideoWithKey,
   GetDownloads,
   PauseDownload,
   ResumeDownload,
@@ -104,8 +105,103 @@ export const useAppStore = defineStore('app', () => {
   }
 
   function setupEventListeners() {
+    function isBadWeChatTitle(t?: string) {
+      if (!t) return true
+      const s = String(t).trim()
+      if (!s) return true
+      const low = s.toLowerCase()
+      if (low.includes('beginning of dialog window')) return true
+      if (low.includes('escape will cancel')) return true
+      if (low.includes('cancel and close the window')) return true
+      if (low === 'play video' || low.includes('play video')) return true
+      return false
+    }
+
+    function isBadWeChatAuthor(a?: string) {
+      if (!a) return true
+      const s = String(a).trim()
+      if (!s) return true
+      const low = s.toLowerCase()
+      if (low === 'play video' || low.includes('play video')) return true
+      if (low.includes('beginning of dialog window')) return true
+      if (low.includes('escape will cancel')) return true
+      return false
+    }
+
+    function isLikelyBadWeChatURL(u?: string) {
+      if (!u) return true
+      const s = String(u).trim()
+      if (!s) return true
+      const low = s.toLowerCase()
+      // obvious live/stream formats
+      if (low.includes('.m3u8') || low.includes('.flv') || low.includes('.mpd')) return true
+      // chunk-ish worker URLs can slip through; never prefer them
+      if (low.includes('startidx=') || low.includes('size=')) return true
+      // if it's a finder download host, require VOD signature
+      if (low.includes('finder.video.qq.com') || low.includes('findermp.video.qq.com')) {
+        if (!low.includes('stodownload')) return true
+        if (!low.includes('encfilekey=')) return true
+      }
+      return false
+    }
+
+    function mergePreferExisting(oldV: DetectedVideo, next: DetectedVideo): DetectedVideo {
+      // Never allow "degradation" from incomplete/incorrect payloads.
+      const merged: DetectedVideo = { ...oldV, ...next }
+
+      // url: prefer a likely-good VOD url; keep old if new looks bad
+      if (next.url && isLikelyBadWeChatURL(next.url) && oldV.url) {
+        merged.url = oldV.url
+      }
+
+      // title/author: ignore obvious UI placeholders
+      if (isBadWeChatTitle(next.title) && !isBadWeChatTitle(oldV.title)) merged.title = oldV.title
+      if (isBadWeChatAuthor(next.author) && !isBadWeChatAuthor(oldV.author)) merged.author = oldV.author
+
+      // cover: keep old if new is empty
+      if (!next.cover && oldV.cover) merged.cover = oldV.cover
+
+      // duration/fileSize/wh: keep old if new is missing/zero
+      if ((!next.duration || next.duration <= 0) && oldV.duration && oldV.duration > 0) merged.duration = oldV.duration
+      if ((!next.fileSize || next.fileSize <= 0) && oldV.fileSize && oldV.fileSize > 0) merged.fileSize = oldV.fileSize
+      if ((!next.width || next.width <= 0) && oldV.width && oldV.width > 0) merged.width = oldV.width
+      if ((!next.height || next.height <= 0) && oldV.height && oldV.height > 0) merged.height = oldV.height
+
+      // isCurrentVideo: preserve true if either says true
+      if (oldV.isCurrentVideo && !next.isCurrentVideo) merged.isCurrentVideo = true
+
+      return merged
+    }
+
     // Video detected event
     EventsOn('video:detected', (video: DetectedVideo) => {
+      // For WeChat: keep history, but dedupe/update by stable id (pageKey) to avoid spam
+      if (video.source === 'wechat') {
+        // Ensure only ONE card is marked as "当前"
+        if (video.isCurrentVideo) {
+          for (const v of detectedVideos.value) {
+            if (v.source === 'wechat') v.isCurrentVideo = false
+          }
+        }
+
+        // Newest first:
+        // - New id: unshift to front
+        // - Same id: update in place (do not reorder) to avoid UI jumps when metadata refreshes
+        const idx = detectedVideos.value.findIndex(v => v.source === 'wechat' && v.id === video.id)
+        if (idx !== -1) {
+          detectedVideos.value[idx] = mergePreferExisting(detectedVideos.value[idx], video)
+        } else {
+          detectedVideos.value.unshift(video)
+        }
+
+        // cap wechat history (keep other sources untouched)
+        const maxWechat = 80
+        const wechat = detectedVideos.value.filter(v => v.source === 'wechat')
+        const others = detectedVideos.value.filter(v => v.source !== 'wechat')
+        detectedVideos.value = [...wechat.slice(0, maxWechat), ...others]
+        return
+      }
+
       // Check for duplicates
       const exists = detectedVideos.value.some(v => v.url === video.url)
       if (!exists) {
@@ -178,13 +274,15 @@ export const useAppStore = defineStore('app', () => {
 
   async function downloadDetectedVideo(video: DetectedVideo) {
     try {
-      const task = await DownloadVideo(
+      // Use DownloadVideoWithKey if decodeKey is present (for encrypted WeChat videos)
+      const task = await DownloadVideoWithKey(
         video.id,
         video.url,
         video.title,
         video.cover,
         video.source,
-        video.quality
+        video.quality || '',
+        video.decodeKey || ''
       ) as DownloadTask
 
       downloads.value.unshift(task)

@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/leanovate/gopter"
 	"github.com/leanovate/gopter/gen"
@@ -303,9 +304,13 @@ func TestLoggerCleanOldLogs(t *testing.T) {
 	}
 	defer os.RemoveAll(tempDir)
 
-	// Create some old log files
+	// Create some old log files with an old modification time
 	oldLogPath := filepath.Join(tempDir, "old.log")
 	os.WriteFile(oldLogPath, []byte("old log content"), 0644)
+
+	// Set the modification time to 2 hours ago to ensure it's "old"
+	oldTime := time.Now().Add(-2 * time.Hour)
+	os.Chtimes(oldLogPath, oldTime, oldTime)
 
 	logger := NewLogger(tempDir)
 	if err := logger.Init(); err != nil {
@@ -313,8 +318,8 @@ func TestLoggerCleanOldLogs(t *testing.T) {
 	}
 	defer logger.Close()
 
-	// Clean logs older than 0 duration (should clean all except current)
-	logger.CleanOldLogs(0)
+	// Clean logs older than 1 hour (should clean the old.log file)
+	logger.CleanOldLogs(1 * time.Hour)
 
 	// Old log should be removed
 	if _, err := os.Stat(oldLogPath); !os.IsNotExist(err) {

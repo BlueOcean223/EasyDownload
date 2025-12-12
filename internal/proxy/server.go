@@ -16,22 +16,30 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/andybalholm/brotli"
 	"github.com/elazarl/goproxy"
 )
 
 // VideoInfo represents detected video information
 type VideoInfo struct {
-	ID        string `json:"id"`
-	Title     string `json:"title"`
-	Cover     string `json:"cover"`
-	URL       string `json:"url"`
-	Source    string `json:"source"` // "wechat" or "bilibili"
-	Quality   string `json:"quality"`
-	Duration  int    `json:"duration"`
-	Author    string `json:"author"`
-	Timestamp int64  `json:"timestamp"`
+	ID           string  `json:"id"`
+	Title        string  `json:"title"`
+	Cover        string  `json:"cover"`
+	URL          string  `json:"url"`
+	Source       string  `json:"source"` // "wechat" or "bilibili"
+	Quality      string  `json:"quality"`
+	Duration     int     `json:"duration"`
+	Author       string  `json:"author"`
+	AuthorAvatar string  `json:"authorAvatar"`
+	Timestamp    int64   `json:"timestamp"`
+	DecodeKey    string  `json:"decodeKey"` // Decryption key for WeChat videos
+	FileSize     float64 `json:"fileSize"`  // File size in bytes
+	Width        int     `json:"width"`
+	Height       int     `json:"height"`
+	IsCurrent    bool    `json:"isCurrentVideo"`
 }
 
 // ProxyServer represents the MITM proxy server using goproxy
@@ -46,23 +54,61 @@ type ProxyServer struct {
 	// Callback for detected videos
 	onVideoDetected func(VideoInfo)
 
-	// Injection script
-	injectScript string
-
 	// Video URL deduplication
 	detectedURLs sync.Map
 
 	// Upstream proxy support
 	upstreamProxy string
+
+	// Diagnostics
+	debug        bool
+	wechatNoMITM bool
+
+	// WeChat video capture components
+	jsInjector    *JSInjector
+	wechatHandler *WeChatHandler
+
+	// Limit how many res.wx.qq.com JS files we modify per session to reduce breakage risk.
+	wechatJSInjected int32
 }
 
 // NewProxyServer creates a new proxy server instance
 func NewProxyServer(certManager *CertManager, port int) *ProxyServer {
-	return &ProxyServer{
+	ps := &ProxyServer{
 		certManager: certManager,
 		port:        port,
 		running:     false,
 	}
+
+	// Initialize WeChat video capture components
+	ps.jsInjector = NewJSInjector()
+	ps.wechatHandler = NewWeChatHandler()
+
+	// Set up WeChat handler callback to convert to VideoInfo
+	ps.wechatHandler.SetVideoCallback(func(info WeChatVideoInfo) {
+		if ps.onVideoDetected != nil {
+			videoInfo := VideoInfo{
+				ID:           info.ID,
+				Title:        info.Title,
+				Cover:        info.CoverURL,
+				URL:          info.URL,
+				Source:       "wechat",
+				Duration:     info.Duration,
+				Author:       info.Author,
+				AuthorAvatar: info.AuthorAvatar,
+				// Frontend expects milliseconds
+				Timestamp: time.Now().UnixMilli(),
+				DecodeKey: info.DecodeKey,
+				FileSize:  info.FileSize,
+				Width:     info.Width,
+				Height:    info.Height,
+				IsCurrent: info.IsCurrentVideo,
+			}
+			ps.onVideoDetected(videoInfo)
+		}
+	})
+
+	return ps
 }
 
 // SetVideoCallback sets the callback function for detected videos
@@ -70,14 +116,20 @@ func (ps *ProxyServer) SetVideoCallback(callback func(VideoInfo)) {
 	ps.onVideoDetected = callback
 }
 
-// SetInjectScript sets the JavaScript to inject into pages
-func (ps *ProxyServer) SetInjectScript(script string) {
-	ps.injectScript = script
-}
-
 // SetUpstreamProxy sets the upstream proxy URL for proxy chaining
 func (ps *ProxyServer) SetUpstreamProxy(proxyURL string) {
 	ps.upstreamProxy = proxyURL
+}
+
+// SetDebug enables/disables verbose proxy diagnostics logging.
+func (ps *ProxyServer) SetDebug(enabled bool) {
+	ps.debug = enabled
+}
+
+// SetWeChatNoMITM forces pass-through (no MITM) for WeChat Channels hosts.
+// This is used for diagnosis; it disables injection while enabled.
+func (ps *ProxyServer) SetWeChatNoMITM(enabled bool) {
+	ps.wechatNoMITM = enabled
 }
 
 // Start starts the proxy server
@@ -224,35 +276,77 @@ func base64Encode(data []byte) string {
 	return result.String()
 }
 
-// setupHandlers configures the goproxy request and response handlers
-func (ps *ProxyServer) setupHandlers() {
-	// Configure HTTPS MITM only for WeChat page/API domains (not video streaming domains)
-	// Video streaming domains (finder.video.qq.com, findermp.video.qq.com) should pass through
-	// directly to avoid slow video loading
-
-	// MITM for page content and API responses
-	ps.proxy.OnRequest(goproxy.ReqHostMatches(regexp.MustCompile(`channels\.weixin\.qq\.com`))).
-		HandleConnect(goproxy.AlwaysMitm)
-	ps.proxy.OnRequest(goproxy.ReqHostMatches(regexp.MustCompile(`szextshort\.weixin\.qq\.com`))).
-		HandleConnect(goproxy.AlwaysMitm)
-	ps.proxy.OnRequest(goproxy.ReqHostMatches(regexp.MustCompile(`res\.wx\.qq\.com`))).
-		HandleConnect(goproxy.AlwaysMitm)
-
-	// Handle responses for video detection and JS injection (only for MITM'd domains)
-	ps.proxy.OnResponse(goproxy.ReqHostMatches(regexp.MustCompile(`(channels\.weixin\.qq\.com|szextshort\.weixin\.qq\.com|res\.wx\.qq\.com)`))).
-		DoFunc(ps.handleResponse)
+// MITMDomains returns the list of domains that should have MITM enabled.
+// These are page content domains where we need to inject scripts.
+// Video streaming domains are NOT included to ensure smooth video playback.
+func MITMDomains() []string {
+	return []string{
+		"channels.weixin.qq.com", // WeChat video channel pages
+		"res.wx.qq.com",          // WeChat static resources (JS files for injection)
+		"wxapp.tc.qq.com",        // Fake domain for injected JS to send data
+	}
 }
 
-// shouldInterceptHost checks if we should intercept traffic for this host
-func (ps *ProxyServer) shouldInterceptHost(host string) bool {
-	interceptHosts := []string{
-		"channels.weixin.qq.com",
-		"finder.video.qq.com",
-		"szextshort.weixin.qq.com",
-		"findermp.video.qq.com",
+// PassThroughDomains returns the list of video streaming domains that should
+// NOT have MITM enabled. These domains pass through directly to avoid
+// performance issues with video loading.
+func PassThroughDomains() []string {
+	return []string{
+		"finder.video.qq.com",      // WeChat video streaming
+		"findermp.video.qq.com",    // WeChat video streaming (alternate)
+		"szextshort.weixin.qq.com", // WeChat short video streaming
+		"mpvideo.qpic.cn",          // WeChat video CDN
 	}
+}
 
-	for _, h := range interceptHosts {
+// setupHandlers configures the goproxy request and response handlers
+func (ps *ProxyServer) setupHandlers() {
+	// Unified CONNECT handler:
+	// - MITM only for allowlisted page/static domains (channels.weixin.qq.com, res.wx.qq.com, wxapp.tc.qq.com)
+	// - Direct pass-through for video streaming domains to avoid slow playback
+	// - Default pass-through for everything else to reduce overhead
+	videoStreamingPattern := regexp.MustCompile(`(finder\.video\.qq\.com|findermp\.video\.qq\.com|szextshort\.weixin\.qq\.com|mpvideo\.qpic\.cn)`)
+	ps.proxy.OnRequest().HandleConnectFunc(func(host string, ctx *goproxy.ProxyCtx) (*goproxy.ConnectAction, string) {
+		start := time.Now()
+		action := "OK"
+		switch {
+		case videoStreamingPattern.MatchString(host):
+			action = "OK(stream)"
+			if ps.debug {
+				logger.Info("[proxy-debug] CONNECT %s -> %s (%s)", host, action, time.Since(start))
+			}
+			return goproxy.OkConnect, host
+		case ps.wechatNoMITM && (strings.Contains(host, "channels.weixin.qq.com") || strings.Contains(host, "res.wx.qq.com")):
+			action = "OK(wechatNoMITM)"
+			if ps.debug {
+				logger.Info("[proxy-debug] CONNECT %s -> %s (%s)", host, action, time.Since(start))
+			}
+			return goproxy.OkConnect, host
+		case ps.shouldInterceptHost(host):
+			action = "MITM"
+			if ps.debug {
+				logger.Info("[proxy-debug] CONNECT %s -> %s (%s)", host, action, time.Since(start))
+			}
+			return goproxy.MitmConnect, host
+		default:
+			if ps.debug {
+				logger.Info("[proxy-debug] CONNECT %s -> %s (%s)", host, action, time.Since(start))
+			}
+			return goproxy.OkConnect, host
+		}
+	})
+	logger.Info("Configured CONNECT handling: MITM allowlist + streaming passthrough")
+
+	// Set up WeChat-specific handlers
+	ps.setupWeChatHandlers()
+}
+
+// shouldInterceptHost checks if we should intercept traffic for this host.
+// This only returns true for MITM domains where we need to inject scripts.
+// Video streaming domains are NOT intercepted to ensure smooth playback.
+func (ps *ProxyServer) shouldInterceptHost(host string) bool {
+	// Only intercept MITM domains (page content domains)
+	for _, h := range MITMDomains() {
 		if strings.Contains(host, h) || strings.HasSuffix(host, h) {
 			return true
 		}
@@ -260,123 +354,34 @@ func (ps *ProxyServer) shouldInterceptHost(host string) bool {
 	return false
 }
 
-// handleResponse processes HTTP responses for video detection and JS injection
-func (ps *ProxyServer) handleResponse(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
-	if resp == nil {
-		return resp
-	}
-
-	contentType := resp.Header.Get("Content-Type")
-
-	// Skip processing for video/binary content to avoid slow loading
-	if strings.Contains(contentType, "video/") ||
-		strings.Contains(contentType, "audio/") ||
-		strings.Contains(contentType, "application/octet-stream") {
-		return resp
-	}
-
-	url := ""
-	if ctx.Req != nil {
-		url = ctx.Req.URL.String()
-	}
-
-	// Read response body
-	body, err := readResponseBody(resp)
-	if err != nil {
-		logger.Error("Failed to read response body: %v", err)
-		return resp
-	}
-
-	// Inject script into HTML responses
-	if strings.Contains(contentType, "text/html") && ps.injectScript != "" {
-		body = ps.injectScriptIntoHTML(body)
-	}
-
-	// Detect video URLs in JSON responses
-	if strings.Contains(contentType, "application/json") || strings.Contains(contentType, "text/plain") {
-		ps.detectVideoInResponse(url, body, contentType)
-	}
-
-	// Create new response with modified body
-	resp.Body = io.NopCloser(bytes.NewReader(body))
-	resp.ContentLength = int64(len(body))
-	resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(body)))
-	resp.Header.Del("Content-Encoding") // Remove encoding since we decoded it
-
-	return resp
-}
-
-// readResponseBody reads and decompresses the response body
-func readResponseBody(resp *http.Response) ([]byte, error) {
+// readResponseBody reads and (if possible) decompresses the response body.
+// Returns:
+// - body: response bytes (decoded if supported encoding)
+// - decoded: true if Content-Encoding was decoded (gzip/br) and body is now plain
+func readResponseBody(resp *http.Response) (body []byte, decoded bool, err error) {
 	if resp.Body == nil {
-		return []byte{}, nil
+		return []byte{}, false, nil
 	}
 
-	var body []byte
-	var err error
-
-	encoding := resp.Header.Get("Content-Encoding")
+	encoding := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding")))
 	switch encoding {
 	case "gzip":
 		gzReader, gzErr := gzip.NewReader(resp.Body)
 		if gzErr != nil {
-			// If gzip fails, try reading raw
-			return io.ReadAll(resp.Body)
+			// If gzip fails, fall back to raw (but mark as not decoded)
+			body, err = io.ReadAll(resp.Body)
+			return body, false, err
 		}
 		defer gzReader.Close()
 		body, err = io.ReadAll(gzReader)
+		return body, err == nil, err
+	case "br":
+		brReader := brotli.NewReader(resp.Body)
+		body, err = io.ReadAll(brReader)
+		return body, err == nil, err
 	default:
 		body, err = io.ReadAll(resp.Body)
-	}
-
-	return body, err
-}
-
-// injectScriptIntoHTML injects JavaScript into HTML content
-func (ps *ProxyServer) injectScriptIntoHTML(body []byte) []byte {
-	html := string(body)
-
-	// Find </body> or </html> and inject script before it
-	scriptTag := fmt.Sprintf("<script>%s</script>", ps.injectScript)
-
-	if idx := strings.LastIndex(strings.ToLower(html), "</body>"); idx != -1 {
-		html = html[:idx] + scriptTag + html[idx:]
-	} else if idx := strings.LastIndex(strings.ToLower(html), "</html>"); idx != -1 {
-		html = html[:idx] + scriptTag + html[idx:]
-	} else {
-		html = html + scriptTag
-	}
-
-	return []byte(html)
-}
-
-// detectVideoInResponse detects video URLs in response content
-func (ps *ProxyServer) detectVideoInResponse(url string, body []byte, contentType string) {
-	bodyStr := string(body)
-
-	// WeChat video URL patterns
-	videoPatterns := []string{
-		`"url"\s*:\s*"(https?://[^"]*finder\.video\.qq\.com[^"]*)"`,
-		`"url"\s*:\s*"(https?://[^"]*findermp\.video\.qq\.com[^"]*)"`,
-		`"url"\s*:\s*"(https?://[^"]*\.video\.qq\.com[^"]*\.mp4[^"]*)"`,
-	}
-
-	for _, pattern := range videoPatterns {
-		re := regexp.MustCompile(pattern)
-		matches := re.FindAllStringSubmatch(bodyStr, -1)
-		for _, match := range matches {
-			if len(match) > 1 {
-				videoURL := match[1]
-				// Check for duplicate URLs
-				if ps.addVideoURL(videoURL) {
-					// Extract more info if available
-					info := ps.extractVideoInfo(bodyStr, videoURL)
-					if ps.onVideoDetected != nil {
-						ps.onVideoDetected(info)
-					}
-				}
-			}
-		}
+		return body, false, err
 	}
 }
 
@@ -391,38 +396,379 @@ func (ps *ProxyServer) ClearDetectedURLs() {
 	ps.detectedURLs = sync.Map{}
 }
 
-// extractVideoInfo extracts video metadata from JSON response
-func (ps *ProxyServer) extractVideoInfo(jsonStr, videoURL string) VideoInfo {
-	info := VideoInfo{
-		ID:        fmt.Sprintf("%d", time.Now().UnixNano()),
-		URL:       videoURL,
-		Source:    "wechat",
-		Timestamp: time.Now().Unix(),
+// setupWeChatHandlers configures WeChat-specific request and response handlers
+func (ps *ProxyServer) setupWeChatHandlers() {
+	// Handle requests to /res-downloader/wechat endpoint (from injected JS)
+	ps.proxy.OnRequest(goproxy.ReqHostMatches(regexp.MustCompile(`wxapp\.tc\.qq\.com`))).
+		DoFunc(ps.handleWeChatAPIRequest)
+
+	// Handle same-origin requests to /res-downloader/wechat from channels.weixin.qq.com
+	// (We inject a script into Channels pages and post back to the same origin.)
+	ps.proxy.OnRequest(goproxy.ReqHostMatches(regexp.MustCompile(`channels\.weixin\.qq\.com`))).
+		DoFunc(ps.handleWeChatAPIRequest)
+
+	// Diagnostics: capture WeChat page error reports (contains useful JS error details)
+	ps.proxy.OnRequest(goproxy.ReqHostMatches(regexp.MustCompile(`channels\.weixin\.qq\.com`))).
+		DoFunc(ps.handleWeChatReportRequest)
+
+	// Handle JS responses from res.wx.qq.com for injection
+	ps.proxy.OnResponse(goproxy.ReqHostMatches(regexp.MustCompile(`res\.wx\.qq\.com`))).
+		DoFunc(ps.handleWeChatJSResponse)
+
+	// Handle HTML responses from channels.weixin.qq.com for version injection
+	ps.proxy.OnResponse(goproxy.ReqHostMatches(regexp.MustCompile(`channels\.weixin\.qq\.com`))).
+		DoFunc(ps.handleWeChatHTMLResponse)
+}
+
+// handleWeChatReportRequest logs request bodies for /web/report-error and /web/report-perf
+// to help diagnose why the Channels page fails under MITM.
+func (ps *ProxyServer) handleWeChatReportRequest(r *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
+	if !ps.debug || r == nil {
+		return r, nil
+	}
+	if !strings.Contains(r.URL.Path, "/web/report-") {
+		return r, nil
 	}
 
-	// Try to extract title
-	titlePattern := regexp.MustCompile(`"title"\s*:\s*"([^"]*)"`)
-	if matches := titlePattern.FindStringSubmatch(jsonStr); len(matches) > 1 {
-		info.Title = matches[1]
+	// Only log the known endpoints to reduce noise
+	if !strings.Contains(r.URL.Path, "/web/report-error") && !strings.Contains(r.URL.Path, "/web/report-perf") {
+		return r, nil
 	}
 
-	// Try to extract cover
-	coverPattern := regexp.MustCompile(`"thumbUrl"\s*:\s*"([^"]*)"`)
-	if matches := coverPattern.FindStringSubmatch(jsonStr); len(matches) > 1 {
-		info.Cover = matches[1]
+	var bodyBytes []byte
+	if r.Body != nil {
+		b, err := io.ReadAll(r.Body)
+		if err == nil {
+			bodyBytes = b
+		}
+		_ = r.Body.Close()
+		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 	}
-	if info.Cover == "" {
-		coverPattern = regexp.MustCompile(`"coverUrl"\s*:\s*"([^"]*)"`)
-		if matches := coverPattern.FindStringSubmatch(jsonStr); len(matches) > 1 {
-			info.Cover = matches[1]
+
+	// Avoid dumping huge bodies; keep first 8KB
+	const maxLog = 8 * 1024
+	logBody := bodyBytes
+	truncated := false
+	if len(logBody) > maxLog {
+		logBody = logBody[:maxLog]
+		truncated = true
+	}
+	logger.Info("[proxy-debug] REPORT %s %s ct=%q len=%d truncated=%v body=%s",
+		r.Method,
+		r.URL.String(),
+		r.Header.Get("Content-Type"),
+		len(bodyBytes),
+		truncated,
+		string(logBody),
+	)
+
+	return r, nil
+}
+
+// handleWeChatAPIRequest handles POST requests to /res-downloader/wechat
+// Supports type=1/2 (video detection) and type=download (trigger download)
+func (ps *ProxyServer) handleWeChatAPIRequest(r *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
+	// Only handle requests to our fake endpoint
+	if !strings.Contains(r.URL.Path, "/res-downloader/wechat") {
+		return r, nil
+	}
+
+	// Only handle POST requests
+	if r.Method != "POST" {
+		return r, nil
+	}
+
+	// Get request type from query parameter
+	reqType := r.URL.Query().Get("type")
+	if reqType == "" {
+		reqType = "1" // Default to video detection
+	}
+
+	// Read request body
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		logger.Error("Failed to read WeChat request body: %v", err)
+		return r, goproxy.NewResponse(r, goproxy.ContentTypeText, http.StatusBadRequest, "Bad Request")
+	}
+	r.Body.Close()
+
+	if ps.debug {
+		// Avoid dumping huge bodies; keep first 2KB
+		const maxLog = 2 * 1024
+		logBody := body
+		truncated := false
+		if len(logBody) > maxLog {
+			logBody = logBody[:maxLog]
+			truncated = true
+		}
+		logger.Info("[proxy-debug] WECHAT_API %s %s host=%q type=%q len=%d truncated=%v body=%s",
+			r.Method,
+			r.URL.String(),
+			r.Host,
+			reqType,
+			len(body),
+			truncated,
+			string(logBody),
+		)
+	}
+
+	// Heartbeat from injected scripts to help diagnose whether script is running at all.
+	if reqType == "ping" {
+		if ps.debug {
+			logger.Info("[proxy-debug] WECHAT_PING host=%q len=%d", r.Host, len(body))
+		}
+		return r, goproxy.NewResponse(r, goproxy.ContentTypeText, http.StatusOK, "OK")
+	}
+
+	// Low-frequency trace from injected scripts (throttled on client side).
+	// Useful to confirm whether injected hooks are being executed and what they see.
+	if reqType == "trace" {
+		if ps.debug {
+			logger.Info("[proxy-debug] WECHAT_TRACE host=%q len=%d body=%s", r.Host, len(body), string(body))
+		}
+		return r, goproxy.NewResponse(r, goproxy.ContentTypeText, http.StatusOK, "OK")
+	}
+
+	// Process the request through WeChatHandler with type
+	if err := ps.wechatHandler.HandleWeChatRequestWithType(body, reqType); err != nil {
+		logger.Debug("WeChat request processing (type=%s): %v", reqType, err)
+	}
+
+	// Return a success response to the injected JS
+	return r, goproxy.NewResponse(r, goproxy.ContentTypeText, http.StatusOK, "OK")
+}
+
+// handleWeChatJSResponse handles JS responses from res.wx.qq.com for injection
+// It processes two types of JS files:
+// 1. Target files (virtual_svg-icons-register): Apply both injection AND version rewriting
+// 2. Other versioned JS files: Apply only version rewriting to their internal imports
+func (ps *ProxyServer) handleWeChatJSResponse(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
+	if resp == nil || ctx.Req == nil {
+		return resp
+	}
+
+	requestPath := ctx.Req.URL.String()
+	if ps.debug {
+		logger.Info("[proxy-debug] RESP res.wx.qq.com %s status=%d enc=%q ct=%q", requestPath, resp.StatusCode, resp.Header.Get("Content-Encoding"), resp.Header.Get("Content-Type"))
+	}
+
+	contentType := resp.Header.Get("Content-Type")
+	// Only process JavaScript files
+	if !strings.Contains(contentType, "javascript") && !strings.Contains(contentType, "text/plain") {
+		if ps.debug {
+			logger.Info("[proxy-debug] SKIP js (content-type): %s ct=%q", requestPath, contentType)
+		}
+		return resp
+	}
+
+	// Read raw bytes first so we can keep pass-through responses unchanged if we decide not to inject.
+	rawBody, err := readResponseBodyRaw(resp)
+	if err != nil {
+		logger.Error("Failed to read JS response body: %v", err)
+		return resp
+	}
+
+	encoding := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding")))
+	decodedBody, decoded, derr := decodeBodyBytes(rawBody, encoding)
+	if derr != nil {
+		// Can't inspect/modify; keep original body/headers intact
+		if ps.debug {
+			logger.Info("[proxy-debug] SKIP js (decode failed enc=%q): %s", encoding, requestPath)
+		}
+		return resp
+	}
+
+	jsContent := string(decodedBody)
+
+	// Decide whether to inject:
+	// - Always inject into virtual_svg-icons-register (known-safe)
+	// - Additionally, inject into a SMALL number of finder bundles that actually contain our target patterns.
+	isTargetFile := ps.jsInjector.IsTargetJSFile(requestPath)
+	isFinderBundle := strings.Contains(requestPath, "/t/wx_fed/finder/web/web-finder/res/js/") &&
+		strings.HasSuffix(strings.Split(requestPath, "?")[0], ".js") &&
+		strings.Contains(requestPath, "publish")
+	hasCandidate := strings.Contains(jsContent, "finderGetCommentDetail") || strings.Contains(jsContent, "get media")
+
+	if !isTargetFile && !(isFinderBundle && hasCandidate) {
+		if ps.debug {
+			logger.Info("[proxy-debug] SKIP js (pass-through): %s", requestPath)
+		}
+		return resp
+	}
+
+	// Enforce injection budget for non-target bundles to avoid reintroducing playback issues.
+	const maxWeChatJSInjections = int32(4)
+	if !isTargetFile && atomic.LoadInt32(&ps.wechatJSInjected) >= maxWeChatJSInjections {
+		if ps.debug {
+			logger.Info("[proxy-debug] SKIP js (budget reached %d): %s", maxWeChatJSInjections, requestPath)
+		}
+		return resp
+	}
+
+	modifiedJS := ps.jsInjector.InjectAll(jsContent)
+	if modifiedJS == jsContent {
+		// No changes (regex didn't match); keep original bytes/headers
+		if ps.debug {
+			logger.Info("[proxy-debug] SKIP js (no injection match): %s", requestPath)
+		}
+		return resp
+	}
+
+	if !isTargetFile {
+		atomic.AddInt32(&ps.wechatJSInjected, 1)
+	}
+	logger.Info("Injected capture code into WeChat JS file: %s", ctx.Req.URL.Path)
+
+	// Create new response with modified body
+	modifiedBody := []byte(modifiedJS)
+	resp.Body = io.NopCloser(bytes.NewReader(modifiedBody))
+	resp.ContentLength = int64(len(modifiedBody))
+	resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(modifiedBody)))
+	// We are serving plain JS bytes now; remove encoding to avoid mismatches.
+	if decoded || strings.TrimSpace(resp.Header.Get("Content-Encoding")) != "" {
+		resp.Header.Del("Content-Encoding")
+	}
+	if ps.debug {
+		logger.Info("[proxy-debug] REWRITE js done: %s decoded=%v in=%d out=%d", requestPath, decoded, len(jsContent), len(modifiedBody))
+	}
+
+	return resp
+}
+
+// readResponseBodyRaw reads the response body as-is and restores it, so we can decide later whether to modify.
+func readResponseBodyRaw(resp *http.Response) ([]byte, error) {
+	if resp.Body == nil {
+		return []byte{}, nil
+	}
+	raw, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	// Restore the original bytes for pass-through
+	resp.Body = io.NopCloser(bytes.NewReader(raw))
+	return raw, err
+}
+
+// decodeBodyBytes decodes gzip/br response bodies from raw bytes for inspection/modification.
+// Returns decoded bytes, a decoded flag (true if encoding was decoded), and error if decoding failed.
+func decodeBodyBytes(raw []byte, encoding string) ([]byte, bool, error) {
+	switch encoding {
+	case "gzip":
+		gr, err := gzip.NewReader(bytes.NewReader(raw))
+		if err != nil {
+			return nil, false, err
+		}
+		defer gr.Close()
+		b, err := io.ReadAll(gr)
+		return b, err == nil, err
+	case "br":
+		br := brotli.NewReader(bytes.NewReader(raw))
+		b, err := io.ReadAll(br)
+		return b, err == nil, err
+	default:
+		// no encoding
+		return raw, false, nil
+	}
+}
+
+// handleWeChatHTMLResponse handles HTML responses from channels.weixin.qq.com
+// to add version parameters to JS links for cache busting and inject download button script
+func (ps *ProxyServer) handleWeChatHTMLResponse(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
+	if resp == nil {
+		return resp
+	}
+
+	contentType := resp.Header.Get("Content-Type")
+	if ps.debug && ctx != nil && ctx.Req != nil {
+		logger.Info("[proxy-debug] RESP channels.weixin.qq.com %s status=%d enc=%q ct=%q", ctx.Req.URL.String(), resp.StatusCode, resp.Header.Get("Content-Encoding"), contentType)
+	}
+	// Only process HTML responses
+	if !strings.Contains(contentType, "text/html") {
+		if ps.debug && ctx != nil && ctx.Req != nil {
+			logger.Info("[proxy-debug] SKIP html (content-type): %s ct=%q", ctx.Req.URL.String(), contentType)
+		}
+		return resp
+	}
+
+	// Read response body (decode gzip/br if possible)
+	body, decoded, err := readResponseBody(resp)
+	if err != nil {
+		logger.Error("Failed to read HTML response body: %v", err)
+		return resp
+	}
+	// If Content-Encoding exists but we couldn't decode it, do NOT modify this response
+	if !decoded && strings.TrimSpace(resp.Header.Get("Content-Encoding")) != "" {
+		if ps.debug && ctx != nil && ctx.Req != nil {
+			logger.Info("[proxy-debug] SKIP html (cannot decode enc=%q): %s", resp.Header.Get("Content-Encoding"), ctx.Req.URL.String())
+		}
+		return resp
+	}
+
+	// Add version to JS links
+	htmlContent := string(body)
+	modifiedHTML := ps.jsInjector.AddVersionToJSLinks(htmlContent)
+
+	// Inject download button script into HTML
+	modifiedHTML = ps.injectDownloadButtonScript(modifiedHTML)
+
+	// Create new response with modified body
+	modifiedBody := []byte(modifiedHTML)
+	resp.Body = io.NopCloser(bytes.NewReader(modifiedBody))
+	resp.ContentLength = int64(len(modifiedBody))
+	resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(modifiedBody)))
+	// Remove encoding only if we decoded it
+	if decoded {
+		resp.Header.Del("Content-Encoding")
+	}
+	if ps.debug && ctx != nil && ctx.Req != nil {
+		logger.Info("[proxy-debug] REWRITE html done: %s decoded=%v out=%d", ctx.Req.URL.String(), decoded, len(modifiedBody))
+	}
+
+	return resp
+}
+
+// injectDownloadButtonScript injects the download button JavaScript into HTML content
+func (ps *ProxyServer) injectDownloadButtonScript(htmlContent string) string {
+	downloadScript := ps.jsInjector.GetDownloadButtonScript()
+	if downloadScript == "" {
+		return htmlContent
+	}
+
+	scriptTag := fmt.Sprintf("<script>%s</script>", downloadScript)
+
+	// Prefer injecting early (inside <head>) so fetch/XHR hooks are installed
+	// before the page's main bundles execute.
+	lowerHTML := strings.ToLower(htmlContent)
+
+	// Insert right after <head ...> if present
+	if headIdx := strings.Index(lowerHTML, "<head"); headIdx != -1 {
+		if gtIdx := strings.Index(lowerHTML[headIdx:], ">"); gtIdx != -1 {
+			insertAt := headIdx + gtIdx + 1
+			return htmlContent[:insertAt] + scriptTag + htmlContent[insertAt:]
 		}
 	}
 
-	// Try to extract author
-	authorPattern := regexp.MustCompile(`"nickname"\s*:\s*"([^"]*)"`)
-	if matches := authorPattern.FindStringSubmatch(jsonStr); len(matches) > 1 {
-		info.Author = matches[1]
+	// Fallback: insert before the first <script ...> to be as early as possible
+	if scriptIdx := strings.Index(lowerHTML, "<script"); scriptIdx != -1 {
+		return htmlContent[:scriptIdx] + scriptTag + htmlContent[scriptIdx:]
 	}
 
-	return info
+	// Last resorts: before </body> / </html> / append
+	if idx := strings.LastIndex(lowerHTML, "</body>"); idx != -1 {
+		return htmlContent[:idx] + scriptTag + htmlContent[idx:]
+	}
+	if idx := strings.LastIndex(lowerHTML, "</html>"); idx != -1 {
+		return htmlContent[:idx] + scriptTag + htmlContent[idx:]
+	}
+
+	// If no closing tags found, append to end
+	return htmlContent + scriptTag
+}
+
+// GetWeChatHandler returns the WeChat handler instance
+func (ps *ProxyServer) GetWeChatHandler() *WeChatHandler {
+	return ps.wechatHandler
+}
+
+// GetJSInjector returns the JS injector instance
+func (ps *ProxyServer) GetJSInjector() *JSInjector {
+	return ps.jsInjector
 }

@@ -9,9 +9,7 @@ import (
 	"fmt"
 	"math/big"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"runtime"
 	"time"
 )
 
@@ -149,49 +147,6 @@ func (cm *CertManager) LoadCACert() (*x509.Certificate, *rsa.PrivateKey, error) 
 	return cert, privateKey, nil
 }
 
-// IsCertInstalled checks if the CA certificate is installed in the system trust store
-func (cm *CertManager) IsCertInstalled() bool {
-	if runtime.GOOS != "windows" {
-		return false
-	}
-
-	// Check if certificate exists in Windows cert store
-	cmd := exec.Command("certutil", "-verifystore", "Root", "EasyDownload Root CA")
-	err := cmd.Run()
-	return err == nil
-}
-
-// InstallCert installs the CA certificate to the system trust store
-func (cm *CertManager) InstallCert() error {
-	if runtime.GOOS != "windows" {
-		return fmt.Errorf("certificate installation only supported on Windows")
-	}
-
-	// Use certutil to add certificate to Trusted Root Certification Authorities
-	cmd := exec.Command("certutil", "-addstore", "-f", "Root", cm.CertPath)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("failed to install certificate: %w, output: %s", err, string(output))
-	}
-
-	return nil
-}
-
-// UninstallCert removes the CA certificate from the system trust store
-func (cm *CertManager) UninstallCert() error {
-	if runtime.GOOS != "windows" {
-		return fmt.Errorf("certificate uninstallation only supported on Windows")
-	}
-
-	cmd := exec.Command("certutil", "-delstore", "Root", "EasyDownload Root CA")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("failed to uninstall certificate: %w, output: %s", err, string(output))
-	}
-
-	return nil
-}
-
 // GetCertPath returns the certificate path
 func (cm *CertManager) GetCertPath() string {
 	return cm.CertPath
@@ -201,4 +156,3 @@ func (cm *CertManager) GetCertPath() string {
 func (cm *CertManager) GetKeyPath() string {
 	return cm.KeyPath
 }
-

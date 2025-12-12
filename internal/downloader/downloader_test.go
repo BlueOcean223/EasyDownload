@@ -27,6 +27,7 @@ func TestSanitizeFileName(t *testing.T) {
 		{"file\"with\"quotes", "file_with_quotes"},
 		{"file<with>brackets", "file_with_brackets"},
 		{"file|with|pipes", "file_with_pipes"},
+		{"line1\nline2\r\nline3\tend", "line1_line2_line3_end"},
 		{"", ""},
 	}
 
@@ -127,8 +128,8 @@ func TestAddTask(t *testing.T) {
 	if task.Status != StatusPending {
 		t.Errorf("task.Status = %s, want pending", task.Status)
 	}
-	if task.FileName != "Test Video.mp4" {
-		t.Errorf("task.FileName = %s, want Test Video.mp4", task.FileName)
+	if task.FileName != "Test_Video.mp4" {
+		t.Errorf("task.FileName = %s, want Test_Video.mp4", task.FileName)
 	}
 }
 
@@ -635,5 +636,106 @@ func TestStatePersistenceWithMultipleTasks(t *testing.T) {
 	tasks := dm2.GetAllTasks()
 	if len(tasks) != 5 {
 		t.Errorf("Expected 5 tasks, got %d", len(tasks))
+	}
+}
+
+// TestAddTaskWithDecodeKey tests adding a task with a decryption key
+func TestAddTaskWithDecodeKey(t *testing.T) {
+	dm := NewDownloadManager(os.TempDir(), 3)
+
+	decodeKey := "AAAAAAAAAAAAAAAAAAAAAA==" // Valid base64 encoded key
+
+	task, err := dm.AddTaskWithDecodeKey("test-decrypt", "http://example.com/video.mp4", "Test Video", "", "wechat", "720p", decodeKey)
+	if err != nil {
+		t.Fatalf("AddTaskWithDecodeKey failed: %v", err)
+	}
+
+	if task.DecodeKey != decodeKey {
+		t.Errorf("task.DecodeKey = %s, want %s", task.DecodeKey, decodeKey)
+	}
+	if task.Source != "wechat" {
+		t.Errorf("task.Source = %s, want wechat", task.Source)
+	}
+}
+
+// TestAddTaskWithoutDecodeKey tests that AddTask works without a decode key
+func TestAddTaskWithoutDecodeKey(t *testing.T) {
+	dm := NewDownloadManager(os.TempDir(), 3)
+
+	task, err := dm.AddTask("test-no-decrypt", "http://example.com/video.mp4", "Test Video", "", "bilibili", "720p")
+	if err != nil {
+		t.Fatalf("AddTask failed: %v", err)
+	}
+
+	if task.DecodeKey != "" {
+		t.Errorf("task.DecodeKey should be empty, got %s", task.DecodeKey)
+	}
+}
+
+// TestTaskToJSONIncludesDecodeKey tests that TaskToJSON includes the decodeKey field
+func TestTaskToJSONIncludesDecodeKey(t *testing.T) {
+	decodeKey := "AAAAAAAAAAAAAAAAAAAAAA=="
+	task := &DownloadTask{
+		ID:        "test-id",
+		URL:       "http://example.com/video.mp4",
+		Title:     "Test Video",
+		Status:    StatusPending,
+		DecodeKey: decodeKey,
+	}
+
+	jsonMap := task.TaskToJSON()
+
+	if jsonMap["decodeKey"] != decodeKey {
+		t.Errorf("jsonMap[decodeKey] = %v, want %s", jsonMap["decodeKey"], decodeKey)
+	}
+}
+
+// TestDecodeKeyStatePersistence tests that decodeKey is persisted and restored correctly
+func TestDecodeKeyStatePersistence(t *testing.T) {
+	tempDir := filepath.Join(os.TempDir(), "easydownload_test_decodekey")
+	os.MkdirAll(tempDir, 0755)
+	defer os.RemoveAll(tempDir)
+
+	statePath := filepath.Join(tempDir, "downloads.json")
+	decodeKey := "AAAAAAAAAAAAAAAAAAAAAA=="
+
+	// Create manager and add task with decode key
+	dm1 := NewDownloadManager(tempDir, 3)
+	dm1.SetStatePath(statePath)
+
+	task, err := dm1.AddTaskWithDecodeKey("test-persist", "http://example.com/video.mp4", "Test Video", "", "wechat", "720p", decodeKey)
+	if err != nil {
+		t.Fatalf("AddTaskWithDecodeKey failed: %v", err)
+	}
+
+	task.mu.Lock()
+	task.Status = StatusPaused
+	task.mu.Unlock()
+
+	// Save state
+	if err := dm1.SaveState(); err != nil {
+		t.Fatalf("SaveState failed: %v", err)
+	}
+
+	// Load in new manager
+	dm2 := NewDownloadManager(tempDir, 3)
+	dm2.SetStatePath(statePath)
+
+	if err := dm2.LoadState(); err != nil {
+		t.Fatalf("LoadState failed: %v", err)
+	}
+
+	// Verify decode key was restored
+	loadedTask, err := dm2.GetTask("test-persist")
+	if err != nil {
+		t.Fatalf("GetTask failed: %v", err)
+	}
+
+	loadedTask.mu.RLock()
+	loadedDecodeKey := loadedTask.DecodeKey
+	loadedTask.mu.RUnlock()
+
+	if loadedDecodeKey != decodeKey {
+		t.Errorf("Loaded decodeKey = %s, want %s", loadedDecodeKey, decodeKey)
 	}
 }

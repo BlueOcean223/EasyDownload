@@ -8,11 +8,50 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
+
+func isLiveOrStreamURL(u string) bool {
+	lu := strings.ToLower(strings.TrimSpace(u))
+	if lu == "" {
+		return false
+	}
+	return strings.Contains(lu, ".m3u8") || strings.Contains(lu, ".flv") || strings.Contains(lu, ".mpd")
+}
+
+func isLikelyWeChatVODURL(raw string) (bool, string) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return false, "empty url"
+	}
+	if isLiveOrStreamURL(raw) {
+		return false, "live/stream url"
+	}
+	lu := strings.ToLower(raw)
+	if strings.Contains(lu, "startidx=") || strings.Contains(lu, "size=") {
+		return false, "chunked url (startIdx/size)"
+	}
+	pu, err := url.Parse(raw)
+	if err == nil {
+		host := strings.ToLower(pu.Host)
+		if strings.Contains(host, "finder.video.qq.com") || strings.Contains(host, "findermp.video.qq.com") {
+			if !strings.Contains(lu, "stodownload") {
+				return false, "not stodownload"
+			}
+			if !strings.Contains(lu, "encfilekey=") {
+				return false, "missing encfilekey"
+			}
+		}
+	}
+	return true, ""
+}
 
 // DownloadStatus represents the status of a download
 type DownloadStatus string
@@ -58,6 +97,9 @@ type DownloadTask struct {
 	RetryCount int    `json:"retryCount"`
 	MaxRetry   int    `json:"maxRetry"`
 	LastError  string `json:"lastError"`
+
+	// Decryption fields (for WeChat videos)
+	DecodeKey string `json:"decodeKey"` // Base64-encoded decryption key
 
 	cancel context.CancelFunc
 	mu     sync.RWMutex
@@ -184,12 +226,24 @@ func (dm *DownloadManager) SetErrorCallback(callback func(task *DownloadTask, er
 
 // AddTask adds a new download task
 func (dm *DownloadManager) AddTask(id, url, title, cover, source, quality string) (*DownloadTask, error) {
+	return dm.AddTaskWithDecodeKey(id, url, title, cover, source, quality, "")
+}
+
+// AddTaskWithDecodeKey adds a new download task with an optional decryption key
+func (dm *DownloadManager) AddTaskWithDecodeKey(id, url, title, cover, source, quality, decodeKey string) (*DownloadTask, error) {
 	dm.tasksMu.Lock()
 	defer dm.tasksMu.Unlock()
 
 	// Check if task already exists
 	if _, exists := dm.tasks[id]; exists {
 		return nil, fmt.Errorf("task with ID %s already exists", id)
+	}
+
+	// Final safety: reject obvious WeChat live/invalid/chunk URLs so users don't download corrupt files
+	if strings.ToLower(strings.TrimSpace(source)) == "wechat" {
+		if ok, reason := isLikelyWeChatVODURL(url); !ok {
+			return nil, fmt.Errorf("invalid wechat video url (%s)", reason)
+		}
 	}
 
 	// Generate filename
@@ -212,6 +266,7 @@ func (dm *DownloadManager) AddTask(id, url, title, cover, source, quality string
 		CreatedAt:  time.Now().Unix(),
 		RetryCount: 0,
 		MaxRetry:   dm.maxRetry,
+		DecodeKey:  decodeKey,
 	}
 
 	dm.tasks[id] = task
@@ -548,6 +603,34 @@ func (dm *DownloadManager) performDownload(task *DownloadTask) error {
 		}
 	}
 
+	// Check if decryption is needed
+	task.mu.RLock()
+	decodeKey := task.DecodeKey
+	taskFilePath := task.FilePath
+	task.mu.RUnlock()
+
+	if decodeKey != "" {
+		// Some WeChat "stodownload" URLs may already return a normal MP4 even if decodeKey is present.
+		// Never decrypt a file that already looks like a valid container, otherwise we corrupt it.
+		if ValidateVideoFormat(taskFilePath) {
+			logger.Info("Skip decryption (already valid video): %s", taskFilePath)
+		} else {
+			logger.Info("Decrypting video file: %s", taskFilePath)
+			decryptor := NewVideoDecryptor()
+			if err := decryptor.DecryptFile(taskFilePath, decodeKey); err != nil {
+				logger.Error("Failed to decrypt video file: %v", err)
+				// Don't fail the download, just log the error
+				// The file is still saved, user can try manual decryption
+			} else {
+				logger.Info("Video decryption completed: %s", taskFilePath)
+				// Validate the decrypted file format
+				if !ValidateVideoFormat(taskFilePath) {
+					logger.Warn("Decrypted file may not be a valid video format: %s", taskFilePath)
+				}
+			}
+		}
+	}
+
 	// Mark as completed
 	task.mu.Lock()
 	task.Status = StatusCompleted
@@ -590,19 +673,89 @@ func (dm *DownloadManager) handleError(task *DownloadTask, err error) {
 
 // sanitizeFileName removes invalid characters from filename
 func sanitizeFileName(name string) string {
-	// Replace invalid characters
-	invalid := []string{"/", "\\", ":", "*", "?", "\"", "<", ">", "|"}
-	result := name
-	for _, char := range invalid {
-		result = replaceAll(result, char, "_")
+	// Normalize whitespace and remove control characters. Windows file names cannot contain
+	// many characters, and also cannot contain CR/LF which can break paths/logs.
+	result := strings.TrimSpace(name)
+	if result == "" {
+		return ""
 	}
 
-	// Limit length
-	if len(result) > 100 {
-		result = result[:100]
+	// Replace common line separators with spaces first.
+	result = strings.NewReplacer(
+		"\r", " ",
+		"\n", " ",
+		"\t", " ",
+		"\u2028", " ",
+		"\u2029", " ",
+	).Replace(result)
+
+	var b strings.Builder
+	b.Grow(len(result))
+	prevUnderscore := false
+	for _, r := range result {
+		// Drop replacement rune and ASCII control chars
+		if r == utf8.RuneError || r == 0xFFFD {
+			continue
+		}
+		if r < 32 || r == 127 {
+			continue
+		}
+
+		// Convert any whitespace run to a single underscore
+		if unicode.IsSpace(r) {
+			if !prevUnderscore {
+				b.WriteByte('_')
+				prevUnderscore = true
+			}
+			continue
+		}
+
+		// Replace invalid Windows filename chars
+		switch r {
+		case '/', '\\', ':', '*', '?', '"', '<', '>', '|':
+			if !prevUnderscore {
+				b.WriteByte('_')
+				prevUnderscore = true
+			}
+			continue
+		}
+
+		b.WriteRune(r)
+		prevUnderscore = false
 	}
 
-	return result
+	out := b.String()
+	out = strings.Trim(out, " ._")
+	if out == "" {
+		return ""
+	}
+
+	// Avoid Windows reserved device names.
+	upper := strings.ToUpper(out)
+	switch upper {
+	case "CON", "PRN", "AUX", "NUL",
+		"COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+		"LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9":
+		out = "_" + out
+	}
+
+	// Limit length to 100 bytes, but keep UTF-8 rune boundaries.
+	if len(out) > 100 {
+		var cut strings.Builder
+		cut.Grow(100)
+		n := 0
+		for _, r := range out {
+			rl := utf8.RuneLen(r)
+			if rl <= 0 || n+rl > 100 {
+				break
+			}
+			cut.WriteRune(r)
+			n += rl
+		}
+		out = strings.Trim(cut.String(), " ._")
+	}
+
+	return out
 }
 
 func replaceAll(s, old, new string) string {
@@ -685,6 +838,7 @@ func (t *DownloadTask) TaskToJSON() map[string]interface{} {
 		"retryCount":  t.RetryCount,
 		"maxRetry":    t.MaxRetry,
 		"lastError":   t.LastError,
+		"decodeKey":   t.DecodeKey,
 	}
 }
 
@@ -713,6 +867,7 @@ type TaskState struct {
 	RetryCount  int            `json:"retryCount"`
 	MaxRetry    int            `json:"maxRetry"`
 	LastError   string         `json:"lastError"`
+	DecodeKey   string         `json:"decodeKey"`
 }
 
 // SaveState saves the current download state to disk
@@ -749,6 +904,7 @@ func (dm *DownloadManager) SaveState() error {
 			RetryCount:  task.RetryCount,
 			MaxRetry:    task.MaxRetry,
 			LastError:   task.LastError,
+			DecodeKey:   task.DecodeKey,
 		}
 		task.mu.RUnlock()
 
@@ -830,6 +986,7 @@ func (dm *DownloadManager) LoadState() error {
 			RetryCount:  taskState.RetryCount,
 			MaxRetry:    taskState.MaxRetry,
 			LastError:   taskState.LastError,
+			DecodeKey:   taskState.DecodeKey,
 		}
 
 		// Reset downloading/retrying tasks to paused state

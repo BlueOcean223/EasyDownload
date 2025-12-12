@@ -21,7 +21,11 @@ import {
   GetLogDir,
   GetUpstreamProxy,
   SetUpstreamProxy,
-  SetUseUpstreamProxy
+  SetUseUpstreamProxy,
+  GetProxyDebug,
+  SetProxyDebug,
+  GetWeChatNoMITM,
+  SetWeChatNoMITM
 } from '../../wailsjs/go/main/App'
 
 const store = useAppStore()
@@ -32,6 +36,8 @@ const sessData = ref('')
 const savingSessData = ref(false)
 const logDir = ref('')
 const upstreamProxyInput = ref('')
+const proxyDebug = ref(false)
+const wechatNoMITM = ref(false)
 
 onMounted(async () => {
   // Load SESSDATA
@@ -53,6 +59,18 @@ onMounted(async () => {
     upstreamProxyInput.value = await GetUpstreamProxy()
   } catch (e) {
     console.error('Failed to get upstream proxy:', e)
+  }
+
+  // Load diagnostics toggles
+  try {
+    proxyDebug.value = await GetProxyDebug()
+  } catch (e) {
+    console.error('Failed to get proxy debug:', e)
+  }
+  try {
+    wechatNoMITM.value = await GetWeChatNoMITM()
+  } catch (e) {
+    console.error('Failed to get wechatNoMITM:', e)
   }
 })
 
@@ -124,6 +142,26 @@ async function toggleUseUpstreamProxy(value: boolean) {
   }
 }
 
+async function toggleProxyDebug(value: boolean) {
+  try {
+    await SetProxyDebug(value)
+    proxyDebug.value = value
+    message.success(value ? '代理调试已开启（请复现一次问题后导出日志）' : '代理调试已关闭')
+  } catch (e: any) {
+    message.error(e.message || '设置失败')
+  }
+}
+
+async function toggleWeChatNoMITM(value: boolean) {
+  try {
+    await SetWeChatNoMITM(value)
+    wechatNoMITM.value = value
+    message.warning(value ? '已启用视频号直通（将禁用注入/一键下载，仅用于定位）' : '已关闭视频号直通')
+  } catch (e: any) {
+    message.error(e.message || '设置失败')
+  }
+}
+
 async function saveUpstreamProxy() {
   try {
     await SetUpstreamProxy(upstreamProxyInput.value)
@@ -177,6 +215,24 @@ async function saveUpstreamProxy() {
               :value="store.useUpstreamProxy"
               @update:value="toggleUseUpstreamProxy"
             />
+          </div>
+
+          <NDivider class="my-2" />
+
+          <div class="flex items-center justify-between">
+            <div>
+              <p class="text-sm font-medium">代理调试（诊断）</p>
+              <p class="text-xs text-gray-500">记录 CONNECT/编码/改写信息到日志，用于定位视频号卡加载</p>
+            </div>
+            <NSwitch :value="proxyDebug" @update:value="toggleProxyDebug" />
+          </div>
+
+          <div class="flex items-center justify-between">
+            <div>
+              <p class="text-sm font-medium">视频号直通（不 MITM）</p>
+              <p class="text-xs text-gray-500">仅用于定位：channels/res 直通，注入/一键下载会失效</p>
+            </div>
+            <NSwitch :value="wechatNoMITM" @update:value="toggleWeChatNoMITM" />
           </div>
           
           <div v-if="store.useUpstreamProxy">

@@ -9,7 +9,13 @@ export namespace api {
 	    quality: string;
 	    duration: number;
 	    author: string;
+	    authorAvatar: string;
 	    timestamp: number;
+	    decodeKey: string;
+	    fileSize: number;
+	    width: number;
+	    height: number;
+	    isCurrentVideo: boolean;
 	
 	    static createFrom(source: any = {}) {
 	        return new DetectedVideo(source);
@@ -25,7 +31,13 @@ export namespace api {
 	        this.quality = source["quality"];
 	        this.duration = source["duration"];
 	        this.author = source["author"];
+	        this.authorAvatar = source["authorAvatar"];
 	        this.timestamp = source["timestamp"];
+	        this.decodeKey = source["decodeKey"];
+	        this.fileSize = source["fileSize"];
+	        this.width = source["width"];
+	        this.height = source["height"];
+	        this.isCurrentVideo = source["isCurrentVideo"];
 	    }
 	}
 

@@ -16,6 +16,7 @@ import {
 import type { BilibiliVideo, BilibiliStream } from '@/types'
 import { GetBilibiliVideoInfo, DownloadBilibiliVideo, DownloadBilibiliPart } from '../../wailsjs/go/main/App'
 import PartSelector from '@/components/PartSelector.vue'
+import ProxiedImage from '@/components/ProxiedImage.vue'
 
 const store = useAppStore()
 const message = useMessage()
@@ -185,12 +186,16 @@ function handleKeydown(e: KeyboardEvent) {
             <!-- Cover -->
             <div class="w-80 flex-shrink-0">
               <div class="aspect-video bg-dark-300 rounded-lg overflow-hidden">
-                <img 
+                <ProxiedImage 
                   v-if="videoInfo.cover"
                   :src="videoInfo.cover" 
                   :alt="videoInfo.title"
-                  class="w-full h-full object-cover"
-                />
+                  class="w-full h-full"
+                >
+                  <template #placeholder>
+                    <PlayCircleOutline class="w-16 h-16 text-gray-600" />
+                  </template>
+                </ProxiedImage>
                 <div v-else class="w-full h-full flex items-center justify-center">
                   <PlayCircleOutline class="w-16 h-16 text-gray-600" />
                 </div>
