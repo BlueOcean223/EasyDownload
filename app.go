@@ -13,6 +13,7 @@ import (
 	"EasyDownload/internal/config"
 	"EasyDownload/internal/downloader"
 	"EasyDownload/internal/ffmpeg"
+	"EasyDownload/internal/logger"
 	"EasyDownload/internal/proxy"
 	"EasyDownload/internal/tray"
 	"EasyDownload/internal/utils"
@@ -769,13 +770,13 @@ func (a *App) ShowNotification(title, message string) {
 
 // OpenLogDir opens the log directory in file explorer
 func (a *App) OpenLogDir() error {
-	logDir := filepath.Join(utils.GetAppDataDir(), "logs")
+	logDir := logger.GetGlobalLogger().GetLogDir()
 	return utils.OpenFolder(logDir)
 }
 
 // GetLogDir returns the log directory path
 func (a *App) GetLogDir() string {
-	return filepath.Join(utils.GetAppDataDir(), "logs")
+	return logger.GetGlobalLogger().GetLogDir()
 }
 
 // ==================== Appearance Methods ====================

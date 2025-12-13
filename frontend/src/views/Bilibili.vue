@@ -11,7 +11,8 @@ import {
   PlayCircleOutline,
   TimeOutline,
   PersonOutline,
-  ListOutline
+  ListOutline,
+  LinkOutline
 } from '@vicons/ionicons5'
 import type { BilibiliVideo, BilibiliStream } from '@/types'
 import { GetBilibiliVideoInfo, DownloadBilibiliVideo, DownloadBilibiliPart } from '../../wailsjs/go/main/App'
@@ -122,7 +123,7 @@ function handleKeydown(e: KeyboardEvent) {
 <template>
   <div class="bilibili-page h-full flex flex-col">
     <!-- Header -->
-    <div class="header p-4 border-b border-dark-300">
+    <div class="header p-4 border-b border-border">
       <h2 class="text-xl font-semibold mb-4">B站视频下载</h2>
       
       <!-- URL Input -->
@@ -136,7 +137,7 @@ function handleKeydown(e: KeyboardEvent) {
           @keydown="handleKeydown"
         >
           <template #prefix>
-            <SearchOutline class="w-5 h-5 text-gray-400" />
+            <SearchOutline class="w-5 h-5 text-text-secondary" />
           </template>
         </NInput>
         
@@ -171,8 +172,11 @@ function handleKeydown(e: KeyboardEvent) {
       <!-- Empty State -->
       <div v-else-if="!videoInfo" class="h-full flex items-center justify-center">
         <NEmpty description="输入视频链接开始解析">
+          <template #icon>
+            <LinkOutline class="w-12 h-12 text-text-secondary opacity-50" />
+          </template>
           <template #extra>
-            <p class="text-gray-500 text-sm mt-2">
+            <p class="text-text-secondary text-sm mt-2">
               支持 bilibili.com 和 b23.tv 链接
             </p>
           </template>
@@ -181,11 +185,11 @@ function handleKeydown(e: KeyboardEvent) {
       
       <!-- Video Info -->
       <div v-else class="max-w-4xl mx-auto">
-        <NCard :bordered="false" class="bg-dark-200">
+        <NCard :bordered="false" class="bg-secondary">
           <div class="flex gap-6">
             <!-- Cover -->
             <div class="w-80 flex-shrink-0">
-              <div class="aspect-video bg-dark-300 rounded-lg overflow-hidden">
+              <div class="aspect-video bg-tertiary rounded-lg overflow-hidden">
                 <ProxiedImage 
                   v-if="videoInfo.cover"
                   :src="videoInfo.cover" 
@@ -193,11 +197,11 @@ function handleKeydown(e: KeyboardEvent) {
                   class="w-full h-full"
                 >
                   <template #placeholder>
-                    <PlayCircleOutline class="w-16 h-16 text-gray-600" />
+                    <PlayCircleOutline class="w-16 h-16 text-text-secondary opacity-50" />
                   </template>
                 </ProxiedImage>
                 <div v-else class="w-full h-full flex items-center justify-center">
-                  <PlayCircleOutline class="w-16 h-16 text-gray-600" />
+                  <PlayCircleOutline class="w-16 h-16 text-text-secondary opacity-50" />
                 </div>
               </div>
             </div>
@@ -206,7 +210,7 @@ function handleKeydown(e: KeyboardEvent) {
             <div class="flex-1 flex flex-col">
               <h3 class="text-lg font-semibold mb-3">{{ videoInfo.title }}</h3>
               
-              <div class="flex items-center gap-4 text-sm text-gray-400 mb-3">
+              <div class="flex items-center gap-4 text-sm text-text-secondary mb-3">
                 <span class="flex items-center gap-1">
                   <PersonOutline class="w-4 h-4" />
                   {{ videoInfo.author }}
@@ -218,13 +222,13 @@ function handleKeydown(e: KeyboardEvent) {
                 <NTag size="small" type="info">{{ videoInfo.bv }}</NTag>
               </div>
               
-              <p class="text-sm text-gray-500 line-clamp-3 mb-4">
+              <p class="text-sm text-text-secondary line-clamp-3 mb-4">
                 {{ videoInfo.desc || '暂无简介' }}
               </p>
               
               <div class="mt-auto flex items-center gap-4">
                 <div class="flex items-center gap-2">
-                  <span class="text-sm text-gray-400">画质:</span>
+                  <span class="text-sm text-text-secondary">画质:</span>
                   <NSelect 
                     v-model:value="selectedQuality"
                     :options="qualityOptions"
@@ -254,7 +258,7 @@ function handleKeydown(e: KeyboardEvent) {
                   </template>
                   共 {{ videoInfo.parts.length }} P
                 </NTag>
-                <span class="text-xs text-gray-500">点击下载按钮选择要下载的分P</span>
+                <span class="text-xs text-text-secondary">点击下载按钮选择要下载的分P</span>
               </div>
             </div>
           </div>

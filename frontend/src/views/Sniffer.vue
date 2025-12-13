@@ -9,6 +9,7 @@ import {
   TrashOutline,
   RefreshOutline,
   SearchOutline,
+  AlertCircleOutline,
   LockClosedOutline,
   StarOutline
 } from '@vicons/ionicons5'
@@ -94,7 +95,7 @@ function clearAll() {
 <template>
   <div class="sniffer-page h-full flex flex-col">
     <!-- Header -->
-    <div class="header flex items-center justify-between p-4 border-b border-dark-300">
+    <div class="header flex items-center justify-between p-4 border-b border-border">
       <div class="flex items-center gap-4">
         <h2 class="text-xl font-semibold">视频嗅探</h2>
         <NTag :type="store.proxyRunning ? 'success' : 'error'" size="small">
@@ -114,7 +115,7 @@ function clearAll() {
           style="width: 200px"
         >
           <template #prefix>
-            <SearchOutline class="w-4 h-4 text-gray-400" />
+            <SearchOutline class="w-4 h-4 text-text-secondary" />
           </template>
         </NInput>
         
@@ -140,16 +141,22 @@ function clearAll() {
       <!-- Empty State -->
       <div v-if="!store.proxyRunning" class="h-full flex items-center justify-center">
         <NEmpty description="代理服务未启动">
+          <template #icon>
+            <AlertCircleOutline class="w-12 h-12 text-text-secondary opacity-50" />
+          </template>
           <template #extra>
-            <p class="text-gray-500 text-sm mb-4">请先在侧边栏启动代理服务，然后打开微信PC端浏览视频</p>
+            <p class="text-text-secondary text-sm mb-4">请先在侧边栏启动代理服务，然后打开微信PC端浏览视频</p>
           </template>
         </NEmpty>
       </div>
       
       <div v-else-if="filteredVideos.length === 0" class="h-full flex items-center justify-center">
         <NEmpty description="暂无检测到的视频">
+          <template #icon>
+            <PlayCircleOutline class="w-12 h-12 text-text-secondary opacity-50" />
+          </template>
           <template #extra>
-            <p class="text-gray-500 text-sm">打开微信PC端，浏览视频号内容即可自动检测</p>
+            <p class="text-text-secondary text-sm">打开微信PC端，浏览视频号内容即可自动检测</p>
           </template>
         </NEmpty>
       </div>
@@ -159,14 +166,14 @@ function clearAll() {
         <NCard 
           v-for="video in filteredVideos" 
           :key="video.id"
-          class="video-card cursor-pointer"
+          class="video-card cursor-pointer bg-secondary"
           :class="{ 'current-video': isCurrentVideo(video) }"
           :bordered="false"
           content-style="padding: 0"
           hoverable
         >
           <!-- Thumbnail -->
-          <div class="relative aspect-video bg-dark-300 overflow-hidden rounded-t-lg">
+          <div class="relative aspect-video bg-tertiary overflow-hidden rounded-t-lg">
             <ProxiedImage
               v-if="video.cover"
               :src="video.cover"
@@ -174,7 +181,7 @@ function clearAll() {
               class="w-full h-full"
             />
             <div v-else class="w-full h-full flex items-center justify-center">
-              <PlayCircleOutline class="w-12 h-12 text-gray-600" />
+              <PlayCircleOutline class="w-12 h-12 text-text-secondary opacity-50" />
             </div>
             
             <!-- Source Badge -->
@@ -213,7 +220,7 @@ function clearAll() {
             
             <!-- Duration Badge -->
             <div v-if="video.duration" class="absolute bottom-2 left-2">
-              <span class="text-xs bg-black/70 px-2 py-1 rounded">
+              <span class="text-xs bg-black/70 text-white px-2 py-1 rounded">
                 {{ formatDuration(video.duration) }}
               </span>
             </div>
@@ -227,14 +234,14 @@ function clearAll() {
             </h3>
             
             <div class="flex items-center justify-between mb-2">
-              <span class="text-xs text-gray-500">
+              <span class="text-xs text-text-secondary">
                 {{ video.author || '未知作者' }}
               </span>
               <div class="flex items-center gap-2">
-                <span v-if="video.width && video.height" class="text-xs text-gray-400">
+                <span v-if="video.width && video.height" class="text-xs text-text-secondary opacity-80">
                   {{ video.width }}×{{ video.height }}
                 </span>
-                <span v-if="video.fileSize" class="text-xs text-gray-400">
+                <span v-if="video.fileSize" class="text-xs text-text-secondary opacity-80">
                   {{ formatFileSize(video.fileSize) }}
                 </span>
               </div>

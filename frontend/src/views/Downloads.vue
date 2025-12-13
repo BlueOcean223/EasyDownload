@@ -111,7 +111,7 @@ async function openDownloadFolder() {
 <template>
   <div class="downloads-page h-full flex flex-col">
     <!-- Header -->
-    <div class="header flex items-center justify-between p-4 border-b border-dark-300">
+    <div class="header flex items-center justify-between p-4 border-b border-border">
       <h2 class="text-xl font-semibold">下载管理</h2>
       
       <NButton size="small" @click="openDownloadFolder">
@@ -124,7 +124,7 @@ async function openDownloadFolder() {
     
     <!-- Content -->
     <div class="content flex-1 overflow-auto">
-      <NTabs type="line" :default-value="activeTab" class="h-full" pane-class="h-full">
+      <NTabs type="line" :default-value="activeTab" class="downloads-tabs h-full" pane-class="h-full">
         <!-- Downloading Tab -->
         <NTabPane name="downloading" tab="下载中" class="h-full">
           <div class="p-4 h-full overflow-auto">
@@ -132,19 +132,23 @@ async function openDownloadFolder() {
               v-if="store.pendingDownloads.length === 0" 
               description="暂无进行中的下载"
               class="h-full flex items-center justify-center"
-            />
+            >
+              <template #icon>
+                <CloudDownloadOutline class="w-12 h-12 text-text-secondary opacity-50" />
+              </template>
+            </NEmpty>
             
             <div v-else class="space-y-3">
               <NCard 
                 v-for="task in store.pendingDownloads" 
                 :key="task.id"
                 :bordered="false"
-                class="bg-dark-200"
+                class="bg-secondary"
                 size="small"
               >
                 <div class="flex items-center gap-4">
                   <!-- Cover -->
-                  <div class="w-24 h-14 bg-dark-300 rounded overflow-hidden flex-shrink-0">
+                  <div class="w-24 h-14 bg-tertiary rounded overflow-hidden flex-shrink-0">
                     <img 
                       v-if="task.cover" 
                       :src="task.cover" 
@@ -152,7 +156,7 @@ async function openDownloadFolder() {
                       class="w-full h-full object-cover"
                     />
                     <div v-else class="w-full h-full flex items-center justify-center">
-                      <CloudDownloadOutline class="w-6 h-6 text-gray-600" />
+                      <CloudDownloadOutline class="w-6 h-6 text-text-secondary opacity-50" />
                     </div>
                   </div>
                   
@@ -174,7 +178,7 @@ async function openDownloadFolder() {
                       class="mb-1"
                     />
                     
-                    <div class="flex items-center gap-4 text-xs text-gray-500">
+                    <div class="flex items-center gap-4 text-xs text-text-secondary">
                       <span>{{ formatBytes(task.downloaded) }} / {{ formatBytes(task.fileSize) }}</span>
                       <span v-if="task.status === 'downloading'">{{ formatSpeed(task.speed) }}</span>
                       <span>{{ task.progress.toFixed(1) }}%</span>
@@ -223,19 +227,23 @@ async function openDownloadFolder() {
               v-if="store.completedDownloads.length === 0" 
               description="暂无已完成的下载"
               class="h-full flex items-center justify-center"
-            />
+            >
+              <template #icon>
+                <CheckmarkCircleOutline class="w-12 h-12 text-text-secondary opacity-50" />
+              </template>
+            </NEmpty>
             
             <div v-else class="space-y-3">
               <NCard 
                 v-for="task in store.completedDownloads" 
                 :key="task.id"
                 :bordered="false"
-                class="bg-dark-200"
+                class="bg-secondary"
                 size="small"
               >
                 <div class="flex items-center gap-4">
                   <!-- Cover -->
-                  <div class="w-24 h-14 bg-dark-300 rounded overflow-hidden flex-shrink-0">
+                  <div class="w-24 h-14 bg-tertiary rounded overflow-hidden flex-shrink-0">
                     <img 
                       v-if="task.cover" 
                       :src="task.cover" 
@@ -254,7 +262,7 @@ async function openDownloadFolder() {
                       <NTag type="success" size="tiny">已完成</NTag>
                     </div>
                     
-                    <div class="text-xs text-gray-500">
+                    <div class="text-xs text-text-secondary">
                       <span>{{ formatBytes(task.fileSize) }}</span>
                       <span class="mx-2">·</span>
                       <span>{{ task.fileName }}</span>
@@ -290,4 +298,11 @@ async function openDownloadFolder() {
     </div>
   </div>
 </template>
+
+<style scoped>
+.downloads-tabs :deep(.n-tabs-nav) {
+  padding-left: 1rem;
+  padding-right: 1rem;
+}
+</style>
 

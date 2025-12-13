@@ -144,6 +144,46 @@ async function toggleProxyDebug(value: boolean) {
   }
 }
 
+async function toggleTheme(value: boolean) {
+  const newTheme = value ? 'dark' : 'light'
+  
+  // Use View Transitions API if supported
+  if (!(document as any).startViewTransition) {
+    store.setAppTheme(newTheme)
+    return
+  }
+
+  const transition = (document as any).startViewTransition(async () => {
+    await store.setAppTheme(newTheme)
+  })
+
+  transition.ready.then(() => {
+    // White -> Dark: Top-Left to Bottom-Right (Expand from 0,0)
+    // Dark -> White: Bottom-Right to Top-Left (Expand from W,H)
+    const x = value ? 0 : window.innerWidth
+    const y = value ? 0 : window.innerHeight
+    
+    const endRadius = Math.hypot(
+      Math.max(x, window.innerWidth - x),
+      Math.max(y, window.innerHeight - y)
+    )
+
+    document.documentElement.animate(
+      {
+        clipPath: [
+          `circle(0px at ${x}px ${y}px)`,
+          `circle(${endRadius}px at ${x}px ${y}px)`,
+        ],
+      },
+      {
+        duration: 500,
+        easing: 'ease-in-out',
+        pseudoElement: '::view-transition-new(root)',
+      }
+    )
+  })
+}
+
 async function saveUpstreamProxy() {
   try {
     await SetUpstreamProxy(upstreamProxyInput.value)
@@ -155,12 +195,12 @@ async function saveUpstreamProxy() {
 </script>
 
 <template>
-  <div class="settings-page h-full overflow-auto p-4">
+  <div class="settings-page h-full overflow-auto p-4 bg-primary text-text-primary">
     <h2 class="text-xl font-semibold mb-6">设置</h2>
     
     <div class="max-w-2xl space-y-4">
       <!-- Proxy Settings -->
-      <NCard title="代理服务" :bordered="false" class="bg-dark-200">
+      <NCard title="代理服务" :bordered="false" class="bg-secondary rounded-xl shadow-sm">
         <template #header-extra>
           <NTag :type="store.proxyRunning ? 'success' : 'default'" size="small">
             {{ store.proxyRunning ? '运行中' : '已停止' }}
@@ -171,9 +211,9 @@ async function saveUpstreamProxy() {
           <div class="flex items-center justify-between">
             <div>
               <p class="text-sm font-medium">代理端口</p>
-              <p class="text-xs text-gray-500">MITM 代理服务监听端口</p>
+              <p class="text-xs text-text-secondary">MITM 代理服务监听端口</p>
             </div>
-            <span class="text-sm text-gray-400">{{ store.appInfo?.proxyPort || 8899 }}</span>
+            <span class="text-sm text-text-secondary">{{ store.appInfo?.proxyPort || 8899 }}</span>
           </div>
           
           <NDivider class="my-2" />
@@ -181,9 +221,9 @@ async function saveUpstreamProxy() {
           <div class="flex items-center justify-between">
             <div>
               <p class="text-sm font-medium">API 端口</p>
-              <p class="text-xs text-gray-500">内部通信端口</p>
+              <p class="text-xs text-text-secondary">内部通信端口</p>
             </div>
-            <span class="text-sm text-gray-400">{{ store.appInfo?.apiPort || 18899 }}</span>
+            <span class="text-sm text-text-secondary">{{ store.appInfo?.apiPort || 18899 }}</span>
           </div>
           
           <NDivider class="my-2" />
@@ -191,7 +231,7 @@ async function saveUpstreamProxy() {
           <div class="flex items-center justify-between">
             <div>
               <p class="text-sm font-medium">启用上游代理</p>
-              <p class="text-xs text-gray-500">将流量转发到另一个代理服务器（如 VPN 代理）</p>
+              <p class="text-xs text-text-secondary">将流量转发到另一个代理服务器（如 VPN 代理）</p>
             </div>
             <NSwitch 
               :value="store.useUpstreamProxy"
@@ -204,7 +244,7 @@ async function saveUpstreamProxy() {
           <div class="flex items-center justify-between">
             <div>
               <p class="text-sm font-medium">代理调试（诊断）</p>
-              <p class="text-xs text-gray-500">记录 CONNECT/编码/改写信息到日志，用于定位视频号卡加载</p>
+              <p class="text-xs text-text-secondary">记录 CONNECT/编码/改写信息到日志，用于定位视频号卡加载</p>
             </div>
             <NSwitch :value="proxyDebug" @update:value="toggleProxyDebug" />
           </div>
@@ -230,7 +270,7 @@ async function saveUpstreamProxy() {
       </NCard>
       
       <!-- Certificate Settings -->
-      <NCard title="证书管理" :bordered="false" class="bg-dark-200">
+      <NCard title="证书管理" :bordered="false" class="bg-secondary rounded-xl shadow-sm">
         <template #header-extra>
           <NTag :type="store.certInstalled ? 'success' : 'warning'" size="small">
             {{ store.certInstalled ? '已安装' : '未安装' }}
@@ -238,7 +278,7 @@ async function saveUpstreamProxy() {
         </template>
         
         <div class="space-y-4">
-          <NAlert type="info" :bordered="false">
+          <NAlert type="info" :bordered="false" class="rounded-lg">
             <template #icon>
               <ShieldCheckmarkOutline class="w-5 h-5" />
             </template>
@@ -248,7 +288,7 @@ async function saveUpstreamProxy() {
           <div class="flex items-center justify-between">
             <div>
               <p class="text-sm font-medium">CA 证书</p>
-              <p class="text-xs text-gray-500 truncate max-w-md" :title="store.appInfo?.certPath">
+              <p class="text-xs text-text-secondary truncate max-w-md" :title="store.appInfo?.certPath">
                 {{ store.appInfo?.certPath }}
               </p>
             </div>
@@ -266,12 +306,12 @@ async function saveUpstreamProxy() {
       </NCard>
       
       <!-- Download Settings -->
-      <NCard title="下载设置" :bordered="false" class="bg-dark-200">
+      <NCard title="下载设置" :bordered="false" class="bg-secondary rounded-xl shadow-sm">
         <div class="space-y-4">
           <div class="flex items-center justify-between">
             <div>
               <p class="text-sm font-medium">下载目录</p>
-              <p class="text-xs text-gray-500 truncate max-w-md" :title="store.downloadDir">
+              <p class="text-xs text-text-secondary truncate max-w-md" :title="store.downloadDir">
                 {{ store.downloadDir }}
               </p>
             </div>
@@ -288,7 +328,7 @@ async function saveUpstreamProxy() {
           <div class="flex items-center justify-between">
             <div>
               <p class="text-sm font-medium">FFmpeg</p>
-              <p class="text-xs text-gray-500">用于合并音视频流（B站高清视频需要）</p>
+              <p class="text-xs text-text-secondary">用于合并音视频流（B站高清视频需要）</p>
             </div>
             <NTag :type="store.ffmpegAvailable ? 'success' : 'warning'" size="small">
               {{ store.ffmpegAvailable ? '已安装' : '未检测到' }}
@@ -298,9 +338,9 @@ async function saveUpstreamProxy() {
       </NCard>
       
       <!-- Bilibili Settings -->
-      <NCard title="B站设置" :bordered="false" class="bg-dark-200">
+      <NCard title="B站设置" :bordered="false" class="bg-secondary rounded-xl shadow-sm">
         <div class="space-y-4">
-          <NAlert type="info" :bordered="false">
+          <NAlert type="info" :bordered="false" class="rounded-lg">
             <template #icon>
               <InformationCircleOutline class="w-5 h-5" />
             </template>
@@ -334,28 +374,28 @@ async function saveUpstreamProxy() {
       </NCard>
       
       <!-- Appearance Settings -->
-      <NCard title="外观设置" :bordered="false" class="bg-dark-200">
+      <NCard title="外观设置" :bordered="false" class="bg-secondary rounded-xl shadow-sm">
         <div class="space-y-4">
           <div class="flex items-center justify-between">
             <div>
               <p class="text-sm font-medium">深色模式</p>
-              <p class="text-xs text-gray-500">使用深色界面主题</p>
+              <p class="text-xs text-text-secondary">使用深色界面主题</p>
             </div>
             <NSwitch 
               :value="store.theme === 'dark'"
-              @update:value="(v: boolean) => store.setAppTheme(v ? 'dark' : 'light')"
+              @update:value="toggleTheme"
             />
           </div>
         </div>
       </NCard>
       
       <!-- System Tray Settings -->
-      <NCard title="系统托盘" :bordered="false" class="bg-dark-200">
+      <NCard title="系统托盘" :bordered="false" class="bg-secondary rounded-xl shadow-sm">
         <div class="space-y-4">
           <div class="flex items-center justify-between">
             <div>
               <p class="text-sm font-medium">最小化到托盘</p>
-              <p class="text-xs text-gray-500">关闭窗口时最小化到系统托盘而不是退出</p>
+              <p class="text-xs text-text-secondary">关闭窗口时最小化到系统托盘而不是退出</p>
             </div>
             <NSwitch 
               :value="store.minimizeToTray"
@@ -368,7 +408,7 @@ async function saveUpstreamProxy() {
           <div class="flex items-center justify-between">
             <div>
               <p class="text-sm font-medium">下载完成通知</p>
-              <p class="text-xs text-gray-500">下载完成时显示系统通知</p>
+              <p class="text-xs text-text-secondary">下载完成时显示系统通知</p>
             </div>
             <NSwitch 
               :value="store.showNotification"
@@ -379,12 +419,12 @@ async function saveUpstreamProxy() {
       </NCard>
       
       <!-- Log Settings -->
-      <NCard title="日志" :bordered="false" class="bg-dark-200">
+      <NCard title="日志" :bordered="false" class="bg-secondary rounded-xl shadow-sm">
         <div class="space-y-4">
           <div class="flex items-center justify-between">
             <div>
               <p class="text-sm font-medium">日志目录</p>
-              <p class="text-xs text-gray-500 truncate max-w-md" :title="logDir">
+              <p class="text-xs text-text-secondary truncate max-w-md" :title="logDir">
                 {{ logDir }}
               </p>
             </div>
@@ -399,14 +439,14 @@ async function saveUpstreamProxy() {
       </NCard>
       
       <!-- About -->
-      <NCard title="关于" :bordered="false" class="bg-dark-200">
+      <NCard title="关于" :bordered="false" class="bg-secondary rounded-xl shadow-sm">
         <div class="space-y-2">
           <div class="flex items-center justify-between">
-            <span class="text-sm text-gray-400">版本</span>
+            <span class="text-sm text-text-secondary">版本</span>
             <span class="text-sm">{{ store.appInfo?.version || '1.0.0' }}</span>
           </div>
           <div class="flex items-center justify-between">
-            <span class="text-sm text-gray-400">技术栈</span>
+            <span class="text-sm text-text-secondary">技术栈</span>
             <span class="text-sm">Wails v2 + Vue 3 + Go</span>
           </div>
         </div>

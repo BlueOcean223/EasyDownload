@@ -100,14 +100,14 @@ function handleWelcomeSkip() {
     :date-locale="dateZhCN"
   >
     <NMessageProvider>
-      <div class="app-container h-screen flex" :class="store.theme === 'light' ? 'bg-white' : 'bg-dark-100'">
+      <div class="app-container h-screen flex bg-primary text-text-primary transition-colors duration-300">
       <!-- Sidebar -->
       <div 
-        class="sidebar flex flex-col bg-dark-200 border-r border-dark-300 transition-all duration-300"
+        class="sidebar flex flex-col bg-secondary border-r border-border transition-all duration-300"
         :class="collapsed ? 'w-16' : 'w-56'"
       >
         <!-- Logo -->
-        <div class="logo-section h-14 flex items-center justify-center border-b border-dark-300">
+        <div class="logo-section h-14 flex items-center justify-center border-b border-border">
           <h1 
             v-if="!collapsed" 
             class="text-lg font-bold text-accent"
@@ -118,9 +118,9 @@ function handleWelcomeSkip() {
         </div>
         
         <!-- Proxy Control -->
-        <div class="proxy-control p-3 border-b border-dark-300">
+        <div class="proxy-control p-3 border-b border-border">
           <div 
-            class="flex items-center gap-3 p-2 rounded-lg bg-dark-300 cursor-pointer hover:bg-dark-400 transition-colors"
+            class="flex items-center gap-3 p-2 rounded-lg bg-tertiary cursor-pointer hover:bg-tertiary/80 transition-colors"
             :class="{ 'justify-center': collapsed }"
             @click="toggleProxy"
           >
@@ -137,7 +137,7 @@ function handleWelcomeSkip() {
               <p class="text-xs font-medium">
                 {{ store.proxyRunning ? '代理运行中' : '代理已停止' }}
               </p>
-              <p class="text-[10px] text-gray-500">
+              <p class="text-[10px] text-text-secondary">
                 点击{{ store.proxyRunning ? '停止' : '启动' }}
               </p>
             </div>
@@ -157,7 +157,7 @@ function handleWelcomeSkip() {
         </div>
         
         <!-- Collapse Toggle -->
-        <div class="collapse-toggle p-3 border-t border-dark-300">
+        <div class="collapse-toggle p-3 border-t border-border">
           <NButton 
             quaternary 
             block 
@@ -170,11 +170,11 @@ function handleWelcomeSkip() {
       </div>
       
       <!-- Main Content -->
-      <div class="main-content flex-1 overflow-hidden bg-dark-100">
+      <div class="main-content flex-1 overflow-hidden bg-primary">
         <!-- Loading Overlay -->
         <div 
           v-if="store.loading" 
-          class="absolute inset-0 bg-dark-100/80 flex items-center justify-center z-50"
+          class="absolute inset-0 bg-primary/80 flex items-center justify-center z-50"
         >
           <NSpin size="large" />
         </div>

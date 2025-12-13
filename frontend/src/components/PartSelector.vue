@@ -146,7 +146,11 @@ const getRowKey = (row: BilibiliPart & { index: number }) => row.index
 
     <div class="part-selector-content">
       <!-- Empty state -->
-      <NEmpty v-if="parts.length === 0" description="没有可用的分P" />
+      <NEmpty v-if="parts.length === 0" description="没有可用的分P">
+        <template #icon>
+          <ListOutline class="w-12 h-12 text-text-secondary opacity-50" />
+        </template>
+      </NEmpty>
 
       <!-- Parts list -->
       <template v-else>
@@ -154,7 +158,7 @@ const getRowKey = (row: BilibiliPart & { index: number }) => row.index
           <NCheckbox v-model:checked="selectAll">
             全选
           </NCheckbox>
-          <span v-if="hasSelection" class="text-sm text-gray-400">
+          <span v-if="hasSelection" class="text-sm text-text-secondary">
             已选 {{ selectedParts.length }} P，
             总时长 {{ formatDuration(totalDuration) }}
           </span>

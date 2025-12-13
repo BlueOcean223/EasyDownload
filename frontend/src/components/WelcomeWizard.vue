@@ -118,7 +118,7 @@ function skip() {
         <div class="text-center mb-6">
           <ShieldCheckmarkOutline class="w-16 h-16 text-accent mx-auto mb-4" />
           <h3 class="text-lg font-semibold mb-2">安装 CA 证书</h3>
-          <p class="text-gray-400 text-sm">
+          <p class="text-text-secondary text-sm">
             为了能够嗅探 HTTPS 加密流量，需要安装 CA 根证书到系统信任存储。
           </p>
         </div>
@@ -156,13 +156,13 @@ function skip() {
         <div class="text-center mb-6">
           <FolderOpenOutline class="w-16 h-16 text-accent mx-auto mb-4" />
           <h3 class="text-lg font-semibold mb-2">选择下载目录</h3>
-          <p class="text-gray-400 text-sm">
+          <p class="text-text-secondary text-sm">
             选择视频文件的保存位置。您可以随时在设置中更改。
           </p>
         </div>
 
-        <div class="bg-dark-300 rounded-lg p-4 mb-4">
-          <p class="text-sm text-gray-400 mb-2">当前下载目录:</p>
+        <div class="bg-tertiary rounded-lg p-4 mb-4">
+          <p class="text-sm text-text-secondary mb-2">当前下载目录:</p>
           <p class="text-sm font-mono truncate" :title="store.downloadDir">
             {{ store.downloadDir || '未设置' }}
           </p>

@@ -4,6 +4,14 @@
 @tailwind components;
 @tailwind utilities;
 
+/* Disable default view transition checks to allow custom control */
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation: none;
+  mix-blend-mode: normal;
+}
+
+/* Ensure darker dark theme for better contrast */
 :root {
   --bg-primary: #121212;
   --bg-secondary: #1e1e1e;
@@ -15,6 +23,7 @@
   --danger: #ff4757;
   --warning: #ffa502;
   --success: #2ed573;
+  --border-color: #333333;
 }
 
 /* Light theme variables */
@@ -29,6 +38,7 @@
   --danger: #e74c3c;
   --warning: #f39c12;
   --success: #27ae60;
+  --border-color: #e0e0e0;
 }
 
 * {
@@ -37,7 +47,9 @@
   box-sizing: border-box;
 }
 
-html, body, #app {
+html,
+body,
+#app {
   height: 100%;
   width: 100%;
   font-family: 'Nunito', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
@@ -126,9 +138,12 @@ html, body, #app {
 }
 
 @keyframes pulse {
-  0%, 100% {
+
+  0%,
+  100% {
     opacity: 1;
   }
+
   50% {
     opacity: 0.5;
   }
