@@ -418,7 +418,7 @@ func (bd *BilibiliDownloader) GetPartStreams(video *BilibiliVideo, partIndex int
 }
 
 // DownloadPart downloads a specific part of a Bilibili video
-func (bd *BilibiliDownloader) DownloadPart(video *BilibiliVideo, partIndex int, quality int, outputDir string, onProgress func(float64)) (string, error) {
+func (bd *BilibiliDownloader) DownloadPart(video *BilibiliVideo, partIndex int, quality int, outputDir string, onProgress func(float64), onSizeKnown func(int64)) (string, error) {
 	if partIndex < 0 || partIndex >= len(video.Parts) {
 		return "", fmt.Errorf("invalid part index: %d (total parts: %d)", partIndex, len(video.Parts))
 	}
@@ -476,6 +476,11 @@ func (bd *BilibiliDownloader) DownloadPart(video *BilibiliVideo, partIndex int, 
 	videoSize, _ := bd.getContentLength(stream.VideoURL)
 	audioSize, _ := bd.getContentLength(stream.AudioURL)
 	logger.Debug("Video size: %d, Audio size: %d", videoSize, audioSize)
+
+	// Notify caller of total file size
+	if onSizeKnown != nil {
+		onSizeKnown(videoSize + audioSize)
+	}
 
 	// Create progress tracker
 	tracker := NewDASHProgressTracker(videoSize, audioSize, onProgress)
@@ -537,7 +542,7 @@ func (bd *BilibiliDownloader) DownloadPart(video *BilibiliVideo, partIndex int, 
 }
 
 // Download downloads a Bilibili video (first part for backward compatibility)
-func (bd *BilibiliDownloader) Download(video *BilibiliVideo, quality int, outputDir string, onProgress func(progress float64)) (string, error) {
+func (bd *BilibiliDownloader) Download(video *BilibiliVideo, quality int, outputDir string, onProgress func(progress float64), onSizeKnown func(totalSize int64)) (string, error) {
 	logger.Info("Starting download for video: %s (quality: %d)", video.Title, quality)
 
 	// Find the requested quality stream
@@ -579,6 +584,11 @@ func (bd *BilibiliDownloader) Download(video *BilibiliVideo, quality int, output
 	videoSize, _ := bd.getContentLength(stream.VideoURL)
 	audioSize, _ := bd.getContentLength(stream.AudioURL)
 	logger.Debug("Video size: %d, Audio size: %d", videoSize, audioSize)
+
+	// Notify caller of total file size
+	if onSizeKnown != nil {
+		onSizeKnown(videoSize + audioSize)
+	}
 
 	// Create progress tracker
 	tracker := NewDASHProgressTracker(videoSize, audioSize, onProgress)

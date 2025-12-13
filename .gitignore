@@ -106,4 +106,4 @@ certs/
 .aider*
 
 # Reference folder (if you don't want to track it)
-# reference/
+reference/

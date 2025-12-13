@@ -2,21 +2,16 @@
 import { computed } from 'vue'
 import { useAppStore } from '@/stores/app'
 import { 
-  NCard, NButton, NEmpty, NProgress, NTag, 
-  NSpace, NTooltip, NTabs, NTabPane, useMessage 
+  NButton, NEmpty, NTabs, NTabPane, useMessage 
 } from 'naive-ui'
 import { 
-  PlayOutline, 
-  PauseOutline, 
-  CloseOutline,
   FolderOpenOutline,
-  TrashOutline,
   CheckmarkCircleOutline,
-  AlertCircleOutline,
   CloudDownloadOutline
 } from '@vicons/ionicons5'
 import type { DownloadTask } from '@/types'
 import { OpenFile } from '../../wailsjs/go/main/App'
+import DownloadTaskCard from '@/components/DownloadTaskCard.vue'
 
 const store = useAppStore()
 const message = useMessage()
@@ -25,41 +20,6 @@ const activeTab = computed(() => {
   if (store.pendingDownloads.length > 0) return 'downloading'
   return 'completed'
 })
-
-function formatBytes(bytes: number) {
-  if (bytes === 0) return '0 B'
-  const k = 1024
-  const sizes = ['B', 'KB', 'MB', 'GB']
-  const i = Math.floor(Math.log(bytes) / Math.log(k))
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i]
-}
-
-function formatSpeed(bytesPerSecond: number) {
-  return formatBytes(bytesPerSecond) + '/s'
-}
-
-function getStatusType(status: string) {
-  switch (status) {
-    case 'downloading': return 'info'
-    case 'completed': return 'success'
-    case 'failed': return 'error'
-    case 'paused': return 'warning'
-    case 'cancelled': return 'default'
-    default: return 'default'
-  }
-}
-
-function getStatusText(status: string) {
-  switch (status) {
-    case 'downloading': return '下载中'
-    case 'completed': return '已完成'
-    case 'failed': return '失败'
-    case 'paused': return '已暂停'
-    case 'cancelled': return '已取消'
-    case 'pending': return '等待中'
-    default: return status
-  }
-}
 
 async function handlePause(task: DownloadTask) {
   try {
@@ -139,83 +99,15 @@ async function openDownloadFolder() {
             </NEmpty>
             
             <div v-else class="space-y-3">
-              <NCard 
+              <DownloadTaskCard 
                 v-for="task in store.pendingDownloads" 
                 :key="task.id"
-                :bordered="false"
-                class="bg-secondary"
-                size="small"
-              >
-                <div class="flex items-center gap-4">
-                  <!-- Cover -->
-                  <div class="w-24 h-14 bg-tertiary rounded overflow-hidden flex-shrink-0">
-                    <img 
-                      v-if="task.cover" 
-                      :src="task.cover" 
-                      :alt="task.title"
-                      class="w-full h-full object-cover"
-                    />
-                    <div v-else class="w-full h-full flex items-center justify-center">
-                      <CloudDownloadOutline class="w-6 h-6 text-text-secondary opacity-50" />
-                    </div>
-                  </div>
-                  
-                  <!-- Info -->
-                  <div class="flex-1 min-w-0">
-                    <div class="flex items-center gap-2 mb-1">
-                      <span class="text-sm font-medium truncate">{{ task.title }}</span>
-                      <NTag :type="getStatusType(task.status)" size="tiny">
-                        {{ getStatusText(task.status) }}
-                      </NTag>
-                    </div>
-                    
-                    <NProgress 
-                      type="line" 
-                      :percentage="task.progress"
-                      :show-indicator="false"
-                      :height="4"
-                      :border-radius="2"
-                      class="mb-1"
-                    />
-                    
-                    <div class="flex items-center gap-4 text-xs text-text-secondary">
-                      <span>{{ formatBytes(task.downloaded) }} / {{ formatBytes(task.fileSize) }}</span>
-                      <span v-if="task.status === 'downloading'">{{ formatSpeed(task.speed) }}</span>
-                      <span>{{ task.progress.toFixed(1) }}%</span>
-                    </div>
-                  </div>
-                  
-                  <!-- Actions -->
-                  <div class="flex items-center gap-1 flex-shrink-0">
-                    <NTooltip v-if="task.status === 'downloading'">
-                      <template #trigger>
-                        <NButton size="tiny" quaternary circle @click="handlePause(task)">
-                          <PauseOutline class="w-4 h-4" />
-                        </NButton>
-                      </template>
-                      暂停
-                    </NTooltip>
-                    
-                    <NTooltip v-if="task.status === 'paused'">
-                      <template #trigger>
-                        <NButton size="tiny" quaternary circle @click="handleResume(task)">
-                          <PlayOutline class="w-4 h-4" />
-                        </NButton>
-                      </template>
-                      继续
-                    </NTooltip>
-                    
-                    <NTooltip>
-                      <template #trigger>
-                        <NButton size="tiny" quaternary circle @click="handleCancel(task)">
-                          <CloseOutline class="w-4 h-4" />
-                        </NButton>
-                      </template>
-                      取消
-                    </NTooltip>
-                  </div>
-                </div>
-              </NCard>
+                :task="task"
+                mode="downloading"
+                @pause="handlePause"
+                @resume="handleResume"
+                @cancel="handleCancel"
+              />
             </div>
           </div>
         </NTabPane>
@@ -234,63 +126,14 @@ async function openDownloadFolder() {
             </NEmpty>
             
             <div v-else class="space-y-3">
-              <NCard 
+              <DownloadTaskCard 
                 v-for="task in store.completedDownloads" 
                 :key="task.id"
-                :bordered="false"
-                class="bg-secondary"
-                size="small"
-              >
-                <div class="flex items-center gap-4">
-                  <!-- Cover -->
-                  <div class="w-24 h-14 bg-tertiary rounded overflow-hidden flex-shrink-0">
-                    <img 
-                      v-if="task.cover" 
-                      :src="task.cover" 
-                      :alt="task.title"
-                      class="w-full h-full object-cover"
-                    />
-                    <div v-else class="w-full h-full flex items-center justify-center">
-                      <CheckmarkCircleOutline class="w-6 h-6 text-green-500" />
-                    </div>
-                  </div>
-                  
-                  <!-- Info -->
-                  <div class="flex-1 min-w-0">
-                    <div class="flex items-center gap-2 mb-1">
-                      <span class="text-sm font-medium truncate">{{ task.title }}</span>
-                      <NTag type="success" size="tiny">已完成</NTag>
-                    </div>
-                    
-                    <div class="text-xs text-text-secondary">
-                      <span>{{ formatBytes(task.fileSize) }}</span>
-                      <span class="mx-2">·</span>
-                      <span>{{ task.fileName }}</span>
-                    </div>
-                  </div>
-                  
-                  <!-- Actions -->
-                  <div class="flex items-center gap-1 flex-shrink-0">
-                    <NTooltip>
-                      <template #trigger>
-                        <NButton size="tiny" quaternary circle @click="handleOpenFile(task)">
-                          <FolderOpenOutline class="w-4 h-4" />
-                        </NButton>
-                      </template>
-                      打开文件
-                    </NTooltip>
-                    
-                    <NTooltip>
-                      <template #trigger>
-                        <NButton size="tiny" quaternary circle @click="handleRemove(task)">
-                          <TrashOutline class="w-4 h-4" />
-                        </NButton>
-                      </template>
-                      删除记录
-                    </NTooltip>
-                  </div>
-                </div>
-              </NCard>
+                :task="task"
+                mode="completed"
+                @open-file="handleOpenFile"
+                @remove="handleRemove"
+              />
             </div>
           </div>
         </NTabPane>
@@ -305,4 +148,3 @@ async function openDownloadFolder() {
   padding-right: 1rem;
 }
 </style>
-

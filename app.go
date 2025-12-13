@@ -529,10 +529,33 @@ func (a *App) DownloadBilibiliVideo(url string, quality int) (string, error) {
 
 	// Download in background
 	go func() {
+		// Set status to downloading
+		task.Status = downloader.StatusDownloading
 		runtime.EventsEmit(a.ctx, "download:start", task.TaskToJSON())
+
+		// Variables for speed calculation
+		var lastUpdate time.Time = time.Now()
+		var lastDownloaded int64 = 0
 
 		outputPath, err := a.bilibiliDownloader.Download(video, quality, a.downloadDir, func(progress float64) {
 			task.Progress = progress
+			task.Status = downloader.StatusDownloading
+			// Calculate downloaded bytes based on progress
+			if task.FileSize > 0 {
+				task.Downloaded = int64(progress / 100 * float64(task.FileSize))
+			}
+
+			// Calculate speed every second
+			now := time.Now()
+			elapsed := now.Sub(lastUpdate)
+			if elapsed >= time.Second {
+				task.Speed = int64(float64(task.Downloaded-lastDownloaded) / elapsed.Seconds())
+				lastDownloaded = task.Downloaded
+				lastUpdate = now
+				runtime.EventsEmit(a.ctx, "download:progress", task.TaskToJSON())
+			}
+		}, func(totalSize int64) {
+			task.FileSize = totalSize
 			runtime.EventsEmit(a.ctx, "download:progress", task.TaskToJSON())
 		})
 
@@ -543,14 +566,23 @@ func (a *App) DownloadBilibiliVideo(url string, quality int) (string, error) {
 				"task":  task.TaskToJSON(),
 				"error": err.Error(),
 			})
+			// Show notification for download failure
+			if a.showNotification && a.trayManager != nil {
+				a.trayManager.ShowNotification("下载失败", task.Title)
+			}
 			return
 		}
 
 		task.Status = downloader.StatusCompleted
 		task.FilePath = outputPath
 		task.Progress = 100
+		task.Speed = 0 // Reset speed when completed
 		task.CompletedAt = time.Now().Unix()
 		runtime.EventsEmit(a.ctx, "download:complete", task.TaskToJSON())
+		// Show notification for download complete
+		if a.showNotification && a.trayManager != nil {
+			a.trayManager.ShowNotification("下载完成", task.Title)
+		}
 	}()
 
 	return id, nil
@@ -586,10 +618,33 @@ func (a *App) DownloadBilibiliPart(url string, partIndex int, quality int) (stri
 
 	// Download in background
 	go func() {
+		// Set status to downloading
+		task.Status = downloader.StatusDownloading
 		runtime.EventsEmit(a.ctx, "download:start", task.TaskToJSON())
+
+		// Variables for speed calculation
+		var lastUpdate time.Time = time.Now()
+		var lastDownloaded int64 = 0
 
 		outputPath, err := a.bilibiliDownloader.DownloadPart(video, partIndex, quality, a.downloadDir, func(progress float64) {
 			task.Progress = progress
+			task.Status = downloader.StatusDownloading
+			// Calculate downloaded bytes based on progress
+			if task.FileSize > 0 {
+				task.Downloaded = int64(progress / 100 * float64(task.FileSize))
+			}
+
+			// Calculate speed every second
+			now := time.Now()
+			elapsed := now.Sub(lastUpdate)
+			if elapsed >= time.Second {
+				task.Speed = int64(float64(task.Downloaded-lastDownloaded) / elapsed.Seconds())
+				lastDownloaded = task.Downloaded
+				lastUpdate = now
+				runtime.EventsEmit(a.ctx, "download:progress", task.TaskToJSON())
+			}
+		}, func(totalSize int64) {
+			task.FileSize = totalSize
 			runtime.EventsEmit(a.ctx, "download:progress", task.TaskToJSON())
 		})
 
@@ -600,14 +655,23 @@ func (a *App) DownloadBilibiliPart(url string, partIndex int, quality int) (stri
 				"task":  task.TaskToJSON(),
 				"error": err.Error(),
 			})
+			// Show notification for download failure
+			if a.showNotification && a.trayManager != nil {
+				a.trayManager.ShowNotification("下载失败", task.Title)
+			}
 			return
 		}
 
 		task.Status = downloader.StatusCompleted
 		task.FilePath = outputPath
 		task.Progress = 100
+		task.Speed = 0 // Reset speed when completed
 		task.CompletedAt = time.Now().Unix()
 		runtime.EventsEmit(a.ctx, "download:complete", task.TaskToJSON())
+		// Show notification for download complete
+		if a.showNotification && a.trayManager != nil {
+			a.trayManager.ShowNotification("下载完成", task.Title)
+		}
 	}()
 
 	return id, nil
