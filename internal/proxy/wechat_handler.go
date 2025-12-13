@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -102,6 +103,7 @@ type WeChatHandler struct {
 	detectedURLs      sync.Map
 	onVideoDetected   func(WeChatVideoInfo)
 	onDownloadRequest func(WeChatVideoInfo)
+	recentVideos      sync.Map
 
 	// Current video tracking - only keeps the current video
 	currentVideo   *WeChatVideoInfo
@@ -110,6 +112,13 @@ type WeChatHandler struct {
 	// avoid probing the same URL repeatedly
 	probedSizes sync.Map
 }
+
+type recentVideoCache struct {
+	Video WeChatVideoInfo
+	Ts    time.Time
+}
+
+var badDurationPattern = regexp.MustCompile(`\d{1,2}:\d{2}\s*/\s*\d{1,2}:\d{2}`)
 
 // NewWeChatHandler creates a new WeChatHandler instance
 func NewWeChatHandler() *WeChatHandler {
@@ -150,6 +159,11 @@ func (wh *WeChatHandler) HandleWeChatRequestWithType(body []byte, reqType string
 	videoInfo, err := wh.ParseVideoPayload(body)
 	if err != nil {
 		return err
+	}
+	sanitizeWeChatVideo(videoInfo)
+	if wh.shouldSkipDuplicate(videoInfo) {
+		logger.Debug("WeChat duplicate skipped: %s", videoInfo.Title)
+		return nil
 	}
 
 	// Update current video (replace, not accumulate)
@@ -641,6 +655,132 @@ func IsLiveStreamURL(videoURL string) bool {
 	if strings.Contains(u, ".m3u8") || strings.Contains(u, ".flv") || strings.Contains(u, ".mpd") {
 		return true
 	}
+	return false
+}
+
+func sanitizeWeChatVideo(v *WeChatVideoInfo) {
+	if v == nil {
+		return
+	}
+	if isBadWeChatTitle(v.Title) {
+		v.Title = "未知标题"
+	}
+	if isBadWeChatAuthor(v.Author) {
+		v.Author = "未知作者"
+	}
+}
+
+func isBadWeChatTitle(t string) bool {
+	s := strings.TrimSpace(t)
+	if s == "" {
+		return true
+	}
+	low := strings.ToLower(s)
+	if strings.Contains(low, "restore all settings to the default values") {
+		return true
+	}
+	if strings.Contains(low, "video player is loading") {
+		return true
+	}
+	if strings.Contains(low, "自动续播") || strings.Contains(low, "小窗模式") || strings.Contains(low, "倍速") {
+		return true
+	}
+	if badDurationPattern.MatchString(low) {
+		return true
+	}
+	return false
+}
+
+func isBadWeChatAuthor(a string) bool {
+	s := strings.TrimSpace(a)
+	if s == "" {
+		return true
+	}
+	low := strings.ToLower(s)
+	if strings.Contains(low, "video player is loading") {
+		return true
+	}
+	if strings.Contains(low, "restore all settings to the default values") {
+		return true
+	}
+	if strings.Contains(low, "个朋友") || strings.Contains(low, "朋友") {
+		return true
+	}
+	return false
+}
+
+func canonicalKeyForVideo(v WeChatVideoInfo) string {
+	if strings.TrimSpace(v.ID) != "" {
+		return strings.TrimSpace(v.ID)
+	}
+	parts := make([]string, 0, 2)
+	if strings.TrimSpace(v.URL) != "" {
+		parts = append(parts, strings.TrimSpace(v.URL))
+	}
+	if strings.TrimSpace(v.DecodeKey) != "" {
+		parts = append(parts, strings.TrimSpace(v.DecodeKey))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.Join(parts, "::")
+}
+
+func hasServerImprovement(prev, next WeChatVideoInfo) bool {
+	pt := strings.TrimSpace(prev.Title)
+	nt := strings.TrimSpace(next.Title)
+	if !isBadWeChatTitle(nt) {
+		if isBadWeChatTitle(pt) && nt != "" {
+			return true
+		}
+		if len(nt) > len(pt) && pt != nt {
+			return true
+		}
+	}
+	if strings.TrimSpace(prev.CoverURL) == "" && strings.TrimSpace(next.CoverURL) != "" {
+		return true
+	}
+	if isBadWeChatAuthor(prev.Author) && !isBadWeChatAuthor(next.Author) && strings.TrimSpace(next.Author) != "" {
+		return true
+	}
+	if prev.FileSize <= 0 && next.FileSize > 0 {
+		return true
+	}
+	if prev.FileSize > 0 && next.FileSize > prev.FileSize*1.2 {
+		return true
+	}
+	if prev.Duration <= 0 && next.Duration > 0 {
+		return true
+	}
+	if prev.Width == 0 && next.Width > 0 {
+		return true
+	}
+	if prev.Height == 0 && next.Height > 0 {
+		return true
+	}
+	return false
+}
+
+func (wh *WeChatHandler) shouldSkipDuplicate(v *WeChatVideoInfo) bool {
+	if v == nil {
+		return true
+	}
+	key := canonicalKeyForVideo(*v)
+	if key == "" {
+		key = strings.TrimSpace(v.URL)
+	}
+	if key == "" {
+		return false
+	}
+	now := time.Now()
+	if cached, ok := wh.recentVideos.Load(key); ok {
+		if cv, ok2 := cached.(recentVideoCache); ok2 {
+			if !hasServerImprovement(cv.Video, *v) && now.Sub(cv.Ts) < 12*time.Second {
+				return true
+			}
+		}
+	}
+	wh.recentVideos.Store(key, recentVideoCache{Video: *v, Ts: now})
 	return false
 }
 

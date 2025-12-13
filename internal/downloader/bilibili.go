@@ -1,6 +1,7 @@
 package downloader
 
 import (
+	"EasyDownload/internal/config"
 	"EasyDownload/internal/logger"
 	"encoding/json"
 	"fmt"
@@ -62,13 +63,8 @@ type BilibiliDownloader struct {
 
 // ConfigManagerInterface defines the interface for config management
 type ConfigManagerInterface interface {
-	Get() *ConfigInterface
+	Get() *config.Config
 	Set(key string, value any) error
-}
-
-// ConfigInterface defines the interface for config access
-type ConfigInterface struct {
-	BilibiliSessData string
 }
 
 // NewBilibiliDownloader creates a new BilibiliDownloader
@@ -93,9 +89,9 @@ func (bd *BilibiliDownloader) SaveSessData(sessData string) error {
 // LoadSessData loads the SESSDATA from persistent storage via config manager
 func (bd *BilibiliDownloader) LoadSessData() (string, error) {
 	if bd.configManager != nil {
-		config := bd.configManager.Get()
-		if config != nil && config.BilibiliSessData != "" {
-			bd.sessData = config.BilibiliSessData
+		cfg := bd.configManager.Get()
+		if cfg != nil && cfg.BilibiliSessData != "" {
+			bd.sessData = cfg.BilibiliSessData
 			return bd.sessData, nil
 		}
 	}

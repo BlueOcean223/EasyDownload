@@ -55,6 +55,9 @@ const downloadButtonScript = `
     lastVideoId: null,
     contact: null,
     worker: null,
+    lastMetaById: {},
+    lastEmitById: {},
+    recentAccepted: {},
     // Context gating to avoid reporting preloaded/offscreen videos
     pageKey: '',
     lastHref: '',
@@ -249,6 +252,7 @@ const downloadButtonScript = `
       var s = window.__easydownload_store__;
       if (!s) return false;
 
+      var now = __ed_now();
       var source = (meta && meta.source) ? String(meta.source) : '';
       var pageKey = __ed_getPageKey();
       var focused = __ed_recentlyFocused();
@@ -267,11 +271,17 @@ const downloadButtonScript = `
         } catch (e) {}
       }
 
+      // Per-id throttle to reduce bursts on the same content.
+      if (videoId) {
+        if (!s.lastEmitById) s.lastEmitById = {};
+        var lastById = Number(s.lastEmitById[videoId] || 0);
+        if (videoId !== s.lastVideoId && lastById && (now - lastById) < 2000) return false;
+      }
+
       // Always allow meta refresh for the already-accepted current video.
       if (videoId && s.lastVideoId && videoId === s.lastVideoId) return true;
 
       // Global throttle to avoid bursts even if gating fails (ms)
-      var now = __ed_now();
       if (now - Number(s.lastEmitTs || 0) < 350) {
         // Still allow same-video meta updates (handled above)
         return false;
@@ -279,6 +289,10 @@ const downloadButtonScript = `
 
       // Prefer pageKey gating when available
       if (pageKey) {
+        var recent = s.recentAccepted && s.recentAccepted[pageKey] ? s.recentAccepted[pageKey] : null;
+        if (recent && recent.id && videoId && recent.id === videoId && (now - Number(recent.ts || 0)) < 8000) {
+          return false;
+        }
         var accepted = s.acceptedByPageKey ? s.acceptedByPageKey[pageKey] : '';
         if (accepted) {
           // Only allow updates for the accepted video of this pageKey
@@ -303,6 +317,8 @@ const downloadButtonScript = `
         // Accept and bind this pageKey to this videoId
         if (!s.acceptedByPageKey) s.acceptedByPageKey = {};
         s.acceptedByPageKey[pageKey] = videoId || 'unknown';
+        if (!s.recentAccepted) s.recentAccepted = {};
+        s.recentAccepted[pageKey] = { id: videoId || 'unknown', ts: now };
         return true;
       }
 
@@ -459,6 +475,8 @@ const downloadButtonScript = `
       if (low.indexOf('escape will cancel') !== -1) return true;
       if (low.indexOf('cancel and close the window') !== -1) return true;
       if (low === 'play video' || low.indexOf('play video') !== -1) return true;
+      if (low.indexOf('restore all settings to the default values') !== -1) return true;
+      if (low.indexOf('video player is loading') !== -1) return true;
     } catch (e) {}
     // Obvious UI labels / nav items (avoid picking buttons as title)
     var bad = ['下载','收藏','关注','举报','分享','更多','清晰度','倍速','设置','登录','搜索','推荐','朋友','直播','音乐','游戏','影视','美食','旅游','生活','知识','评论','转发'];
@@ -467,6 +485,8 @@ const downloadButtonScript = `
       if (txt.indexOf(bad[i]) === 0 && txt.length <= 6) return true;
     }
     if (/^\d{1,2}:\d{2}$/.test(txt)) return true;
+    if (/[0-9]{1,2}:[0-9]{2}\s*\/\s*[0-9]{1,2}:[0-9]{2}/.test(txt)) return true;
+    if (/(自动续播|小窗模式|默认值)/.test(txt)) return true;
     return false;
   }
 
@@ -494,6 +514,8 @@ const downloadButtonScript = `
       if (low === 'play video' || low.indexOf('play video') !== -1) return true;
       if (low.indexOf('beginning of dialog window') !== -1) return true;
       if (low.indexOf('escape will cancel') !== -1) return true;
+      if (low.indexOf('video player is loading') !== -1) return true;
+      if (low.indexOf('restore all settings to the default values') !== -1) return true;
     } catch (e) {}
     // Friend/social hints are NOT author
     if (/等\s*\d+\s*个朋友/.test(a)) return true;
@@ -1379,7 +1401,7 @@ const downloadButtonScript = `
     try {
       var dm = __ed_collectDomMeta();
       if (dm) {
-        if (!__ed_trim(objectDesc.description) && __ed_trim(dm.title)) {
+        if (!__ed_trim(objectDesc.description) && __ed_trim(dm.title) && !__ed_isBadTitle(dm.title)) {
           objectDesc.description = dm.title;
         }
         if (media && !__ed_trim(media.coverUrl) && __ed_trim(dm.coverUrl)) {
@@ -1424,16 +1446,23 @@ const downloadButtonScript = `
 
     // Prefer stable identifiers if present; fallback to url + decodeKey
     var videoId = __ed_computeVideoId(objectDesc);
+    var prevMeta = null;
+    try {
+      if (window.__easydownload_store__ && window.__easydownload_store__.lastMetaById) {
+        prevMeta = window.__easydownload_store__.lastMetaById[videoId] || null;
+      }
+    } catch (e) {}
     
     // If same video id, allow "meta-only" improvements (title/cover/author/spec) to refresh UI once.
     if (videoId === window.__easydownload_store__.lastVideoId) {
       try {
-        var cur = window.__easydownload_store__.currentVideo;
+        var cur = window.__easydownload_store__.currentVideo || (prevMeta && prevMeta.objectDesc) || null;
+        var prevContact = (prevMeta && prevMeta.contact) ? prevMeta.contact : null;
         var curTitle = cur ? __ed_trim(cur.description || '') : '';
         var nextTitle = __ed_trim(objectDesc.description || '');
         var curCover = (cur && cur.media && cur.media[0]) ? __ed_trim(cur.media[0].coverUrl || '') : '';
         var nextCover = (objectDesc.media && objectDesc.media[0]) ? __ed_trim(objectDesc.media[0].coverUrl || '') : '';
-        var curNick = (window.__easydownload_store__.contact && window.__easydownload_store__.contact.nickname) ? __ed_trim(window.__easydownload_store__.contact.nickname) : '';
+        var curNick = (window.__easydownload_store__.contact && window.__easydownload_store__.contact.nickname) ? __ed_trim(window.__easydownload_store__.contact.nickname) : (prevContact && prevContact.nickname ? __ed_trim(prevContact.nickname) : '');
         var nextNick = (contact && contact.nickname) ? __ed_trim(contact.nickname) : '';
         // duration/size/spec improvements should also refresh UI (otherwise we get "duplicates" with missing fields)
         var curDur = 0, nextDur = 0;
@@ -1446,6 +1475,13 @@ const downloadButtonScript = `
               try { curDur = Number(cur.media[0].spec[0].durationMs || 0) || 0; } catch (e) { curDur = 0; }
               try { curW = Number(cur.media[0].spec[0].width || 0) || 0; } catch (e) { curW = 0; }
               try { curH = Number(cur.media[0].spec[0].height || 0) || 0; } catch (e) { curH = 0; }
+            }
+          } else if (prevMeta && prevMeta.objectDesc && prevMeta.objectDesc.media && prevMeta.objectDesc.media[0]) {
+            try { curSize = Number(prevMeta.objectDesc.media[0].fileSize || 0) || 0; } catch (e) { curSize = 0; }
+            if (prevMeta.objectDesc.media[0].spec && prevMeta.objectDesc.media[0].spec.length) {
+              try { curDur = Number(prevMeta.objectDesc.media[0].spec[0].durationMs || 0) || 0; } catch (e) { curDur = 0; }
+              try { curW = Number(prevMeta.objectDesc.media[0].spec[0].width || 0) || 0; } catch (e) { curW = 0; }
+              try { curH = Number(prevMeta.objectDesc.media[0].spec[0].height || 0) || 0; } catch (e) { curH = 0; }
             }
           }
         } catch (e) {}
@@ -1461,8 +1497,8 @@ const downloadButtonScript = `
         } catch (e) {}
 
         var improved = false;
-        if (!curTitle && nextTitle) improved = true;
-        if (curTitle && nextTitle && nextTitle.length > curTitle.length && curTitle !== nextTitle) improved = true;
+        if (!curTitle && nextTitle && !__ed_isBadTitle(nextTitle)) improved = true;
+        if (curTitle && nextTitle && !__ed_isBadTitle(nextTitle) && nextTitle.length > curTitle.length && curTitle !== nextTitle) improved = true;
         if (!curCover && nextCover) improved = true;
         if (!curNick && nextNick) improved = true;
         if (!curDur && nextDur) improved = true;
@@ -1480,6 +1516,22 @@ const downloadButtonScript = `
     window.__easydownload_store__.lastVideoId = videoId;
     window.__easydownload_store__.currentVideo = objectDesc;
     window.__easydownload_store__.contact = contact || null;
+    try {
+      if (!window.__easydownload_store__.lastMetaById) window.__easydownload_store__.lastMetaById = {};
+      var snapMedia = media ? {
+        coverUrl: media.coverUrl || '',
+        fileSize: media.fileSize || 0,
+        spec: media.spec ? JSON.parse(JSON.stringify(media.spec)) : []
+      } : {};
+      var snapContact = contact ? { nickname: contact.nickname || '', head_url: contact.head_url || contact.headUrl || '' } : null;
+      window.__easydownload_store__.lastMetaById[videoId] = {
+        objectDesc: { description: objectDesc.description || '', media: [snapMedia] },
+        contact: snapContact,
+        ts: __ed_now()
+      };
+      if (!window.__easydownload_store__.lastEmitById) window.__easydownload_store__.lastEmitById = {};
+      window.__easydownload_store__.lastEmitById[videoId] = __ed_now();
+    } catch (e) {}
     
     console.log('[EasyDownload] Current video updated:', objectDesc.description || 'Unknown');
     
@@ -1526,14 +1578,14 @@ const downloadButtonScript = `
             var c2 = __ed_trim(dm2.coverUrl || '');
             var n2 = dm2.contact && dm2.contact.nickname ? __ed_trim(dm2.contact.nickname) : '';
             var need = false;
-            if (t2 && (__ed_trim(objectDesc.description || '') !== t2)) need = true;
+            if (t2 && !__ed_isBadTitle(t2) && (__ed_trim(objectDesc.description || '') !== t2)) need = true;
             if (c2 && (!media.coverUrl)) need = true;
-            if (n2 && (!contact || !contact.nickname)) need = true;
+            if (n2 && !__ed_isBadAuthorName(n2) && (!contact || !contact.nickname)) need = true;
             if (!need) return;
             // Call updateVideo again; meta-only improvements are allowed above.
             var clone = objectDesc;
             try {
-              if (t2) clone.description = t2;
+              if (t2 && !__ed_isBadTitle(t2)) clone.description = t2;
               if (c2) clone.media[0].coverUrl = c2;
             } catch (e) {}
             var ctt = contact;
@@ -1743,9 +1795,12 @@ const downloadButtonScript = `
     if (window.location.pathname !== lastPath) {
       lastPath = window.location.pathname;
       // Clear current video when navigating to new page
-      window.__easydownload_store__.currentVideo = null;
-      window.__easydownload_store__.lastVideoId = null;
-      window.__easydownload_store__.contact = null;
+      try {
+        if (window.__easydownload_store__) {
+          window.__easydownload_store__.currentVideo = null;
+          window.__easydownload_store__.contact = null;
+        }
+      } catch (e) {}
       setTimeout(injectDownloadButton, 500);
     }
   }, 500);

@@ -147,10 +147,26 @@ func (fm *FFmpegManager) getExtractedPath() string {
 	return filepath.Join(fm.extractDir, ffmpegName)
 }
 
-// verifyFFmpeg checks if the FFmpeg binary is valid and executable
+// verifyFFmpeg checks if the FFmpeg binary exists and is valid
+// First checks file existence, then tries to run it with full path
 func (fm *FFmpegManager) verifyFFmpeg(path string) bool {
+	// First check if file exists
+	info, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	// Check it's a file, not a directory, and has content
+	if info.IsDir() || info.Size() == 0 {
+		return false
+	}
+
+	// Try to run ffmpeg -version with full absolute path
+	// exec.Command handles absolute paths correctly regardless of working directory
 	cmd := exec.Command(path, "-version")
-	err := cmd.Run()
+	// Set working directory to the directory containing ffmpeg
+	cmd.Dir = filepath.Dir(path)
+	err = cmd.Run()
+
 	return err == nil
 }
 

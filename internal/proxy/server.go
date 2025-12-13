@@ -61,8 +61,7 @@ type ProxyServer struct {
 	upstreamProxy string
 
 	// Diagnostics
-	debug        bool
-	wechatNoMITM bool
+	debug bool
 
 	// WeChat video capture components
 	jsInjector    *JSInjector
@@ -124,12 +123,6 @@ func (ps *ProxyServer) SetUpstreamProxy(proxyURL string) {
 // SetDebug enables/disables verbose proxy diagnostics logging.
 func (ps *ProxyServer) SetDebug(enabled bool) {
 	ps.debug = enabled
-}
-
-// SetWeChatNoMITM forces pass-through (no MITM) for WeChat Channels hosts.
-// This is used for diagnosis; it disables injection while enabled.
-func (ps *ProxyServer) SetWeChatNoMITM(enabled bool) {
-	ps.wechatNoMITM = enabled
 }
 
 // Start starts the proxy server
@@ -312,12 +305,6 @@ func (ps *ProxyServer) setupHandlers() {
 		switch {
 		case videoStreamingPattern.MatchString(host):
 			action = "OK(stream)"
-			if ps.debug {
-				logger.Info("[proxy-debug] CONNECT %s -> %s (%s)", host, action, time.Since(start))
-			}
-			return goproxy.OkConnect, host
-		case ps.wechatNoMITM && (strings.Contains(host, "channels.weixin.qq.com") || strings.Contains(host, "res.wx.qq.com")):
-			action = "OK(wechatNoMITM)"
 			if ps.debug {
 				logger.Info("[proxy-debug] CONNECT %s -> %s (%s)", host, action, time.Since(start))
 			}

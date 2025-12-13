@@ -23,9 +23,7 @@ import {
   SetUpstreamProxy,
   SetUseUpstreamProxy,
   GetProxyDebug,
-  SetProxyDebug,
-  GetWeChatNoMITM,
-  SetWeChatNoMITM
+  SetProxyDebug
 } from '../../wailsjs/go/main/App'
 
 const store = useAppStore()
@@ -37,7 +35,6 @@ const savingSessData = ref(false)
 const logDir = ref('')
 const upstreamProxyInput = ref('')
 const proxyDebug = ref(false)
-const wechatNoMITM = ref(false)
 
 onMounted(async () => {
   // Load SESSDATA
@@ -66,11 +63,6 @@ onMounted(async () => {
     proxyDebug.value = await GetProxyDebug()
   } catch (e) {
     console.error('Failed to get proxy debug:', e)
-  }
-  try {
-    wechatNoMITM.value = await GetWeChatNoMITM()
-  } catch (e) {
-    console.error('Failed to get wechatNoMITM:', e)
   }
 })
 
@@ -152,16 +144,6 @@ async function toggleProxyDebug(value: boolean) {
   }
 }
 
-async function toggleWeChatNoMITM(value: boolean) {
-  try {
-    await SetWeChatNoMITM(value)
-    wechatNoMITM.value = value
-    message.warning(value ? '已启用视频号直通（将禁用注入/一键下载，仅用于定位）' : '已关闭视频号直通')
-  } catch (e: any) {
-    message.error(e.message || '设置失败')
-  }
-}
-
 async function saveUpstreamProxy() {
   try {
     await SetUpstreamProxy(upstreamProxyInput.value)
@@ -225,14 +207,6 @@ async function saveUpstreamProxy() {
               <p class="text-xs text-gray-500">记录 CONNECT/编码/改写信息到日志，用于定位视频号卡加载</p>
             </div>
             <NSwitch :value="proxyDebug" @update:value="toggleProxyDebug" />
-          </div>
-
-          <div class="flex items-center justify-between">
-            <div>
-              <p class="text-sm font-medium">视频号直通（不 MITM）</p>
-              <p class="text-xs text-gray-500">仅用于定位：channels/res 直通，注入/一键下载会失效</p>
-            </div>
-            <NSwitch :value="wechatNoMITM" @update:value="toggleWeChatNoMITM" />
           </div>
           
           <div v-if="store.useUpstreamProxy">

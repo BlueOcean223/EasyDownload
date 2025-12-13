@@ -41,8 +41,6 @@ export function GetTheme():Promise<string>;
 
 export function GetUpstreamProxy():Promise<string>;
 
-export function GetWeChatNoMITM():Promise<boolean>;
-
 export function InstallCert():Promise<void>;
 
 export function IsCertInstalled():Promise<boolean>;
@@ -98,8 +96,6 @@ export function SetTheme(arg1:string):Promise<void>;
 export function SetUpstreamProxy(arg1:string):Promise<void>;
 
 export function SetUseUpstreamProxy(arg1:boolean):Promise<void>;
-
-export function SetWeChatNoMITM(arg1:boolean):Promise<void>;
 
 export function ShowNotification(arg1:string,arg2:string):Promise<void>;
 

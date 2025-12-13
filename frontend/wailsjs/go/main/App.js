@@ -78,10 +78,6 @@ export function GetUpstreamProxy() {
   return window['go']['main']['App']['GetUpstreamProxy']();
 }
 
-export function GetWeChatNoMITM() {
-  return window['go']['main']['App']['GetWeChatNoMITM']();
-}
-
 export function InstallCert() {
   return window['go']['main']['App']['InstallCert']();
 }
@@ -192,10 +188,6 @@ export function SetUpstreamProxy(arg1) {
 
 export function SetUseUpstreamProxy(arg1) {
   return window['go']['main']['App']['SetUseUpstreamProxy'](arg1);
-}
-
-export function SetWeChatNoMITM(arg1) {
-  return window['go']['main']['App']['SetWeChatNoMITM'](arg1);
 }
 
 export function ShowNotification(arg1, arg2) {

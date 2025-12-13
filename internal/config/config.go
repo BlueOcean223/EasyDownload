@@ -38,8 +38,11 @@ type Config struct {
 	UseUpstreamProxy bool   `json:"useUpstreamProxy"` // Whether to use upstream proxy
 
 	// Diagnostics
-	ProxyDebug   bool `json:"proxyDebug"`   // Enable verbose proxy diagnostics logs
-	WeChatNoMITM bool `json:"wechatNoMITM"` // Force pass-through (no MITM) for WeChat Channels hosts
+	ProxyDebug bool `json:"proxyDebug"` // Enable verbose proxy diagnostics logs
+
+	// Cached detection results (for faster startup)
+	FFmpegPath    string `json:"ffmpegPath,omitempty"` // Cached FFmpeg executable path
+	CertInstalled bool   `json:"certInstalled"`        // Cached certificate installation status
 
 	// Version info
 	Version string `json:"version"`
@@ -66,7 +69,8 @@ func DefaultConfig() *Config {
 		UpstreamProxy:    "",
 		UseUpstreamProxy: false,
 		ProxyDebug:       false,
-		WeChatNoMITM:     false,
+		FFmpegPath:       "",
+		CertInstalled:    false,
 		Version:          "1.0.0",
 	}
 }
@@ -306,11 +310,17 @@ func (cm *ConfigManager) Set(key string, value any) error {
 		} else {
 			return fmt.Errorf("invalid type for proxyDebug")
 		}
-	case "wechatNoMITM":
-		if v, ok := value.(bool); ok {
-			cm.config.WeChatNoMITM = v
+	case "ffmpegPath":
+		if v, ok := value.(string); ok {
+			cm.config.FFmpegPath = v
 		} else {
-			return fmt.Errorf("invalid type for wechatNoMITM")
+			return fmt.Errorf("invalid type for ffmpegPath")
+		}
+	case "certInstalled":
+		if v, ok := value.(bool); ok {
+			cm.config.CertInstalled = v
+		} else {
+			return fmt.Errorf("invalid type for certInstalled")
 		}
 	default:
 		return fmt.Errorf("unknown config key: %s", key)

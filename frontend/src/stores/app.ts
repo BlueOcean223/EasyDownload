@@ -114,6 +114,10 @@ export const useAppStore = defineStore('app', () => {
       if (low.includes('escape will cancel')) return true
       if (low.includes('cancel and close the window')) return true
       if (low === 'play video' || low.includes('play video')) return true
+      if (low.includes('restore all settings to the default values')) return true
+      if (low.includes('video player is loading')) return true
+      if (/[0-9]{1,2}:[0-9]{2}\s*\/\s*[0-9]{1,2}:[0-9]{2}/.test(s)) return true
+      if (s.includes('自动续播') || s.includes('小窗模式') || s.includes('默认值')) return true
       return false
     }
 
@@ -125,6 +129,8 @@ export const useAppStore = defineStore('app', () => {
       if (low === 'play video' || low.includes('play video')) return true
       if (low.includes('beginning of dialog window')) return true
       if (low.includes('escape will cancel')) return true
+      if (low.includes('restore all settings to the default values')) return true
+      if (low.includes('video player is loading')) return true
       return false
     }
 
@@ -238,6 +244,13 @@ export const useAppStore = defineStore('app', () => {
       const exists = downloads.value.some(d => d.id === task.id)
       if (!exists) {
         downloads.value.unshift(task)
+      }
+    })
+
+    // FFmpeg ready event
+    EventsOn('ffmpeg:ready', (available: boolean) => {
+      if (available) {
+        ffmpegAvailable.value = true
       }
     })
   }

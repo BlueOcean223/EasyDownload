@@ -18,26 +18,8 @@ const (
 )
 
 // IsCertInstalled checks if the CA certificate is installed in the system trust store
-// using Windows CryptoAPI
+// using Windows CryptoAPI. Checks both LocalMachine and CurrentUser stores.
 func (cm *CertManager) IsCertInstalled() bool {
-	// Open the LocalMachine Root certificate store
-	rootStorePtr, err := windows.UTF16PtrFromString("ROOT")
-	if err != nil {
-		return false
-	}
-
-	store, err := windows.CertOpenStore(
-		windows.CERT_STORE_PROV_SYSTEM,
-		0,
-		0,
-		windows.CERT_SYSTEM_STORE_LOCAL_MACHINE,
-		uintptr(unsafe.Pointer(rootStorePtr)),
-	)
-	if err != nil {
-		return false
-	}
-	defer windows.CertCloseStore(store, 0)
-
 	// Load our certificate to get its data for comparison
 	certPEM, err := os.ReadFile(cm.CertPath)
 	if err != nil {
@@ -53,6 +35,34 @@ func (cm *CertManager) IsCertInstalled() bool {
 	if err != nil {
 		return false
 	}
+
+	// Check LocalMachine store first (where we install certs with admin privileges)
+	if cm.isCertInStore(cert, windows.CERT_SYSTEM_STORE_LOCAL_MACHINE) {
+		return true
+	}
+
+	// Also check CurrentUser store as fallback
+	return cm.isCertInStore(cert, windows.CERT_SYSTEM_STORE_CURRENT_USER)
+}
+
+// isCertInStore checks if a certificate is in a specific Windows certificate store
+func (cm *CertManager) isCertInStore(cert *x509.Certificate, storeLocation uint32) bool {
+	rootStorePtr, err := windows.UTF16PtrFromString("ROOT")
+	if err != nil {
+		return false
+	}
+
+	store, err := windows.CertOpenStore(
+		windows.CERT_STORE_PROV_SYSTEM,
+		0,
+		0,
+		storeLocation,
+		uintptr(unsafe.Pointer(rootStorePtr)),
+	)
+	if err != nil {
+		return false
+	}
+	defer windows.CertCloseStore(store, 0)
 
 	// Search for our certificate by subject name
 	subjectPtr, err := windows.UTF16PtrFromString(cert.Subject.CommonName)

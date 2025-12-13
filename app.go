@@ -46,8 +46,7 @@ type App struct {
 	useUpstreamProxy bool   // Whether to use upstream proxy
 
 	// Diagnostics
-	proxyDebug   bool
-	wechatNoMITM bool
+	proxyDebug bool
 }
 
 // NewApp creates a new App application struct
@@ -71,7 +70,6 @@ func NewApp() *App {
 		upstreamProxy:    "",
 		useUpstreamProxy: false,
 		proxyDebug:       false,
-		wechatNoMITM:     false,
 	}
 }
 
@@ -110,7 +108,6 @@ func (a *App) startup(ctx context.Context) {
 			a.upstreamProxy = cfg.UpstreamProxy
 			a.useUpstreamProxy = cfg.UseUpstreamProxy
 			a.proxyDebug = cfg.ProxyDebug
-			a.wechatNoMITM = cfg.WeChatNoMITM
 		}
 	}
 
@@ -126,10 +123,16 @@ func (a *App) startup(ctx context.Context) {
 		}
 	}
 
+	// Proactively check and cache certificate installation status
+	certInstalled := a.certManager.IsCertInstalled()
+	log.Printf("Certificate installed: %v", certInstalled)
+	if a.configManager != nil {
+		_ = a.configManager.Set("certInstalled", certInstalled)
+	}
+
 	// Initialize proxy server
 	a.proxyServer = proxy.NewProxyServer(a.certManager, a.proxyPort)
 	a.proxyServer.SetDebug(a.proxyDebug)
-	a.proxyServer.SetWeChatNoMITM(a.wechatNoMITM)
 
 	// Initialize system proxy
 	a.systemProxy = proxy.NewSystemProxy()
@@ -162,11 +165,21 @@ func (a *App) startup(ctx context.Context) {
 
 	// Initialize Bilibili downloader
 	a.bilibiliDownloader = downloader.NewBilibiliDownloader()
+	if a.configManager != nil {
+		a.bilibiliDownloader.SetConfigManager(a.configManager)
+		// Load persisted SESSDATA
+		if _, err := a.bilibiliDownloader.LoadSessData(); err != nil {
+			log.Printf("Failed to load Bilibili SESSDATA: %v", err)
+		}
+	}
 
 	// Initialize FFmpeg manager with embedded FFmpeg
 	a.ffmpegManager = ffmpeg.NewFFmpegManager()
 	ffmpegDir := filepath.Join(utils.GetAppDataDir(), "ffmpeg")
 	a.ffmpegManager.SetExtractDir(ffmpegDir)
+
+	// Set FFmpeg manager for Bilibili downloader
+	a.bilibiliDownloader.SetFFmpegManager(a.ffmpegManager)
 
 	// Set embedded FS and extract if available
 	if assets.HasEmbeddedFFmpeg() {
@@ -175,30 +188,40 @@ func (a *App) startup(ctx context.Context) {
 			log.Printf("Failed to extract embedded FFmpeg: %v", err)
 		} else {
 			log.Printf("FFmpeg ready at: %s", a.ffmpegManager.GetPath())
+			runtime.EventsEmit(a.ctx, "ffmpeg:ready", true)
 		}
 	}
 
-	// Set FFmpeg manager for Bilibili downloader
-	a.bilibiliDownloader.SetFFmpegManager(a.ffmpegManager)
+	// Even if embedded FFmpeg is not available, check if FFmpeg already exists
+	// This ensures detection works when FFmpeg was previously extracted
+	if ffmpegPath := a.ffmpegManager.GetPath(); ffmpegPath != "" {
+		log.Printf("FFmpeg detected at: %s", ffmpegPath)
+		// Cache to config for faster startup next time
+		if a.configManager != nil {
+			_ = a.configManager.Set("ffmpegPath", ffmpegPath)
+		}
+		// Ensure frontend is notified if it wasn't the embedded extraction that triggered it
+		runtime.EventsEmit(a.ctx, "ffmpeg:ready", true)
+	}
 
 	// Set proxy video callback
 	a.proxyServer.SetVideoCallback(func(video proxy.VideoInfo) {
 		apiVideo := api.DetectedVideo{
-			ID:        video.ID,
-			Title:     video.Title,
-			Cover:     video.Cover,
-			URL:       video.URL,
-			Source:    video.Source,
-			Quality:   video.Quality,
-			Duration:  video.Duration,
-			Author:    video.Author,
+			ID:           video.ID,
+			Title:        video.Title,
+			Cover:        video.Cover,
+			URL:          video.URL,
+			Source:       video.Source,
+			Quality:      video.Quality,
+			Duration:     video.Duration,
+			Author:       video.Author,
 			AuthorAvatar: video.AuthorAvatar,
-			Timestamp: video.Timestamp,
-			DecodeKey: video.DecodeKey,
-			FileSize:  video.FileSize,
-			Width:     video.Width,
-			Height:    video.Height,
-			IsCurrent: video.IsCurrent,
+			Timestamp:    video.Timestamp,
+			DecodeKey:    video.DecodeKey,
+			FileSize:     video.FileSize,
+			Width:        video.Width,
+			Height:       video.Height,
+			IsCurrent:    video.IsCurrent,
 		}
 		runtime.EventsEmit(a.ctx, "video:detected", apiVideo)
 	})
@@ -367,19 +390,38 @@ func (a *App) GetProxyPort() int {
 
 // ==================== Certificate Methods ====================
 
-// IsCertInstalled checks if the CA certificate is installed
+// IsCertInstalled checks if the CA certificate is installed and caches the status
 func (a *App) IsCertInstalled() bool {
-	return a.certManager.IsCertInstalled()
+	installed := a.certManager.IsCertInstalled()
+	// Cache the cert installation status to config for faster startup next time
+	if a.configManager != nil {
+		_ = a.configManager.Set("certInstalled", installed)
+	}
+	return installed
 }
 
 // InstallCert installs the CA certificate to the system trust store
 func (a *App) InstallCert() error {
-	return a.certManager.InstallCert()
+	err := a.certManager.InstallCert()
+	if err == nil {
+		// Cache the installation status immediately
+		if a.configManager != nil {
+			_ = a.configManager.Set("certInstalled", true)
+		}
+	}
+	return err
 }
 
 // UninstallCert removes the CA certificate from the system trust store
 func (a *App) UninstallCert() error {
-	return a.certManager.UninstallCert()
+	err := a.certManager.UninstallCert()
+	if err == nil {
+		// Cache the uninstallation status immediately
+		if a.configManager != nil {
+			_ = a.configManager.Set("certInstalled", false)
+		}
+	}
+	return err
 }
 
 // GetCertPath returns the CA certificate file path
@@ -581,9 +623,17 @@ func (a *App) GetBilibiliSessData() string {
 	return sessData
 }
 
-// IsFFmpegAvailable checks if ffmpeg is available
+// IsFFmpegAvailable checks if ffmpeg is available and caches the path
 func (a *App) IsFFmpegAvailable() bool {
-	return a.bilibiliDownloader.IsFFmpegAvailable()
+	available := a.bilibiliDownloader.IsFFmpegAvailable()
+	// Cache the FFmpeg path to config for faster startup next time
+	if available && a.configManager != nil && a.ffmpegManager != nil {
+		path := a.ffmpegManager.GetPath()
+		if path != "" {
+			_ = a.configManager.Set("ffmpegPath", path)
+		}
+	}
+	return available
 }
 
 // ==================== Settings Methods ====================
@@ -599,6 +649,9 @@ func (a *App) SetDownloadDir(dir string) error {
 		return err
 	}
 	a.downloadDir = dir
+	if a.configManager != nil {
+		_ = a.configManager.Set("downloadDir", dir)
+	}
 	return nil
 }
 
@@ -645,7 +698,6 @@ func (a *App) GetAppInfo() map[string]interface{} {
 		"upstreamProxy":    a.upstreamProxy,
 		"useUpstreamProxy": a.useUpstreamProxy,
 		"proxyDebug":       a.proxyDebug,
-		"wechatNoMITM":     a.wechatNoMITM,
 	}
 }
 
@@ -675,6 +727,9 @@ func (a *App) IsMinimizeToTrayEnabled() bool {
 // SetMinimizeToTray sets whether to minimize to tray on close
 func (a *App) SetMinimizeToTray(enabled bool) {
 	a.minimizeToTray = enabled
+	if a.configManager != nil {
+		_ = a.configManager.Set("minimizeToTray", enabled)
+	}
 }
 
 // IsShowNotificationEnabled returns whether notifications are enabled
@@ -685,6 +740,9 @@ func (a *App) IsShowNotificationEnabled() bool {
 // SetShowNotification sets whether to show notifications
 func (a *App) SetShowNotification(enabled bool) {
 	a.showNotification = enabled
+	if a.configManager != nil {
+		_ = a.configManager.Set("showNotification", enabled)
+	}
 }
 
 // IsFirstRunComplete returns whether first run setup is complete
@@ -695,6 +753,9 @@ func (a *App) IsFirstRunComplete() bool {
 // SetFirstRunComplete marks first run setup as complete
 func (a *App) SetFirstRunComplete(complete bool) {
 	a.firstRunComplete = complete
+	if a.configManager != nil {
+		_ = a.configManager.Set("firstRunComplete", complete)
+	}
 }
 
 // ShowNotification shows a system notification
@@ -730,6 +791,9 @@ func (a *App) SetTheme(theme string) error {
 		return fmt.Errorf("invalid theme: must be 'dark' or 'light'")
 	}
 	a.theme = theme
+	if a.configManager != nil {
+		_ = a.configManager.Set("theme", theme)
+	}
 	return nil
 }
 
@@ -744,6 +808,9 @@ func (a *App) SetLanguage(lang string) error {
 		return fmt.Errorf("invalid language: must be 'zh-CN' or 'en-US'")
 	}
 	a.language = lang
+	if a.configManager != nil {
+		_ = a.configManager.Set("language", lang)
+	}
 	return nil
 }
 
@@ -798,19 +865,5 @@ func (a *App) SetProxyDebug(enabled bool) {
 	}
 	if a.configManager != nil {
 		_ = a.configManager.Set("proxyDebug", enabled)
-	}
-}
-
-func (a *App) GetWeChatNoMITM() bool {
-	return a.wechatNoMITM
-}
-
-func (a *App) SetWeChatNoMITM(enabled bool) {
-	a.wechatNoMITM = enabled
-	if a.proxyServer != nil {
-		a.proxyServer.SetWeChatNoMITM(enabled)
-	}
-	if a.configManager != nil {
-		_ = a.configManager.Set("wechatNoMITM", enabled)
 	}
 }

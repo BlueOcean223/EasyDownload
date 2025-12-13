@@ -1,6 +1,7 @@
 package downloader
 
 import (
+	"EasyDownload/internal/config"
 	"testing"
 
 	"github.com/leanovate/gopter"
@@ -181,16 +182,16 @@ func TestSetFFmpegPath(t *testing.T) {
 
 // MockConfigManager implements ConfigManagerInterface for testing
 type MockConfigManager struct {
-	config *ConfigInterface
+	config *config.Config
 }
 
 func NewMockConfigManager() *MockConfigManager {
 	return &MockConfigManager{
-		config: &ConfigInterface{},
+		config: &config.Config{},
 	}
 }
 
-func (m *MockConfigManager) Get() *ConfigInterface {
+func (m *MockConfigManager) Get() *config.Config {
 	return m.config
 }
 
