@@ -773,15 +773,17 @@ func (bd *BilibiliDownloader) downloadFileWithSize(url, path string, knownSize i
 }
 
 // downloadFileWithContext downloads a file with context support for cancellation and resume
+// It automatically uses multipart download for large files that support range requests
 func (bd *BilibiliDownloader) downloadFileWithContext(ctx context.Context, url, path string, knownSize int64, onProgress func(float64)) (string, error) {
 	// Check if file already exists for resume
 	var existingSize int64 = 0
 	if fileInfo, err := os.Stat(path); err == nil {
 		existingSize = fileInfo.Size()
 	}
+	stateExists := multipartStateExists(path)
 
 	// If we already have the full file, skip download
-	if knownSize > 0 && existingSize >= knownSize {
+	if knownSize > 0 && existingSize >= knownSize && !stateExists {
 		logger.Info("File already complete: %s (%d bytes)", path, existingSize)
 		if onProgress != nil {
 			onProgress(100)
@@ -789,6 +791,100 @@ func (bd *BilibiliDownloader) downloadFileWithContext(ctx context.Context, url, 
 		return path, nil
 	}
 
+	// If resuming a multipart download (resume state exists), continue with multipart.
+	if stateExists {
+		md := NewMultipartDownloader()
+		md.SetHeaders(map[string]string{
+			"Referer":         "https://www.bilibili.com/",
+			"Origin":          "https://www.bilibili.com",
+			"Accept":          "application/json, text/plain, */*",
+			"Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+		})
+		if bd.sessData != "" {
+			md.SetHeaders(map[string]string{
+				"Cookie": fmt.Sprintf("SESSDATA=%s", bd.sessData),
+			})
+		}
+		totalSize := knownSize
+		if totalSize <= 0 {
+			if st, err := loadMultipartState(path); err == nil && st != nil {
+				totalSize = st.TotalSize
+			}
+		}
+		if totalSize <= 0 {
+			checkResult := md.CheckRangeSupport(ctx, url)
+			if checkResult.Error != nil {
+				logger.Debug("Failed to check range support: %v, falling back to sequential", checkResult.Error)
+				return bd.downloadFileSequential(ctx, url, path, 0, 0, onProgress)
+			}
+			totalSize = checkResult.ContentLength
+		}
+		return bd.downloadFileMultipart(ctx, url, path, totalSize, md, onProgress)
+	}
+
+	// If resuming, use sequential download
+	if existingSize > 0 {
+		logger.Debug("Resuming download from %d bytes, using sequential download", existingSize)
+		return bd.downloadFileSequential(ctx, url, path, knownSize, existingSize, onProgress)
+	}
+
+	// For new downloads, check if multipart download is beneficial
+	md := NewMultipartDownloader()
+	md.SetHeaders(map[string]string{
+		"Referer":         "https://www.bilibili.com/",
+		"Origin":          "https://www.bilibili.com",
+		"Accept":          "application/json, text/plain, */*",
+		"Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+	})
+	if bd.sessData != "" {
+		md.SetHeaders(map[string]string{
+			"Cookie": fmt.Sprintf("SESSDATA=%s", bd.sessData),
+		})
+	}
+
+	// Determine file size - use knownSize if provided, otherwise check
+	totalSize := knownSize
+	supportsRange := true
+
+	if totalSize <= 0 {
+		checkResult := md.CheckRangeSupport(ctx, url)
+		if checkResult.Error != nil {
+			logger.Debug("Failed to check range support: %v, falling back to sequential", checkResult.Error)
+			return bd.downloadFileSequential(ctx, url, path, 0, 0, onProgress)
+		}
+		totalSize = checkResult.ContentLength
+		supportsRange = checkResult.SupportsRange
+	}
+
+	// Decide whether to use multipart download
+	if ShouldUseMultipart(supportsRange, totalSize) {
+		logger.Info("Using multipart download for Bilibili (size: %d bytes)", totalSize)
+		return bd.downloadFileMultipart(ctx, url, path, totalSize, md, onProgress)
+	}
+
+	// Fall back to sequential download
+	logger.Debug("Using sequential download (size: %d, supports range: %v)", totalSize, supportsRange)
+	return bd.downloadFileSequential(ctx, url, path, totalSize, 0, onProgress)
+}
+
+// downloadFileMultipart performs multipart download for Bilibili videos
+func (bd *BilibiliDownloader) downloadFileMultipart(ctx context.Context, url, path string, totalSize int64, md *MultipartDownloader, onProgress func(float64)) (string, error) {
+	result := md.Download(ctx, url, path, totalSize, func(downloaded, total int64) {
+		if onProgress != nil && total > 0 {
+			progress := float64(downloaded) / float64(total) * 100
+			onProgress(progress)
+		}
+	})
+
+	if result.Error != nil {
+		return "", result.Error
+	}
+
+	return path, nil
+}
+
+// downloadFileSequential performs sequential download (original logic)
+func (bd *BilibiliDownloader) downloadFileSequential(ctx context.Context, url, path string, knownSize int64, existingSize int64, onProgress func(float64)) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return "", err

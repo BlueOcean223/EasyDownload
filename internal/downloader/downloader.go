@@ -604,7 +604,117 @@ func (dm *DownloadManager) performCustomDownload(ctx context.Context, task *Down
 }
 
 // performHTTPDownload performs a standard HTTP download with Range support
+// It automatically decides whether to use multipart (chunked) download for large files
 func (dm *DownloadManager) performHTTPDownload(ctx context.Context, task *DownloadTask) error {
+	// Check if we're resuming a download - if so, use sequential download
+	task.mu.RLock()
+	downloaded := task.Downloaded
+	taskURL := task.URL
+	filePath := task.FilePath
+	fileSize := task.FileSize
+	task.mu.RUnlock()
+
+	if downloaded > 0 {
+		// If multipart resume state exists, resume with multipart (sequential can't safely continue from a
+		// single offset because multipart downloads fill multiple ranges).
+		if multipartStateExists(filePath) {
+			totalSize := fileSize
+			if totalSize <= 0 {
+				if st, err := loadMultipartState(filePath); err == nil && st != nil {
+					totalSize = st.TotalSize
+				}
+			}
+			if totalSize > 0 {
+				md := NewMultipartDownloader()
+				md.SetHeaders(map[string]string{
+					"Referer": "https://channels.weixin.qq.com/",
+				})
+				return dm.performMultipartHTTPDownload(ctx, task, md, totalSize)
+			}
+		}
+
+		// Resuming a download - use sequential to continue from where we left off
+		logger.Debug("Resuming download from %d bytes, using sequential download", downloaded)
+		return dm.performSequentialHTTPDownload(ctx, task)
+	}
+
+	// For new downloads, check if multipart download is beneficial
+	md := NewMultipartDownloader()
+	md.SetHeaders(map[string]string{
+		"Referer": "https://channels.weixin.qq.com/",
+	})
+
+	// Check range support and get file size
+	checkResult := md.CheckRangeSupport(ctx, taskURL)
+	if checkResult.Error != nil {
+		logger.Debug("Failed to check range support: %v, falling back to sequential", checkResult.Error)
+		return dm.performSequentialHTTPDownload(ctx, task)
+	}
+
+	// Update file size in task
+	if checkResult.ContentLength > 0 {
+		task.mu.Lock()
+		task.FileSize = checkResult.ContentLength
+		task.mu.Unlock()
+	}
+
+	// Decide whether to use multipart download
+	if ShouldUseMultipart(checkResult.SupportsRange, checkResult.ContentLength) {
+		logger.Info("Using multipart download for %s (size: %d bytes, supports range: %v)",
+			task.Title, checkResult.ContentLength, checkResult.SupportsRange)
+		return dm.performMultipartHTTPDownload(ctx, task, md, checkResult.ContentLength)
+	}
+
+	// Fall back to sequential download for small files or servers without range support
+	logger.Debug("Using sequential download (size: %d, supports range: %v)",
+		checkResult.ContentLength, checkResult.SupportsRange)
+	return dm.performSequentialHTTPDownload(ctx, task)
+}
+
+// performMultipartHTTPDownload performs a multipart (chunked) download for large files
+func (dm *DownloadManager) performMultipartHTTPDownload(ctx context.Context, task *DownloadTask, md *MultipartDownloader, totalSize int64) error {
+	task.mu.RLock()
+	filePath := task.FilePath
+	task.mu.RUnlock()
+
+	lastUpdate := time.Now()
+	var lastDownloaded int64 = 0
+
+	// Perform multipart download
+	result := md.Download(ctx, task.URL, filePath, totalSize, func(downloaded, total int64) {
+		task.mu.Lock()
+		task.Downloaded = downloaded
+		task.FileSize = total
+		if total > 0 {
+			task.Progress = float64(downloaded) / float64(total) * 100
+		}
+		task.mu.Unlock()
+
+		// Update speed every second
+		if time.Since(lastUpdate) >= time.Second {
+			task.mu.Lock()
+			task.Speed = downloaded - lastDownloaded
+			task.mu.Unlock()
+
+			lastDownloaded = downloaded
+			lastUpdate = time.Now()
+
+			if dm.onProgress != nil {
+				dm.onProgress(task)
+			}
+		}
+	})
+
+	if result.Error != nil {
+		return result.Error
+	}
+
+	// Handle decryption if needed
+	return dm.handlePostDownloadDecryption(task)
+}
+
+// performSequentialHTTPDownload performs a standard sequential HTTP download
+func (dm *DownloadManager) performSequentialHTTPDownload(ctx context.Context, task *DownloadTask) error {
 	// Create HTTP request
 	req, err := http.NewRequestWithContext(ctx, "GET", task.URL, nil)
 	if err != nil {
@@ -720,7 +830,12 @@ func (dm *DownloadManager) performHTTPDownload(ctx context.Context, task *Downlo
 		}
 	}
 
-	// Check if decryption is needed
+	// Handle decryption if needed
+	return dm.handlePostDownloadDecryption(task)
+}
+
+// handlePostDownloadDecryption handles decryption after download completes
+func (dm *DownloadManager) handlePostDownloadDecryption(task *DownloadTask) error {
 	task.mu.RLock()
 	decodeKey := task.DecodeKey
 	taskFilePath := task.FilePath
@@ -1219,30 +1334,43 @@ func (dm *DownloadManager) ResumeTask(id string) error {
 	// Verify the partial file exists and matches our progress
 	downloaded := task.Downloaded
 	filePath := task.FilePath
+	customDownloader := task.customDownloader
 	task.mu.Unlock()
 
-	if downloaded > 0 {
+	// For custom downloaders (e.g. Bilibili DASH), the task's FilePath may be the FINAL path
+	// that doesn't exist until merge completes. Skip generic partial-file verification.
+	if downloaded > 0 && customDownloader == nil {
 		fileInfo, err := os.Stat(filePath)
 		if err != nil {
 			if os.IsNotExist(err) {
-				// File was deleted, reset progress
-				task.mu.Lock()
-				task.Downloaded = 0
-				task.Progress = 0
-				task.mu.Unlock()
-				logger.Info("Partial file not found for task %s, restarting from beginning", id)
+				// If multipart resume state exists, don't reset (partial data tracked via state file)
+				if multipartStateExists(filePath) {
+					// keep progress as-is
+				} else {
+					// File was deleted, reset progress
+					task.mu.Lock()
+					task.Downloaded = 0
+					task.Progress = 0
+					task.mu.Unlock()
+					logger.Info("Partial file not found for task %s, restarting from beginning", id)
+				}
 			} else {
 				return fmt.Errorf("failed to check partial file: %w", err)
 			}
 		} else if fileInfo.Size() != downloaded {
-			// File size doesn't match, use actual file size
-			task.mu.Lock()
-			task.Downloaded = fileInfo.Size()
-			if task.FileSize > 0 {
-				task.Progress = float64(task.Downloaded) / float64(task.FileSize) * 100
+			// If multipart state exists, file size is not reliable because we pre-allocate.
+			if multipartStateExists(filePath) {
+				// keep Downloaded as-is
+			} else {
+				// File size doesn't match, use actual file size
+				task.mu.Lock()
+				task.Downloaded = fileInfo.Size()
+				if task.FileSize > 0 {
+					task.Progress = float64(task.Downloaded) / float64(task.FileSize) * 100
+				}
+				task.mu.Unlock()
+				logger.Info("Adjusted progress for task %s to match file size: %d bytes", id, fileInfo.Size())
 			}
-			task.mu.Unlock()
-			logger.Info("Adjusted progress for task %s to match file size: %d bytes", id, fileInfo.Size())
 		}
 	}
 
