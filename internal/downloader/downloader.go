@@ -66,6 +66,16 @@ const (
 	StatusRetrying    DownloadStatus = "retrying"
 )
 
+// DownloadFunc is a custom download function type for sources that need special handling (e.g., Bilibili DASH)
+// Parameters:
+//   - ctx: context for cancellation
+//   - task: the download task (for reading metadata, NOT for writing - use callbacks instead)
+//   - onProgress: callback to report progress (downloaded bytes, total bytes)
+//   - onComplete: callback when download completes (output file path)
+//
+// Returns error if download fails, nil on success
+type DownloadFunc func(ctx context.Context, task *DownloadTask, onProgress func(downloaded, total int64), onComplete func(outputPath string)) error
+
 // Default retry settings
 const (
 	DefaultMaxRetry     = 3
@@ -100,6 +110,9 @@ type DownloadTask struct {
 
 	// Decryption fields (for WeChat videos)
 	DecodeKey string `json:"decodeKey"` // Base64-encoded decryption key
+
+	// Custom downloader for sources that need special handling (e.g., Bilibili DASH format)
+	customDownloader DownloadFunc
 
 	cancel context.CancelFunc
 	mu     sync.RWMutex
@@ -271,6 +284,31 @@ func (dm *DownloadManager) AddTaskWithDecodeKey(id, url, title, cover, source, q
 
 	dm.tasks[id] = task
 	return task, nil
+}
+
+// AddTaskWithDownloader adds a new download task with a custom downloader function
+// This is used for sources that need special handling (e.g., Bilibili DASH format)
+func (dm *DownloadManager) AddTaskWithDownloader(id, url, title, cover, source, quality string, downloader DownloadFunc) (*DownloadTask, error) {
+	task, err := dm.AddTask(id, url, title, cover, source, quality)
+	if err != nil {
+		return nil, err
+	}
+	task.customDownloader = downloader
+	return task, nil
+}
+
+// SetCustomDownloader sets a custom downloader for the task
+func (t *DownloadTask) SetCustomDownloader(downloader DownloadFunc) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.customDownloader = downloader
+}
+
+// GetCustomDownloader returns the custom downloader for the task
+func (t *DownloadTask) GetCustomDownloader() DownloadFunc {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.customDownloader
 }
 
 // StartTask starts downloading a task
@@ -486,8 +524,87 @@ func (dm *DownloadManager) performDownload(task *DownloadTask) error {
 	task.mu.Lock()
 	task.cancel = cancel
 	task.Status = StatusDownloading
+	customDownloader := task.customDownloader
 	task.mu.Unlock()
 
+	var err error
+
+	// Check if task has a custom downloader (e.g., Bilibili DASH)
+	if customDownloader != nil {
+		err = dm.performCustomDownload(ctx, task, customDownloader)
+	} else {
+		// Default HTTP download for simple URLs (e.g., WeChat)
+		err = dm.performHTTPDownload(ctx, task)
+	}
+
+	if err != nil {
+		return err
+	}
+
+	// Mark as completed (shared completion logic for all download types)
+	task.mu.Lock()
+	task.Status = StatusCompleted
+	task.Progress = 100
+	task.CompletedAt = time.Now().Unix()
+	task.mu.Unlock()
+
+	logger.Info("Download completed: %s (%s)", task.Title, task.FilePath)
+
+	// Auto-save state after completion
+	if dm.statePath != "" {
+		dm.SaveState()
+	}
+
+	if dm.onComplete != nil {
+		dm.onComplete(task)
+	}
+
+	return nil
+}
+
+// performCustomDownload executes a custom download function
+func (dm *DownloadManager) performCustomDownload(ctx context.Context, task *DownloadTask, downloader DownloadFunc) error {
+	lastUpdate := time.Now()
+	var lastDownloaded int64 = 0
+
+	err := downloader(ctx, task,
+		// onProgress callback
+		func(downloaded, total int64) {
+			task.mu.Lock()
+			task.Downloaded = downloaded
+			task.FileSize = total
+			if total > 0 {
+				task.Progress = float64(downloaded) / float64(total) * 100
+			}
+			task.mu.Unlock()
+
+			// Update speed every second
+			if time.Since(lastUpdate) >= time.Second {
+				task.mu.Lock()
+				task.Speed = downloaded - lastDownloaded
+				task.mu.Unlock()
+
+				lastDownloaded = downloaded
+				lastUpdate = time.Now()
+
+				if dm.onProgress != nil {
+					dm.onProgress(task)
+				}
+			}
+		},
+		// onComplete callback
+		func(outputPath string) {
+			task.mu.Lock()
+			task.FilePath = outputPath
+			task.mu.Unlock()
+		},
+	)
+
+	return err
+}
+
+// performHTTPDownload performs a standard HTTP download with Range support
+func (dm *DownloadManager) performHTTPDownload(ctx context.Context, task *DownloadTask) error {
 	// Create HTTP request
 	req, err := http.NewRequestWithContext(ctx, "GET", task.URL, nil)
 	if err != nil {
@@ -629,24 +746,6 @@ func (dm *DownloadManager) performDownload(task *DownloadTask) error {
 				}
 			}
 		}
-	}
-
-	// Mark as completed
-	task.mu.Lock()
-	task.Status = StatusCompleted
-	task.Progress = 100
-	task.CompletedAt = time.Now().Unix()
-	task.mu.Unlock()
-
-	logger.Info("Download completed: %s (%s)", task.Title, task.FilePath)
-
-	// Auto-save state after completion
-	if dm.statePath != "" {
-		dm.SaveState()
-	}
-
-	if dm.onComplete != nil {
-		dm.onComplete(task)
 	}
 
 	return nil
@@ -840,6 +939,106 @@ func (t *DownloadTask) TaskToJSON() map[string]interface{} {
 		"lastError":   t.LastError,
 		"decodeKey":   t.DecodeKey,
 	}
+}
+
+// Thread-safe getter/setter methods for DownloadTask
+
+// SetCancel sets the cancel function for the task
+func (t *DownloadTask) SetCancel(cancel context.CancelFunc) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.cancel = cancel
+}
+
+// GetStatus returns the task status
+func (t *DownloadTask) GetStatus() DownloadStatus {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.Status
+}
+
+// SetStatus sets the task status
+func (t *DownloadTask) SetStatus(status DownloadStatus) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.Status = status
+}
+
+// GetProgress returns the task progress
+func (t *DownloadTask) GetProgress() float64 {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.Progress
+}
+
+// SetProgress sets the task progress
+func (t *DownloadTask) SetProgress(progress float64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.Progress = progress
+}
+
+// GetFileSize returns the file size
+func (t *DownloadTask) GetFileSize() int64 {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.FileSize
+}
+
+// SetFileSize sets the file size
+func (t *DownloadTask) SetFileSize(size int64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.FileSize = size
+}
+
+// GetDownloaded returns the downloaded bytes
+func (t *DownloadTask) GetDownloaded() int64 {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.Downloaded
+}
+
+// SetDownloaded sets the downloaded bytes
+func (t *DownloadTask) SetDownloaded(downloaded int64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.Downloaded = downloaded
+}
+
+// GetSpeed returns the download speed
+func (t *DownloadTask) GetSpeed() int64 {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.Speed
+}
+
+// SetSpeed sets the download speed
+func (t *DownloadTask) SetSpeed(speed int64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.Speed = speed
+}
+
+// SetError sets the error message
+func (t *DownloadTask) SetError(err string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.Error = err
+}
+
+// SetFilePath sets the file path
+func (t *DownloadTask) SetFilePath(path string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.FilePath = path
+}
+
+// SetCompletedAt sets the completion timestamp
+func (t *DownloadTask) SetCompletedAt(ts int64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.CompletedAt = ts
 }
 
 // DownloadState represents the persisted state of downloads

@@ -138,25 +138,19 @@ function clearAll() {
     
     <!-- Content -->
     <div class="content flex-1 overflow-auto p-4">
-      <!-- Empty State -->
-      <div v-if="!store.proxyRunning" class="h-full flex items-center justify-center">
-        <NEmpty description="代理服务未启动">
+      <!-- Empty State: only show when no videos detected -->
+      <div v-if="filteredVideos.length === 0" class="h-full flex items-center justify-center">
+        <NEmpty :description="!store.proxyRunning ? '代理服务未启动' : '暂无检测到的视频'">
           <template #icon>
-            <AlertCircleOutline class="w-12 h-12 text-text-secondary opacity-50" />
+            <component 
+              :is="!store.proxyRunning ? AlertCircleOutline : PlayCircleOutline" 
+              class="w-12 h-12 text-text-secondary opacity-50" 
+            />
           </template>
           <template #extra>
-            <p class="text-text-secondary text-sm mb-4">请先在侧边栏启动代理服务，然后打开微信PC端浏览视频</p>
-          </template>
-        </NEmpty>
-      </div>
-      
-      <div v-else-if="filteredVideos.length === 0" class="h-full flex items-center justify-center">
-        <NEmpty description="暂无检测到的视频">
-          <template #icon>
-            <PlayCircleOutline class="w-12 h-12 text-text-secondary opacity-50" />
-          </template>
-          <template #extra>
-            <p class="text-text-secondary text-sm">打开微信PC端，浏览视频号内容即可自动检测</p>
+            <p class="text-text-secondary text-sm mb-4">
+              {{ !store.proxyRunning ? '请先在侧边栏启动代理服务，然后打开微信PC端浏览视频' : '打开微信PC端，浏览视频号内容即可自动检测' }}
+            </p>
           </template>
         </NEmpty>
       </div>

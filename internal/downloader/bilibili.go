@@ -3,6 +3,7 @@ package downloader
 import (
 	"EasyDownload/internal/config"
 	"EasyDownload/internal/logger"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -419,6 +420,11 @@ func (bd *BilibiliDownloader) GetPartStreams(video *BilibiliVideo, partIndex int
 
 // DownloadPart downloads a specific part of a Bilibili video
 func (bd *BilibiliDownloader) DownloadPart(video *BilibiliVideo, partIndex int, quality int, outputDir string, onProgress func(float64), onSizeKnown func(int64)) (string, error) {
+	return bd.DownloadPartWithContext(context.Background(), video, partIndex, quality, outputDir, onProgress, onSizeKnown)
+}
+
+// DownloadPartWithContext downloads a specific part of a Bilibili video with context support for cancellation
+func (bd *BilibiliDownloader) DownloadPartWithContext(ctx context.Context, video *BilibiliVideo, partIndex int, quality int, outputDir string, onProgress func(float64), onSizeKnown func(int64)) (string, error) {
 	if partIndex < 0 || partIndex >= len(video.Parts) {
 		return "", fmt.Errorf("invalid part index: %d (total parts: %d)", partIndex, len(video.Parts))
 	}
@@ -462,7 +468,7 @@ func (bd *BilibiliDownloader) DownloadPart(video *BilibiliVideo, partIndex int, 
 
 	// If no audio (old format), direct download
 	if stream.AudioURL == "" {
-		return bd.downloadFile(stream.VideoURL, outputPath, onProgress)
+		return bd.downloadFileWithContext(ctx, stream.VideoURL, outputPath, 0, onProgress)
 	}
 
 	// DASH format - need to download video and audio separately, then merge
@@ -485,29 +491,60 @@ func (bd *BilibiliDownloader) DownloadPart(video *BilibiliVideo, partIndex int, 
 	// Create progress tracker
 	tracker := NewDASHProgressTracker(videoSize, audioSize, onProgress)
 
-	// Create temp files
+	// Temp file paths
 	videoPath := filepath.Join(outputDir, fileName+"_video.m4s")
 	audioPath := filepath.Join(outputDir, fileName+"_audio.m4s")
 
-	defer os.Remove(videoPath)
-	defer os.Remove(audioPath)
+	// Helper to clean up temp files
+	cleanupTempFiles := func() {
+		os.Remove(videoPath)
+		os.Remove(audioPath)
+	}
 
 	// Download video
 	logger.Debug("Downloading video stream to: %s", videoPath)
-	if _, err := bd.downloadFileWithSize(stream.VideoURL, videoPath, videoSize, func(p float64) {
+	if _, err := bd.downloadFileWithContext(ctx, stream.VideoURL, videoPath, videoSize, func(p float64) {
 		tracker.UpdateVideoProgress(p)
 	}); err != nil {
+		// If context was cancelled (pause/cancel), keep temp files for potential resume
+		if ctx.Err() != nil {
+			logger.Info("Video download interrupted, keeping temp files for resume")
+			return "", err
+		}
 		logger.Error("Failed to download video stream: %v", err)
+		cleanupTempFiles()
 		return "", fmt.Errorf("failed to download video: %w", err)
+	}
+
+	// Check for cancellation before audio download
+	select {
+	case <-ctx.Done():
+		logger.Info("Download paused/cancelled after video, keeping temp files")
+		return "", ctx.Err()
+	default:
 	}
 
 	// Download audio
 	logger.Debug("Downloading audio stream to: %s", audioPath)
-	if _, err := bd.downloadFileWithSize(stream.AudioURL, audioPath, audioSize, func(p float64) {
+	if _, err := bd.downloadFileWithContext(ctx, stream.AudioURL, audioPath, audioSize, func(p float64) {
 		tracker.UpdateAudioProgress(p)
 	}); err != nil {
+		// If context was cancelled (pause/cancel), keep temp files for potential resume
+		if ctx.Err() != nil {
+			logger.Info("Audio download interrupted, keeping temp files for resume")
+			return "", err
+		}
 		logger.Error("Failed to download audio stream: %v", err)
+		cleanupTempFiles()
 		return "", fmt.Errorf("failed to download audio: %w", err)
+	}
+
+	// Check for cancellation before merge
+	select {
+	case <-ctx.Done():
+		logger.Info("Download paused/cancelled before merge, keeping temp files")
+		return "", ctx.Err()
+	default:
 	}
 
 	// Merge with ffmpeg
@@ -518,10 +555,11 @@ func (bd *BilibiliDownloader) DownloadPart(video *BilibiliVideo, partIndex int, 
 	if bd.ffmpegManager != nil {
 		if err := bd.ffmpegManager.Merge(videoPath, audioPath, outputPath); err != nil {
 			logger.Error("FFmpeg merge failed: %v", err)
+			cleanupTempFiles()
 			return "", fmt.Errorf("failed to merge video and audio: %w", err)
 		}
 	} else {
-		cmd := exec.Command(bd.GetFFmpegPath(),
+		cmd := exec.CommandContext(ctx, bd.GetFFmpegPath(),
 			"-i", videoPath,
 			"-i", audioPath,
 			"-c", "copy",
@@ -530,12 +568,21 @@ func (bd *BilibiliDownloader) DownloadPart(video *BilibiliVideo, partIndex int, 
 		)
 
 		if err := cmd.Run(); err != nil {
+			// If context was cancelled during merge, keep temp files
+			if ctx.Err() != nil {
+				logger.Info("Merge interrupted, keeping temp files")
+				return "", ctx.Err()
+			}
 			logger.Error("FFmpeg merge failed: %v", err)
+			cleanupTempFiles()
 			return "", fmt.Errorf("failed to merge video and audio: %w", err)
 		}
 	}
 
 	tracker.SetMergeProgress(100)
+
+	// Clean up temp files after successful merge
+	cleanupTempFiles()
 
 	logger.Info("Download completed: %s", outputPath)
 	return outputPath, nil
@@ -543,6 +590,11 @@ func (bd *BilibiliDownloader) DownloadPart(video *BilibiliVideo, partIndex int, 
 
 // Download downloads a Bilibili video (first part for backward compatibility)
 func (bd *BilibiliDownloader) Download(video *BilibiliVideo, quality int, outputDir string, onProgress func(progress float64), onSizeKnown func(totalSize int64)) (string, error) {
+	return bd.DownloadWithContext(context.Background(), video, quality, outputDir, onProgress, onSizeKnown)
+}
+
+// DownloadWithContext downloads a Bilibili video with context support for cancellation
+func (bd *BilibiliDownloader) DownloadWithContext(ctx context.Context, video *BilibiliVideo, quality int, outputDir string, onProgress func(progress float64), onSizeKnown func(totalSize int64)) (string, error) {
 	logger.Info("Starting download for video: %s (quality: %d)", video.Title, quality)
 
 	// Find the requested quality stream
@@ -570,7 +622,7 @@ func (bd *BilibiliDownloader) Download(video *BilibiliVideo, quality int, output
 
 	// If no audio (old format), direct download
 	if stream.AudioURL == "" {
-		return bd.downloadFile(stream.VideoURL, outputPath, onProgress)
+		return bd.downloadFileWithContext(ctx, stream.VideoURL, outputPath, 0, onProgress)
 	}
 
 	// DASH format - need to download video and audio separately, then merge
@@ -593,29 +645,60 @@ func (bd *BilibiliDownloader) Download(video *BilibiliVideo, quality int, output
 	// Create progress tracker
 	tracker := NewDASHProgressTracker(videoSize, audioSize, onProgress)
 
-	// Create temp files
+	// Temp file paths
 	videoPath := filepath.Join(outputDir, fileName+"_video.m4s")
 	audioPath := filepath.Join(outputDir, fileName+"_audio.m4s")
 
-	defer os.Remove(videoPath)
-	defer os.Remove(audioPath)
+	// Helper to clean up temp files
+	cleanupTempFiles := func() {
+		os.Remove(videoPath)
+		os.Remove(audioPath)
+	}
 
 	// Download video
 	logger.Debug("Downloading video stream to: %s", videoPath)
-	if _, err := bd.downloadFileWithSize(stream.VideoURL, videoPath, videoSize, func(p float64) {
+	if _, err := bd.downloadFileWithContext(ctx, stream.VideoURL, videoPath, videoSize, func(p float64) {
 		tracker.UpdateVideoProgress(p)
 	}); err != nil {
+		// If context was cancelled (pause/cancel), keep temp files for potential resume
+		if ctx.Err() != nil {
+			logger.Info("Video download interrupted, keeping temp files for resume")
+			return "", err
+		}
 		logger.Error("Failed to download video stream: %v", err)
+		cleanupTempFiles()
 		return "", fmt.Errorf("failed to download video: %w", err)
+	}
+
+	// Check for cancellation before audio download
+	select {
+	case <-ctx.Done():
+		logger.Info("Download paused/cancelled after video, keeping temp files")
+		return "", ctx.Err()
+	default:
 	}
 
 	// Download audio
 	logger.Debug("Downloading audio stream to: %s", audioPath)
-	if _, err := bd.downloadFileWithSize(stream.AudioURL, audioPath, audioSize, func(p float64) {
+	if _, err := bd.downloadFileWithContext(ctx, stream.AudioURL, audioPath, audioSize, func(p float64) {
 		tracker.UpdateAudioProgress(p)
 	}); err != nil {
+		// If context was cancelled (pause/cancel), keep temp files for potential resume
+		if ctx.Err() != nil {
+			logger.Info("Audio download interrupted, keeping temp files for resume")
+			return "", err
+		}
 		logger.Error("Failed to download audio stream: %v", err)
+		cleanupTempFiles()
 		return "", fmt.Errorf("failed to download audio: %w", err)
+	}
+
+	// Check for cancellation before merge
+	select {
+	case <-ctx.Done():
+		logger.Info("Download paused/cancelled before merge, keeping temp files")
+		return "", ctx.Err()
+	default:
 	}
 
 	// Merge with ffmpeg
@@ -626,10 +709,11 @@ func (bd *BilibiliDownloader) Download(video *BilibiliVideo, quality int, output
 	if bd.ffmpegManager != nil {
 		if err := bd.ffmpegManager.Merge(videoPath, audioPath, outputPath); err != nil {
 			logger.Error("FFmpeg merge failed: %v", err)
+			cleanupTempFiles()
 			return "", fmt.Errorf("failed to merge video and audio: %w", err)
 		}
 	} else {
-		cmd := exec.Command(bd.GetFFmpegPath(),
+		cmd := exec.CommandContext(ctx, bd.GetFFmpegPath(),
 			"-i", videoPath,
 			"-i", audioPath,
 			"-c", "copy",
@@ -638,12 +722,21 @@ func (bd *BilibiliDownloader) Download(video *BilibiliVideo, quality int, output
 		)
 
 		if err := cmd.Run(); err != nil {
+			// If context was cancelled during merge, keep temp files
+			if ctx.Err() != nil {
+				logger.Info("Merge interrupted, keeping temp files")
+				return "", ctx.Err()
+			}
 			logger.Error("FFmpeg merge failed: %v", err)
+			cleanupTempFiles()
 			return "", fmt.Errorf("failed to merge video and audio: %w", err)
 		}
 	}
 
 	tracker.SetMergeProgress(100)
+
+	// Clean up temp files after successful merge
+	cleanupTempFiles()
 
 	logger.Info("Download completed: %s", outputPath)
 	return outputPath, nil
@@ -671,18 +764,44 @@ func (bd *BilibiliDownloader) getContentLength(url string) (int64, error) {
 
 // downloadFile downloads a file from URL to path
 func (bd *BilibiliDownloader) downloadFile(url, path string, onProgress func(float64)) (string, error) {
-	return bd.downloadFileWithSize(url, path, 0, onProgress)
+	return bd.downloadFileWithContext(context.Background(), url, path, 0, onProgress)
 }
 
 // downloadFileWithSize downloads a file with known total size for accurate progress
 func (bd *BilibiliDownloader) downloadFileWithSize(url, path string, knownSize int64, onProgress func(float64)) (string, error) {
-	req, err := http.NewRequest("GET", url, nil)
+	return bd.downloadFileWithContext(context.Background(), url, path, knownSize, onProgress)
+}
+
+// downloadFileWithContext downloads a file with context support for cancellation and resume
+func (bd *BilibiliDownloader) downloadFileWithContext(ctx context.Context, url, path string, knownSize int64, onProgress func(float64)) (string, error) {
+	// Check if file already exists for resume
+	var existingSize int64 = 0
+	if fileInfo, err := os.Stat(path); err == nil {
+		existingSize = fileInfo.Size()
+	}
+
+	// If we already have the full file, skip download
+	if knownSize > 0 && existingSize >= knownSize {
+		logger.Info("File already complete: %s (%d bytes)", path, existingSize)
+		if onProgress != nil {
+			onProgress(100)
+		}
+		return path, nil
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return "", err
 	}
 
 	bd.setHeaders(req)
 	req.Header.Set("Referer", "https://www.bilibili.com/")
+
+	// Set Range header for resume
+	if existingSize > 0 {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", existingSize))
+		logger.Info("Resuming download from %d bytes: %s", existingSize, path)
+	}
 
 	client := &http.Client{}
 	resp, err := client.Do(req)
@@ -691,27 +810,49 @@ func (bd *BilibiliDownloader) downloadFileWithSize(url, path string, knownSize i
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
+	// Check response status
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
 		return "", fmt.Errorf("unexpected status: %d", resp.StatusCode)
 	}
 
-	// Create file
+	// Determine total size
+	totalSize := knownSize
+	if totalSize <= 0 {
+		if resp.StatusCode == http.StatusPartialContent {
+			// Parse Content-Range header
+			totalSize = existingSize + resp.ContentLength
+		} else {
+			totalSize = resp.ContentLength
+		}
+	}
+
+	// Open file for append or create
 	os.MkdirAll(filepath.Dir(path), 0755)
-	file, err := os.Create(path)
+	var file *os.File
+	if existingSize > 0 && resp.StatusCode == http.StatusPartialContent {
+		file, err = os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0644)
+	} else {
+		// Server doesn't support range, start from beginning
+		existingSize = 0
+		file, err = os.Create(path)
+	}
 	if err != nil {
 		return "", err
 	}
 	defer file.Close()
 
 	// Download with progress
-	totalSize := resp.ContentLength
-	if knownSize > 0 {
-		totalSize = knownSize
-	}
-	var downloaded int64
+	downloaded := existingSize
 	buf := make([]byte, 32*1024)
 
 	for {
+		// Check for cancellation
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		default:
+		}
+
 		n, err := resp.Body.Read(buf)
 		if n > 0 {
 			file.Write(buf[:n])

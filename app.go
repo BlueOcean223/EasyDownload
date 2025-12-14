@@ -476,7 +476,32 @@ func (a *App) PauseDownload(id string) error {
 
 // ResumeDownload resumes a paused download
 func (a *App) ResumeDownload(id string) error {
-	return a.downloadManager.StartTask(id)
+	task, err := a.downloadManager.GetTask(id)
+	if err != nil {
+		return err
+	}
+
+	// For Bilibili tasks, ensure custom downloader is set (may be lost after app restart)
+	if task.Source == "bilibili" && task.GetCustomDownloader() == nil {
+		quality := 80
+		fmt.Sscanf(task.Quality, "%d", &quality)
+
+		bvid, err := a.bilibiliDownloader.ParseURL(task.URL)
+		if err != nil {
+			return fmt.Errorf("failed to parse Bilibili URL: %w", err)
+		}
+
+		video, err := a.bilibiliDownloader.GetVideoInfo(bvid)
+		if err != nil {
+			return fmt.Errorf("failed to get video info: %w", err)
+		}
+
+		// Re-create the custom downloader
+		task.SetCustomDownloader(a.createBilibiliDownloader(video, quality, -1))
+	}
+
+	// Use unified resume logic for all sources
+	return a.downloadManager.ResumeTask(id)
 }
 
 // CancelDownload cancels a download
@@ -521,69 +546,22 @@ func (a *App) DownloadBilibiliVideo(url string, quality int) (string, error) {
 	// Create unique ID
 	id := fmt.Sprintf("bilibili_%s_%d", video.BV, time.Now().Unix())
 
-	// Add to download manager for tracking
-	task, err := a.downloadManager.AddTask(id, url, video.Title, video.Cover, "bilibili", fmt.Sprintf("%d", quality))
+	// Create custom downloader function for Bilibili DASH format
+	bilibiliDownloader := a.createBilibiliDownloader(video, quality, -1) // -1 means first part
+
+	// Add task with custom downloader
+	task, err := a.downloadManager.AddTaskWithDownloader(id, url, video.Title, video.Cover, "bilibili", fmt.Sprintf("%d", quality), bilibiliDownloader)
 	if err != nil {
 		return "", err
 	}
 
-	// Download in background
-	go func() {
-		// Set status to downloading
-		task.Status = downloader.StatusDownloading
-		runtime.EventsEmit(a.ctx, "download:start", task.TaskToJSON())
+	// Start download via DownloadManager (handles progress, completion, retry automatically)
+	if err := a.downloadManager.StartTask(id); err != nil {
+		return "", err
+	}
 
-		// Variables for speed calculation
-		var lastUpdate time.Time = time.Now()
-		var lastDownloaded int64 = 0
-
-		outputPath, err := a.bilibiliDownloader.Download(video, quality, a.downloadDir, func(progress float64) {
-			task.Progress = progress
-			task.Status = downloader.StatusDownloading
-			// Calculate downloaded bytes based on progress
-			if task.FileSize > 0 {
-				task.Downloaded = int64(progress / 100 * float64(task.FileSize))
-			}
-
-			// Calculate speed every second
-			now := time.Now()
-			elapsed := now.Sub(lastUpdate)
-			if elapsed >= time.Second {
-				task.Speed = int64(float64(task.Downloaded-lastDownloaded) / elapsed.Seconds())
-				lastDownloaded = task.Downloaded
-				lastUpdate = now
-				runtime.EventsEmit(a.ctx, "download:progress", task.TaskToJSON())
-			}
-		}, func(totalSize int64) {
-			task.FileSize = totalSize
-			runtime.EventsEmit(a.ctx, "download:progress", task.TaskToJSON())
-		})
-
-		if err != nil {
-			task.Status = downloader.StatusFailed
-			task.Error = err.Error()
-			runtime.EventsEmit(a.ctx, "download:error", map[string]interface{}{
-				"task":  task.TaskToJSON(),
-				"error": err.Error(),
-			})
-			// Show notification for download failure
-			if a.showNotification && a.trayManager != nil {
-				a.trayManager.ShowNotification("下载失败", task.Title)
-			}
-			return
-		}
-
-		task.Status = downloader.StatusCompleted
-		task.FilePath = outputPath
-		task.Progress = 100
-		task.Speed = 0 // Reset speed when completed
-		task.CompletedAt = time.Now().Unix()
-		runtime.EventsEmit(a.ctx, "download:complete", task.TaskToJSON())
-		// Show notification for download complete
-		if a.showNotification && a.trayManager != nil {
-			a.trayManager.ShowNotification("下载完成", task.Title)
-		}
-	}()
+	// Emit start event for frontend
+	runtime.EventsEmit(a.ctx, "download:start", task.TaskToJSON())
 
 	return id, nil
 }
@@ -610,71 +588,63 @@ func (a *App) DownloadBilibiliPart(url string, partIndex int, quality int) (stri
 		title = fmt.Sprintf("%s - P%d %s", video.Title, part.Page, part.PartName)
 	}
 
-	// Add to download manager for tracking
-	task, err := a.downloadManager.AddTask(id, url, title, video.Cover, "bilibili", fmt.Sprintf("%d", quality))
+	// Create custom downloader function for this specific part
+	bilibiliDownloader := a.createBilibiliDownloader(video, quality, partIndex)
+
+	// Add task with custom downloader
+	task, err := a.downloadManager.AddTaskWithDownloader(id, url, title, video.Cover, "bilibili", fmt.Sprintf("%d", quality), bilibiliDownloader)
 	if err != nil {
 		return "", err
 	}
 
-	// Download in background
-	go func() {
-		// Set status to downloading
-		task.Status = downloader.StatusDownloading
-		runtime.EventsEmit(a.ctx, "download:start", task.TaskToJSON())
+	// Start download via DownloadManager
+	if err := a.downloadManager.StartTask(id); err != nil {
+		return "", err
+	}
 
-		// Variables for speed calculation
-		var lastUpdate time.Time = time.Now()
-		var lastDownloaded int64 = 0
-
-		outputPath, err := a.bilibiliDownloader.DownloadPart(video, partIndex, quality, a.downloadDir, func(progress float64) {
-			task.Progress = progress
-			task.Status = downloader.StatusDownloading
-			// Calculate downloaded bytes based on progress
-			if task.FileSize > 0 {
-				task.Downloaded = int64(progress / 100 * float64(task.FileSize))
-			}
-
-			// Calculate speed every second
-			now := time.Now()
-			elapsed := now.Sub(lastUpdate)
-			if elapsed >= time.Second {
-				task.Speed = int64(float64(task.Downloaded-lastDownloaded) / elapsed.Seconds())
-				lastDownloaded = task.Downloaded
-				lastUpdate = now
-				runtime.EventsEmit(a.ctx, "download:progress", task.TaskToJSON())
-			}
-		}, func(totalSize int64) {
-			task.FileSize = totalSize
-			runtime.EventsEmit(a.ctx, "download:progress", task.TaskToJSON())
-		})
-
-		if err != nil {
-			task.Status = downloader.StatusFailed
-			task.Error = err.Error()
-			runtime.EventsEmit(a.ctx, "download:error", map[string]interface{}{
-				"task":  task.TaskToJSON(),
-				"error": err.Error(),
-			})
-			// Show notification for download failure
-			if a.showNotification && a.trayManager != nil {
-				a.trayManager.ShowNotification("下载失败", task.Title)
-			}
-			return
-		}
-
-		task.Status = downloader.StatusCompleted
-		task.FilePath = outputPath
-		task.Progress = 100
-		task.Speed = 0 // Reset speed when completed
-		task.CompletedAt = time.Now().Unix()
-		runtime.EventsEmit(a.ctx, "download:complete", task.TaskToJSON())
-		// Show notification for download complete
-		if a.showNotification && a.trayManager != nil {
-			a.trayManager.ShowNotification("下载完成", task.Title)
-		}
-	}()
+	// Emit start event for frontend
+	runtime.EventsEmit(a.ctx, "download:start", task.TaskToJSON())
 
 	return id, nil
+}
+
+// createBilibiliDownloader creates a custom download function for Bilibili videos
+// partIndex: -1 for first part (single video), >= 0 for specific part
+func (a *App) createBilibiliDownloader(video *downloader.BilibiliVideo, quality int, partIndex int) downloader.DownloadFunc {
+	return func(ctx context.Context, task *downloader.DownloadTask, onProgress func(downloaded, total int64), onComplete func(outputPath string)) error {
+		var outputPath string
+		var downloadErr error
+
+		// Track progress - Bilibili reports percentage, we convert to bytes
+		var totalSize int64 = 0
+
+		progressCallback := func(progress float64) {
+			if totalSize > 0 {
+				downloaded := int64(progress / 100 * float64(totalSize))
+				onProgress(downloaded, totalSize)
+			}
+		}
+
+		sizeCallback := func(size int64) {
+			totalSize = size
+			onProgress(0, size)
+		}
+
+		if partIndex < 0 {
+			// Download first/single part
+			outputPath, downloadErr = a.bilibiliDownloader.DownloadWithContext(ctx, video, quality, a.downloadDir, progressCallback, sizeCallback)
+		} else {
+			// Download specific part
+			outputPath, downloadErr = a.bilibiliDownloader.DownloadPartWithContext(ctx, video, partIndex, quality, a.downloadDir, progressCallback, sizeCallback)
+		}
+
+		if downloadErr != nil {
+			return downloadErr
+		}
+
+		onComplete(outputPath)
+		return nil
+	}
 }
 
 // SetBilibiliSessData sets the Bilibili session cookie

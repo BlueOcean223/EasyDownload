@@ -58,7 +58,7 @@ export const useAppStore = defineStore('app', () => {
 
   // Computed
   const pendingDownloads = computed(() =>
-    downloads.value.filter(d => d.status === 'pending' || d.status === 'downloading')
+    downloads.value.filter(d => d.status === 'pending' || d.status === 'downloading' || d.status === 'paused')
   )
 
   const completedDownloads = computed(() =>
