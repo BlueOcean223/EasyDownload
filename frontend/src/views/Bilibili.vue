@@ -32,6 +32,26 @@ const showPartSelector = ref(false)
 
 const qualityOptions = ref<{ label: string; value: number }[]>([])
 
+// Get estimated file size for selected quality
+const selectedStreamSize = computed(() => {
+  if (!videoInfo.value || selectedQuality.value === null) return null
+  const stream = videoInfo.value.streams.find(s => s.quality === selectedQuality.value)
+  return stream?.size || null
+})
+
+// Format file size to human readable
+function formatFileSize(bytes?: number | null) {
+  if (!bytes || bytes <= 0) return ''
+  const units = ['B', 'KB', 'MB', 'GB']
+  let unitIndex = 0
+  let size = bytes
+  while (size >= 1024 && unitIndex < units.length - 1) {
+    size /= 1024
+    unitIndex++
+  }
+  return `≈ ${size.toFixed(1)} ${units[unitIndex]}`
+}
+
 // Check if video has multiple parts
 const hasMultipleParts = computed(() => {
   return videoInfo.value && videoInfo.value.parts && videoInfo.value.parts.length > 1
@@ -235,6 +255,9 @@ function handleKeydown(e: KeyboardEvent) {
                     size="small"
                     style="width: 150px"
                   />
+                  <span v-if="selectedStreamSize" class="text-sm text-text-secondary">
+                    {{ formatFileSize(selectedStreamSize) }}
+                  </span>
                 </div>
                 
                 <NButton 

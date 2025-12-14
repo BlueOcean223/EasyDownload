@@ -15,20 +15,29 @@ import (
 
 // WeChatVideoInfo represents video information extracted from WeChat
 type WeChatVideoInfo struct {
-	ID             string   `json:"id"`
-	URL            string   `json:"url"` // Full URL (url + urlToken)
-	CoverURL       string   `json:"coverUrl"`
-	Title          string   `json:"title"` // From description field
-	FileSize       float64  `json:"fileSize"`
-	DecodeKey      string   `json:"decodeKey"`      // Decryption key
-	MediaType      int      `json:"mediaType"`      // 9=image, others=video
-	FileFormats    []string `json:"fileFormats"`    // Available quality formats
-	Author         string   `json:"author"`         // Author nickname from contact
-	AuthorAvatar   string   `json:"authorAvatar"`   // Author avatar URL from contact
-	Duration       int      `json:"duration"`       // Video duration in milliseconds
-	Width          int      `json:"width"`          // Video width
-	Height         int      `json:"height"`         // Video height
-	IsCurrentVideo bool     `json:"isCurrentVideo"` // Whether this is the current playing video
+	ID             string            `json:"id"`
+	URL            string            `json:"url"` // Full URL (url + urlToken)
+	CoverURL       string            `json:"coverUrl"`
+	Title          string            `json:"title"` // From description field
+	FileSize       float64           `json:"fileSize"`
+	DecodeKey      string            `json:"decodeKey"`      // Decryption key
+	MediaType      int               `json:"mediaType"`      // 9=image, others=video
+	FileFormats    []string          `json:"fileFormats"`    // Available quality formats (for backward compatibility)
+	Specs          []WeChatVideoSpec `json:"specs"`          // Detailed spec info for each quality
+	Author         string            `json:"author"`         // Author nickname from contact
+	AuthorAvatar   string            `json:"authorAvatar"`   // Author avatar URL from contact
+	Duration       int               `json:"duration"`       // Video duration in milliseconds
+	Width          int               `json:"width"`          // Video width
+	Height         int               `json:"height"`         // Video height
+	IsCurrentVideo bool              `json:"isCurrentVideo"` // Whether this is the current playing video
+}
+
+// WeChatVideoSpec represents video specification for a specific quality
+type WeChatVideoSpec struct {
+	FileFormat string `json:"fileFormat"`
+	Width      int    `json:"width"`
+	Height     int    `json:"height"`
+	DurationMs int    `json:"durationMs"`
 }
 
 // objectDescMedia represents a single media item in objectDesc
@@ -345,10 +354,17 @@ func (wh *WeChatHandler) ParseVideoPayload(data []byte) (*WeChatVideoInfo, error
 
 	// Extract file formats and video metadata from spec
 	var formats []string
+	var specs []WeChatVideoSpec
 	var duration, width, height int
 	for _, spec := range media.Spec {
 		if spec.FileFormat != "" {
 			formats = append(formats, spec.FileFormat)
+			specs = append(specs, WeChatVideoSpec{
+				FileFormat: spec.FileFormat,
+				Width:      spec.Width,
+				Height:     spec.Height,
+				DurationMs: spec.DurationMs,
+			})
 		}
 		if duration == 0 && spec.DurationMs > 0 {
 			duration = spec.DurationMs
@@ -396,6 +412,7 @@ func (wh *WeChatHandler) ParseVideoPayload(data []byte) (*WeChatVideoInfo, error
 		DecodeKey:    media.DecodeKey,
 		MediaType:    media.MediaType,
 		FileFormats:  formats,
+		Specs:        specs,
 		Author:       author,
 		AuthorAvatar: authorAvatar,
 		Duration:     duration,
@@ -426,14 +443,25 @@ func (wh *WeChatHandler) ParseWxProfile(data []byte) (*WeChatVideoInfo, error) {
 		title = "未知标题"
 	}
 
-	// File formats
+	// File formats and specs
 	formats := make([]string, 0)
+	specs := make([]WeChatVideoSpec, 0)
 	if len(p.FileFormat) > 0 {
 		formats = append(formats, p.FileFormat...)
-	} else if len(p.Spec) > 0 {
+		// No detailed spec info available in this format
+	}
+	if len(p.Spec) > 0 {
 		for _, sp := range p.Spec {
 			if sp.FileFormat != "" {
-				formats = append(formats, sp.FileFormat)
+				if len(formats) == 0 || !contains(formats, sp.FileFormat) {
+					formats = append(formats, sp.FileFormat)
+				}
+				specs = append(specs, WeChatVideoSpec{
+					FileFormat: sp.FileFormat,
+					Width:      sp.Width,
+					Height:     sp.Height,
+					DurationMs: sp.DurationMs,
+				})
 			}
 		}
 	}
@@ -492,6 +520,7 @@ func (wh *WeChatHandler) ParseWxProfile(data []byte) (*WeChatVideoInfo, error) {
 		DecodeKey:    strings.TrimSpace(p.Key),
 		MediaType:    mediaType,
 		FileFormats:  formats,
+		Specs:        specs,
 		Author:       author,
 		AuthorAvatar: authorAvatar,
 		Duration:     duration,
@@ -535,10 +564,17 @@ func (wh *WeChatHandler) ParseObjectDesc(data []byte) (*WeChatVideoInfo, error) 
 
 	// Extract file formats and video metadata from spec
 	var formats []string
+	var specs []WeChatVideoSpec
 	var duration, width, height int
 	for _, spec := range media.Spec {
 		if spec.FileFormat != "" {
 			formats = append(formats, spec.FileFormat)
+			specs = append(specs, WeChatVideoSpec{
+				FileFormat: spec.FileFormat,
+				Width:      spec.Width,
+				Height:     spec.Height,
+				DurationMs: spec.DurationMs,
+			})
 		}
 		// Use the first spec's metadata (they should be the same across specs)
 		if duration == 0 && spec.DurationMs > 0 {
@@ -577,12 +613,23 @@ func (wh *WeChatHandler) ParseObjectDesc(data []byte) (*WeChatVideoInfo, error) 
 		DecodeKey:    media.DecodeKey,
 		MediaType:    media.MediaType,
 		FileFormats:  formats,
+		Specs:        specs,
 		Author:       author,
 		AuthorAvatar: authorAvatar,
 		Duration:     duration,
 		Width:        width,
 		Height:       height,
 	}, nil
+}
+
+// contains checks if a string slice contains a specific string
+func contains(slice []string, item string) bool {
+	for _, s := range slice {
+		if s == item {
+			return true
+		}
+	}
+	return false
 }
 
 // BuildFullURL concatenates url and urlToken to create the full video URL

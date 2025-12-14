@@ -8,23 +8,33 @@ import (
 	"sync"
 )
 
+// VideoSpec represents video specification for a specific quality
+type VideoSpec struct {
+	FileFormat string `json:"fileFormat"`
+	Width      int    `json:"width"`
+	Height     int    `json:"height"`
+	DurationMs int    `json:"durationMs"`
+}
+
 // DetectedVideo represents a video detected by the proxy
 type DetectedVideo struct {
-	ID           string  `json:"id"`
-	Title        string  `json:"title"`
-	Cover        string  `json:"cover"`
-	URL          string  `json:"url"`
-	Source       string  `json:"source"`
-	Quality      string  `json:"quality"`
-	Duration     int     `json:"duration"`
-	Author       string  `json:"author"`
-	AuthorAvatar string  `json:"authorAvatar"` // Author avatar URL
-	Timestamp    int64   `json:"timestamp"`
-	DecodeKey    string  `json:"decodeKey"` // Decryption key for WeChat videos
-	FileSize     float64 `json:"fileSize"`  // File size in bytes
-	Width        int     `json:"width"`     // Video width in pixels
-	Height       int     `json:"height"`    // Video height in pixels
-	IsCurrent    bool    `json:"isCurrentVideo"`
+	ID           string      `json:"id"`
+	Title        string      `json:"title"`
+	Cover        string      `json:"cover"`
+	URL          string      `json:"url"`
+	Source       string      `json:"source"`
+	Quality      string      `json:"quality"`
+	Duration     int         `json:"duration"`
+	Author       string      `json:"author"`
+	AuthorAvatar string      `json:"authorAvatar"` // Author avatar URL
+	Timestamp    int64       `json:"timestamp"`
+	DecodeKey    string      `json:"decodeKey"` // Decryption key for WeChat videos
+	FileSize     float64     `json:"fileSize"`  // File size in bytes
+	Width        int         `json:"width"`     // Video width in pixels
+	Height       int         `json:"height"`    // Video height in pixels
+	IsCurrent    bool        `json:"isCurrentVideo"`
+	FileFormats  []string    `json:"fileFormats"` // Available quality formats
+	Specs        []VideoSpec `json:"specs"`       // Detailed spec info for each quality
 }
 
 // InternalAPI provides an HTTP API for receiving data from injected scripts

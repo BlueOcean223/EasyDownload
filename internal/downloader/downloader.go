@@ -238,12 +238,12 @@ func (dm *DownloadManager) SetErrorCallback(callback func(task *DownloadTask, er
 }
 
 // AddTask adds a new download task
-func (dm *DownloadManager) AddTask(id, url, title, cover, source, quality string) (*DownloadTask, error) {
-	return dm.AddTaskWithDecodeKey(id, url, title, cover, source, quality, "")
+func (dm *DownloadManager) AddTask(id, rawURL, title, cover, source, quality string) (*DownloadTask, error) {
+	return dm.AddTaskWithDecodeKey(id, rawURL, title, cover, source, quality, "")
 }
 
 // AddTaskWithDecodeKey adds a new download task with an optional decryption key
-func (dm *DownloadManager) AddTaskWithDecodeKey(id, url, title, cover, source, quality, decodeKey string) (*DownloadTask, error) {
+func (dm *DownloadManager) AddTaskWithDecodeKey(id, rawURL, title, cover, source, quality, decodeKey string) (*DownloadTask, error) {
 	dm.tasksMu.Lock()
 	defer dm.tasksMu.Unlock()
 
@@ -254,9 +254,41 @@ func (dm *DownloadManager) AddTaskWithDecodeKey(id, url, title, cover, source, q
 
 	// Final safety: reject obvious WeChat live/invalid/chunk URLs so users don't download corrupt files
 	if strings.ToLower(strings.TrimSpace(source)) == "wechat" {
-		if ok, reason := isLikelyWeChatVODURL(url); !ok {
+		if ok, reason := isLikelyWeChatVODURL(rawURL); !ok {
 			return nil, fmt.Errorf("invalid wechat video url (%s)", reason)
 		}
+	}
+
+	// For WeChat videos, handle quality parameter in URL
+	// The X-snsvideoflag parameter tells the server which quality to return
+	downloadURL := rawURL
+	if strings.ToLower(strings.TrimSpace(source)) == "wechat" {
+		// Remove any existing X-snsvideoflag parameter first
+		// This ensures we don't have duplicate parameters
+		if strings.Contains(downloadURL, "X-snsvideoflag=") {
+			// Parse URL and remove the existing parameter
+			parsedURL, err := url.Parse(downloadURL)
+			if err == nil {
+				query := parsedURL.Query()
+				query.Del("X-snsvideoflag")
+				parsedURL.RawQuery = query.Encode()
+				downloadURL = parsedURL.String()
+			}
+		}
+		
+		// Add the selected quality parameter if specified
+		if quality != "" {
+			// quality contains the fileFormat value (e.g., "xWT...")
+			if strings.Contains(downloadURL, "?") {
+				downloadURL = downloadURL + "&X-snsvideoflag=" + quality
+			} else {
+				downloadURL = downloadURL + "?X-snsvideoflag=" + quality
+			}
+			logger.Info("[WeChat Download] Using quality format: %s", quality)
+		} else {
+			logger.Info("[WeChat Download] No quality specified, using original URL")
+		}
+		logger.Debug("[WeChat Download] Final URL: %s", downloadURL)
 	}
 
 	// Generate filename
@@ -268,7 +300,7 @@ func (dm *DownloadManager) AddTaskWithDecodeKey(id, url, title, cover, source, q
 
 	task := &DownloadTask{
 		ID:         id,
-		URL:        url,
+		URL:        downloadURL,
 		Title:      title,
 		Cover:      cover,
 		Source:     source,

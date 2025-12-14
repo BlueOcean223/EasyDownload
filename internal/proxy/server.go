@@ -25,21 +25,23 @@ import (
 
 // VideoInfo represents detected video information
 type VideoInfo struct {
-	ID           string  `json:"id"`
-	Title        string  `json:"title"`
-	Cover        string  `json:"cover"`
-	URL          string  `json:"url"`
-	Source       string  `json:"source"` // "wechat" or "bilibili"
-	Quality      string  `json:"quality"`
-	Duration     int     `json:"duration"`
-	Author       string  `json:"author"`
-	AuthorAvatar string  `json:"authorAvatar"`
-	Timestamp    int64   `json:"timestamp"`
-	DecodeKey    string  `json:"decodeKey"` // Decryption key for WeChat videos
-	FileSize     float64 `json:"fileSize"`  // File size in bytes
-	Width        int     `json:"width"`
-	Height       int     `json:"height"`
-	IsCurrent    bool    `json:"isCurrentVideo"`
+	ID           string           `json:"id"`
+	Title        string           `json:"title"`
+	Cover        string           `json:"cover"`
+	URL          string           `json:"url"`
+	Source       string           `json:"source"` // "wechat" or "bilibili"
+	Quality      string           `json:"quality"`
+	Duration     int              `json:"duration"`
+	Author       string           `json:"author"`
+	AuthorAvatar string           `json:"authorAvatar"`
+	Timestamp    int64            `json:"timestamp"`
+	DecodeKey    string           `json:"decodeKey"` // Decryption key for WeChat videos
+	FileSize     float64          `json:"fileSize"`  // File size in bytes
+	Width        int              `json:"width"`
+	Height       int              `json:"height"`
+	IsCurrent    bool             `json:"isCurrentVideo"`
+	FileFormats  []string         `json:"fileFormats"` // Available quality formats
+	Specs        []WeChatVideoSpec `json:"specs"`       // Detailed spec info for each quality
 }
 
 // ProxyServer represents the MITM proxy server using goproxy
@@ -96,12 +98,14 @@ func NewProxyServer(certManager *CertManager, port int) *ProxyServer {
 				Author:       info.Author,
 				AuthorAvatar: info.AuthorAvatar,
 				// Frontend expects milliseconds
-				Timestamp: time.Now().UnixMilli(),
-				DecodeKey: info.DecodeKey,
-				FileSize:  info.FileSize,
-				Width:     info.Width,
-				Height:    info.Height,
-				IsCurrent: info.IsCurrentVideo,
+				Timestamp:   time.Now().UnixMilli(),
+				DecodeKey:   info.DecodeKey,
+				FileSize:    info.FileSize,
+				Width:       info.Width,
+				Height:      info.Height,
+				IsCurrent:   info.IsCurrentVideo,
+				FileFormats: info.FileFormats,
+				Specs:       info.Specs,
 			}
 			ps.onVideoDetected(videoInfo)
 		}

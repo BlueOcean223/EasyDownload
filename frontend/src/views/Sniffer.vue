@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { ref, computed } from 'vue'
+import { ref, computed, reactive } from 'vue'
 import { useAppStore } from '@/stores/app'
-import { NCard, NButton, NEmpty, NSpin, NTag, NSpace, NTooltip, useMessage, NModal, NInput } from 'naive-ui'
+import { NCard, NButton, NEmpty, NSpin, NTag, NSpace, NTooltip, useMessage, NModal, NInput, NSelect } from 'naive-ui'
 import ProxiedImage from '@/components/ProxiedImage.vue'
 import { 
   PlayCircleOutline, 
@@ -19,6 +19,118 @@ const store = useAppStore()
 const message = useMessage()
 const searchQuery = ref('')
 const downloading = ref<Set<string>>(new Set())
+
+// Selected quality for each video (videoId -> format)
+const selectedQualities = reactive<Record<string, string>>({})
+
+// Standard quality levels based on height
+const qualityLevels = [
+  { height: 2160, label: '4K' },
+  { height: 1440, label: '2K' },
+  { height: 1080, label: '1080P' },
+  { height: 720, label: '720P' },
+  { height: 540, label: '540P' },
+  { height: 480, label: '480P' },
+  { height: 360, label: '360P' },
+  { height: 240, label: '240P' },
+]
+
+// Get friendly quality name based on video height
+function getQualityLabel(height: number): string {
+  for (const level of qualityLevels) {
+    if (height >= level.height) {
+      return level.label
+    }
+  }
+  return `${height}P`
+}
+
+// Generate quality options based on specs data (preferred) or fileFormats fallback
+// IMPORTANT: WeChat video URLs without X-snsvideoflag parameter return the HIGHEST quality
+// Adding X-snsvideoflag parameter requests a SPECIFIC (usually lower) quality
+function getQualityOptions(video: DetectedVideo) {
+  const options: { label: string; value: string }[] = []
+  const seenLabels = new Set<string>()
+  
+  // Always add "Original" option first - this downloads the highest quality
+  // by NOT adding X-snsvideoflag parameter to the URL
+  options.push({
+    label: '原始画质',
+    value: ''  // Empty value means use original URL without X-snsvideoflag
+  })
+  
+  // Use specs data if available (contains actual resolution info)
+  if (video.specs && video.specs.length > 0) {
+    // Sort specs by height descending (highest quality first)
+    const sortedSpecs = [...video.specs].sort((a, b) => b.height - a.height)
+    
+    for (const spec of sortedSpecs) {
+      if (!spec.fileFormat) continue
+      
+      const label = getQualityLabel(spec.height)
+      
+      // Deduplicate by label
+      if (seenLabels.has(label)) continue
+      seenLabels.add(label)
+      
+      options.push({
+        label,
+        value: spec.fileFormat
+      })
+    }
+    
+    return options
+  }
+  
+  // Fallback: use fileFormats with estimated quality levels
+  if (!video.fileFormats || video.fileFormats.length === 0) {
+    return options  // Return with just "原始画质" option
+  }
+  
+  const videoHeight = video.height || 720
+  const formatCount = video.fileFormats.length
+  
+  // Find available quality levels up to the video's resolution
+  const availableLevels = qualityLevels.filter(level => level.height <= videoHeight)
+  const levelsToUse = availableLevels.slice(0, formatCount)
+  
+  // Map formats to quality levels
+  for (let i = 0; i < formatCount; i++) {
+    const format = video.fileFormats[i]
+    let label: string
+    
+    if (i < levelsToUse.length) {
+      label = levelsToUse[i].label
+    } else {
+      const estimatedHeight = Math.round(videoHeight * (formatCount - i) / formatCount)
+      label = getQualityLabel(estimatedHeight)
+    }
+    
+    // Deduplicate by label
+    if (seenLabels.has(label)) continue
+    seenLabels.add(label)
+    
+    options.push({ label, value: format })
+  }
+  
+  return options
+}
+
+// Get default (highest) quality for a video
+// Returns empty string to use original URL (highest quality)
+function getDefaultQuality(video: DetectedVideo): string {
+  // Always default to empty string (original quality / highest quality)
+  // The original URL without X-snsvideoflag returns the highest quality
+  return ''
+}
+
+// Get selected quality for a video, or default to highest
+function getSelectedQuality(video: DetectedVideo): string {
+  if (selectedQualities[video.id]) {
+    return selectedQualities[video.id]
+  }
+  return getDefaultQuality(video)
+}
 
 // Keep list order as stored (WeChat newest first); only filter by search query
 const filteredVideos = computed(() => {
@@ -44,7 +156,15 @@ async function downloadVideo(video: DetectedVideo) {
   
   downloading.value.add(video.id)
   try {
-    await store.downloadDetectedVideo(video)
+    // Get selected quality format
+    const selectedFormat = getSelectedQuality(video)
+    console.log('[Sniffer] Download video:', video.title)
+    console.log('[Sniffer] Video specs:', video.specs)
+    console.log('[Sniffer] Video fileFormats:', video.fileFormats)
+    console.log('[Sniffer] Quality options:', getQualityOptions(video))
+    console.log('[Sniffer] Selected format:', selectedFormat)
+    // Pass the selected quality to download
+    await store.downloadDetectedVideo(video, selectedFormat)
     message.success('已添加到下载队列')
   } catch (error: any) {
     message.error(error.message || '下载失败')
@@ -241,7 +361,22 @@ function clearAll() {
               </div>
             </div>
             
-            <div class="flex items-center justify-end">
+            <div class="flex items-center justify-between">
+              <!-- Quality selector for videos with multiple formats (more than just "原始画质") -->
+              <div v-if="getQualityOptions(video).length > 2" class="flex items-center gap-1">
+                <span class="text-xs text-text-secondary">画质:</span>
+                <NSelect 
+                  :value="getSelectedQuality(video)"
+                  :options="getQualityOptions(video)"
+                  size="tiny"
+                  style="width: 100px"
+                  @update:value="(val: string) => selectedQualities[video.id] = val"
+                />
+              </div>
+              <div v-else class="flex items-center">
+                <NTag size="tiny" type="info">原始画质</NTag>
+              </div>
+              
               <NButton 
                 type="primary" 
                 size="tiny"

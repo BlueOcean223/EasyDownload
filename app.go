@@ -207,6 +207,17 @@ func (a *App) startup(ctx context.Context) {
 
 	// Set proxy video callback
 	a.proxyServer.SetVideoCallback(func(video proxy.VideoInfo) {
+		// Convert specs from proxy type to api type
+		apiSpecs := make([]api.VideoSpec, len(video.Specs))
+		for i, spec := range video.Specs {
+			apiSpecs[i] = api.VideoSpec{
+				FileFormat: spec.FileFormat,
+				Width:      spec.Width,
+				Height:     spec.Height,
+				DurationMs: spec.DurationMs,
+			}
+		}
+
 		apiVideo := api.DetectedVideo{
 			ID:           video.ID,
 			Title:        video.Title,
@@ -223,6 +234,8 @@ func (a *App) startup(ctx context.Context) {
 			Width:        video.Width,
 			Height:       video.Height,
 			IsCurrent:    video.IsCurrent,
+			FileFormats:  video.FileFormats,
+			Specs:        apiSpecs,
 		}
 		runtime.EventsEmit(a.ctx, "video:detected", apiVideo)
 	})

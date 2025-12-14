@@ -1,3 +1,11 @@
+// Video specification for a specific quality (WeChat)
+export interface VideoSpec {
+  fileFormat: string
+  width: number
+  height: number
+  durationMs: number
+}
+
 // Video detected by proxy/sniffer
 export interface DetectedVideo {
   id: string
@@ -15,6 +23,8 @@ export interface DetectedVideo {
   width?: number      // Video width in pixels
   height?: number     // Video height in pixels
   isCurrentVideo?: boolean
+  fileFormats?: string[]  // Available quality formats (e.g., 'mp4_720p', 'mp4_1080p')
+  specs?: VideoSpec[]     // Detailed spec info for each quality
 }
 
 // Download task status

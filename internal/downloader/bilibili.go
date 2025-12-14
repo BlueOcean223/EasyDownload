@@ -204,7 +204,7 @@ func (bd *BilibiliDownloader) GetVideoInfo(bvid string) (*BilibiliVideo, error) 
 	if len(video.Parts) > 0 {
 		aid := int64(0)
 		fmt.Sscanf(video.AV, "av%d", &aid)
-		streams, err := bd.getStreamInfo(bvid, aid, video.Parts[0].CID)
+		streams, err := bd.getStreamInfo(bvid, aid, video.Parts[0].CID, video.Parts[0].Duration)
 		if err == nil {
 			video.Streams = streams
 		}
@@ -304,7 +304,7 @@ func (bd *BilibiliDownloader) GetVideoInfoWithParts(bvid string) (*BilibiliVideo
 }
 
 // getStreamInfo fetches available stream qualities
-func (bd *BilibiliDownloader) getStreamInfo(bvid string, _ int64, cid int64) ([]BilibiliStream, error) {
+func (bd *BilibiliDownloader) getStreamInfo(bvid string, _ int64, cid int64, duration int) ([]BilibiliStream, error) {
 	// Play URL API
 	apiURL := fmt.Sprintf("https://api.bilibili.com/x/player/playurl?bvid=%s&cid=%d&fnval=4048&fnver=0&fourk=1", bvid, cid)
 
@@ -373,6 +373,12 @@ func (bd *BilibiliDownloader) getStreamInfo(bvid string, _ int64, cid int64) ([]
 
 	var streams []BilibiliStream
 
+	// Get best audio bandwidth for size estimation
+	var audioBandwidth int64
+	if len(result.Data.Dash.Audio) > 0 {
+		audioBandwidth = result.Data.Dash.Audio[0].Bandwidth
+	}
+
 	// Create stream entries for each quality
 	for i, q := range result.Data.AcceptQuality {
 		stream := BilibiliStream{
@@ -386,9 +392,11 @@ func (bd *BilibiliDownloader) getStreamInfo(bvid string, _ int64, cid int64) ([]
 		}
 
 		// Find matching video stream
+		var videoBandwidth int64
 		for _, v := range result.Data.Dash.Video {
 			if v.ID == q {
 				stream.VideoURL = v.BaseURL
+				videoBandwidth = v.Bandwidth
 				break
 			}
 		}
@@ -396,6 +404,12 @@ func (bd *BilibiliDownloader) getStreamInfo(bvid string, _ int64, cid int64) ([]
 		// Get first audio stream
 		if len(result.Data.Dash.Audio) > 0 {
 			stream.AudioURL = result.Data.Dash.Audio[0].BaseURL
+		}
+
+		// Estimate file size: (video_bandwidth + audio_bandwidth) * duration / 8
+		// bandwidth is in bits per second, duration is in seconds
+		if duration > 0 && videoBandwidth > 0 {
+			stream.Size = (videoBandwidth + audioBandwidth) * int64(duration) / 8
 		}
 
 		if stream.VideoURL != "" {
@@ -415,7 +429,7 @@ func (bd *BilibiliDownloader) GetPartStreams(video *BilibiliVideo, partIndex int
 	aid := int64(0)
 	fmt.Sscanf(video.AV, "av%d", &aid)
 
-	return bd.getStreamInfo(video.BV, aid, video.Parts[partIndex].CID)
+	return bd.getStreamInfo(video.BV, aid, video.Parts[partIndex].CID, video.Parts[partIndex].Duration)
 }
 
 // DownloadPart downloads a specific part of a Bilibili video

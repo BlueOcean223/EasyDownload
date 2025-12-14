@@ -173,6 +173,11 @@ export const useAppStore = defineStore('app', () => {
       if ((!next.width || next.width <= 0) && oldV.width && oldV.width > 0) merged.width = oldV.width
       if ((!next.height || next.height <= 0) && oldV.height && oldV.height > 0) merged.height = oldV.height
 
+      // fileFormats: keep old if new is empty
+      if ((!next.fileFormats || next.fileFormats.length === 0) && oldV.fileFormats && oldV.fileFormats.length > 0) {
+        merged.fileFormats = oldV.fileFormats
+      }
+
       // isCurrentVideo: preserve true if either says true
       if (oldV.isCurrentVideo && !next.isCurrentVideo) merged.isCurrentVideo = true
 
@@ -285,8 +290,14 @@ export const useAppStore = defineStore('app', () => {
     detectedVideos.value = []
   }
 
-  async function downloadDetectedVideo(video: DetectedVideo) {
+  async function downloadDetectedVideo(video: DetectedVideo, selectedFormat?: string) {
     try {
+      console.log('[Store] downloadDetectedVideo called')
+      console.log('[Store] video.url:', video.url)
+      console.log('[Store] selectedFormat:', selectedFormat)
+      console.log('[Store] video.quality:', video.quality)
+      console.log('[Store] Final quality param:', selectedFormat || video.quality || '')
+      
       // Use DownloadVideoWithKey if decodeKey is present (for encrypted WeChat videos)
       const task = await DownloadVideoWithKey(
         video.id,
@@ -294,7 +305,7 @@ export const useAppStore = defineStore('app', () => {
         video.title,
         video.cover,
         video.source,
-        video.quality || '',
+        selectedFormat || video.quality || '',
         video.decodeKey || ''
       ) as DownloadTask
 

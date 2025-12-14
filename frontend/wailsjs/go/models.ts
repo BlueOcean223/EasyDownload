@@ -1,5 +1,23 @@
 export namespace api {
 	
+	export class VideoSpec {
+	    fileFormat: string;
+	    width: number;
+	    height: number;
+	    durationMs: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new VideoSpec(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.fileFormat = source["fileFormat"];
+	        this.width = source["width"];
+	        this.height = source["height"];
+	        this.durationMs = source["durationMs"];
+	    }
+	}
 	export class DetectedVideo {
 	    id: string;
 	    title: string;
@@ -16,6 +34,8 @@ export namespace api {
 	    width: number;
 	    height: number;
 	    isCurrentVideo: boolean;
+	    fileFormats: string[];
+	    specs: VideoSpec[];
 	
 	    static createFrom(source: any = {}) {
 	        return new DetectedVideo(source);
@@ -38,7 +58,27 @@ export namespace api {
 	        this.width = source["width"];
 	        this.height = source["height"];
 	        this.isCurrentVideo = source["isCurrentVideo"];
+	        this.fileFormats = source["fileFormats"];
+	        this.specs = this.convertValues(source["specs"], VideoSpec);
 	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
 	}
 
 }

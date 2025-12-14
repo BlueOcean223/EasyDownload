@@ -14,11 +14,11 @@ import {
   CloudDownloadOutline,
   SettingsOutline,
   PlayOutline,
-  StopOutline,
-  RadioButtonOnOutline
+  StopOutline
 } from '@vicons/ionicons5'
 import { h } from 'vue'
 import WelcomeWizard from '@/components/WelcomeWizard.vue'
+import BilibiliIcon from '@/components/BilibiliIcon.vue'
 
 const router = useRouter()
 const route = useRoute()
@@ -49,7 +49,7 @@ const menuOptions: MenuOption[] = [
   {
     label: 'B站下载',
     key: 'Bilibili',
-    icon: () => h(RadioButtonOnOutline, { class: 'w-5 h-5' })
+    icon: () => h(BilibiliIcon, { class: 'w-5 h-5' })
   },
   {
     label: '下载管理',
