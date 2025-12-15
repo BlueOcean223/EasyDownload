@@ -116,20 +116,8 @@ func (a *App) startup(ctx context.Context) {
 	certDir := filepath.Join(utils.GetAppDataDir(), "certs")
 	a.certManager = proxy.NewCertManager(certDir)
 
-	// Generate CA certificate if not exists
-	if !a.certManager.CertExists() {
-		log.Println("Generating CA certificate...")
-		if err := a.certManager.GenerateCACert(); err != nil {
-			log.Printf("Failed to generate CA certificate: %v", err)
-		}
-	}
-
-	// Proactively check and cache certificate installation status
-	certInstalled := a.certManager.IsCertInstalled()
-	log.Printf("Certificate installed: %v", certInstalled)
-	if a.configManager != nil {
-		_ = a.configManager.Set("certInstalled", certInstalled)
-	}
+	// Certificate generation is now manual only
+	// Users must install certificate via Welcome Wizard or Settings page
 
 	// Initialize proxy server
 	a.proxyServer = proxy.NewProxyServer(a.certManager, a.proxyPort)
@@ -306,23 +294,17 @@ func (a *App) initTray() {
 	// Set callbacks
 	a.trayManager.SetOnShow(func() {
 		runtime.WindowShow(a.ctx)
+		a.trayManager.SetWindowVisible(true)
 	})
 
-	a.trayManager.SetOnHide(func() {
-		runtime.WindowHide(a.ctx)
+	a.trayManager.SetOnSetting(func() {
+		// Emit event to frontend to navigate to settings
+		runtime.EventsEmit(a.ctx, "navigate:settings")
 	})
 
 	a.trayManager.SetOnExit(func() {
 		a.shutdown(a.ctx)
 		runtime.Quit(a.ctx)
-	})
-
-	a.trayManager.SetOnToggleProxy(func() {
-		if a.proxyServer.IsRunning() {
-			a.StopProxy()
-		} else {
-			a.StartProxy()
-		}
 	})
 
 	// Start tray in background
@@ -404,18 +386,21 @@ func (a *App) GetProxyPort() int {
 
 // ==================== Certificate Methods ====================
 
-// IsCertInstalled checks if the CA certificate is installed and caches the status
+// IsCertInstalled checks if the CA certificate is installed
 func (a *App) IsCertInstalled() bool {
-	installed := a.certManager.IsCertInstalled()
-	// Cache the cert installation status to config for faster startup next time
-	if a.configManager != nil {
-		_ = a.configManager.Set("certInstalled", installed)
-	}
-	return installed
+	return a.certManager.IsCertInstalled()
 }
 
 // InstallCert installs the CA certificate to the system trust store
 func (a *App) InstallCert() error {
+	// Generate CA certificate if not exists
+	if !a.certManager.CertExists() {
+		log.Println("Generating CA certificate...")
+		if err := a.certManager.GenerateCACert(); err != nil {
+			return fmt.Errorf("failed to generate CA certificate: %w", err)
+		}
+	}
+
 	err := a.certManager.InstallCert()
 	if err == nil {
 		// Cache the installation status immediately

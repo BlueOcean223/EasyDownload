@@ -7,6 +7,7 @@ import {
   IsProxyRunning,
   IsCertInstalled,
   InstallCert,
+  UninstallCert,
   GetDetectedVideos,
   ClearDetectedVideos,
   DownloadVideo,
@@ -77,7 +78,7 @@ export const useAppStore = defineStore('app', () => {
       proxyRunning.value = await IsProxyRunning()
       certInstalled.value = await IsCertInstalled()
       ffmpegAvailable.value = await IsFFmpegAvailable()
-      firstRunComplete.value = await IsFirstRunComplete()
+      // Note: firstRunComplete is deprecated, wizard display is now based on certInstalled
 
       // Load settings from appInfo
       if (appInfo.value) {
@@ -285,6 +286,16 @@ export const useAppStore = defineStore('app', () => {
     }
   }
 
+  async function uninstallCertificate() {
+    try {
+      await UninstallCert()
+      certInstalled.value = false
+    } catch (error) {
+      console.error('Failed to uninstall certificate:', error)
+      throw error
+    }
+  }
+
   async function clearVideos() {
     await ClearDetectedVideos()
     detectedVideos.value = []
@@ -414,6 +425,7 @@ export const useAppStore = defineStore('app', () => {
     initApp,
     toggleProxy,
     installCertificate,
+    uninstallCertificate,
     clearVideos,
     downloadDetectedVideo,
     pauseDownloadTask,

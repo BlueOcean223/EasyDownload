@@ -30,6 +30,7 @@ const store = useAppStore()
 const message = useMessage()
 
 const installing = ref(false)
+const uninstalling = ref(false)
 const sessData = ref('')
 const savingSessData = ref(false)
 const logDir = ref('')
@@ -75,6 +76,18 @@ async function installCert() {
     message.error(e.message || '证书安装失败，请以管理员身份运行')
   } finally {
     installing.value = false
+  }
+}
+
+async function uninstallCert() {
+  uninstalling.value = true
+  try {
+    await store.uninstallCertificate()
+    message.success('证书卸载成功')
+  } catch (e: any) {
+    message.error(e.message || '证书卸载失败，请以管理员身份运行')
+  } finally {
+    uninstalling.value = false
   }
 }
 
@@ -292,15 +305,26 @@ async function saveUpstreamProxy() {
                 {{ store.appInfo?.certPath }}
               </p>
             </div>
-            <NButton 
-              type="primary" 
-              size="small"
-              :loading="installing"
-              :disabled="store.certInstalled"
-              @click="installCert"
-            >
-              {{ store.certInstalled ? '已安装' : '安装证书' }}
-            </NButton>
+            <NSpace>
+              <NButton 
+                type="primary" 
+                size="small"
+                :loading="installing"
+                :disabled="store.certInstalled"
+                @click="installCert"
+              >
+                {{ store.certInstalled ? '已安装' : '安装证书' }}
+              </NButton>
+              <NButton 
+                type="error" 
+                size="small"
+                :loading="uninstalling"
+                :disabled="!store.certInstalled"
+                @click="uninstallCert"
+              >
+                卸载证书
+              </NButton>
+            </NSpace>
           </div>
         </div>
       </NCard>

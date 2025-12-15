@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref, computed, watch } from 'vue'
+import { onMounted, onUnmounted, ref, computed, watch } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { useAppStore } from '@/stores/app'
 import { 
@@ -19,6 +19,7 @@ import {
 import { h } from 'vue'
 import WelcomeWizard from '@/components/WelcomeWizard.vue'
 import BilibiliIcon from '@/components/BilibiliIcon.vue'
+import { EventsOn, EventsOff } from '../wailsjs/runtime/runtime'
 
 const router = useRouter()
 const route = useRoute()
@@ -33,9 +34,10 @@ const activeKey = computed(() => route.name as string)
 // Computed theme for Naive UI
 const currentTheme = computed(() => store.theme === 'light' ? lightTheme : darkTheme)
 
-// Show welcome wizard after app init if first run
+// Show welcome wizard after app init if certificate is not installed
+// Requirements 1.1, 1.2, 3.1: Use certInstalled instead of firstRunComplete
 watch(() => store.loading, (loading) => {
-  if (!loading && !store.firstRunComplete) {
+  if (!loading && !store.certInstalled) {
     showWelcome.value = true
   }
 })
@@ -80,15 +82,26 @@ async function toggleProxy() {
 
 onMounted(async () => {
   await store.initApp()
+  
+  // Listen for navigate:settings event from tray menu
+  EventsOn('navigate:settings', () => {
+    router.push({ name: 'Settings' })
+  })
+})
+
+onUnmounted(() => {
+  EventsOff('navigate:settings')
 })
 
 function handleWelcomeComplete() {
-  store.completeFirstRun()
+  // Requirements 3.2: Do not update firstRunComplete config
+  // Certificate installation in wizard updates certInstalled config via InstallCert()
   showWelcome.value = false
 }
 
 function handleWelcomeSkip() {
-  store.completeFirstRun()
+  // Requirements 1.4, 3.2: Skip does not update any config
+  // certInstalled remains false, wizard will show again on next startup
   showWelcome.value = false
 }
 </script>

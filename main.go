@@ -1,12 +1,14 @@
 package main
 
 import (
+	"context"
 	"embed"
 
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
 	"github.com/wailsapp/wails/v2/pkg/options/windows"
+	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
 //go:embed all:frontend/dist
@@ -30,6 +32,18 @@ func main() {
 		BackgroundColour: &options.RGBA{R: 18, G: 18, B: 18, A: 1},
 		OnStartup:        app.startup,
 		OnShutdown:       app.shutdown,
+		OnBeforeClose: func(ctx context.Context) (prevent bool) {
+			// Check if minimize to tray is enabled
+			if app.IsMinimizeToTrayEnabled() {
+				// Hide window instead of closing
+				runtime.WindowHide(ctx)
+				if app.trayManager != nil {
+					app.trayManager.SetWindowVisible(false)
+				}
+				return true // Prevent the window from closing
+			}
+			return false // Allow the window to close normally
+		},
 		Bind: []interface{}{
 			app,
 		},

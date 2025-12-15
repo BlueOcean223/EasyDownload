@@ -1,6 +1,7 @@
 package tray
 
 import (
+	"log"
 	"sync"
 
 	"github.com/getlantern/systray"
@@ -12,19 +13,18 @@ type TrayManager struct {
 	activeIcon []byte
 	tooltip    string
 	running    bool
+	ready      bool
 	mu         sync.RWMutex
 
 	// Menu items
-	mShow        *systray.MenuItem
-	mHide        *systray.MenuItem
-	mToggleProxy *systray.MenuItem
-	mQuit        *systray.MenuItem
+	mShow    *systray.MenuItem
+	mSetting *systray.MenuItem
+	mQuit    *systray.MenuItem
 
 	// Callbacks
-	onShow        func()
-	onHide        func()
-	onExit        func()
-	onToggleProxy func()
+	onShow    func()
+	onSetting func()
+	onExit    func()
 
 	// State
 	proxyRunning  bool
@@ -60,11 +60,16 @@ func (tm *TrayManager) SetOnShow(callback func()) {
 	tm.onShow = callback
 }
 
-// SetOnHide sets the callback for hiding the window
+// SetOnHide is deprecated, kept for compatibility
 func (tm *TrayManager) SetOnHide(callback func()) {
+	// No longer used
+}
+
+// SetOnSetting sets the callback for opening settings
+func (tm *TrayManager) SetOnSetting(callback func()) {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
-	tm.onHide = callback
+	tm.onSetting = callback
 }
 
 // SetOnExit sets the callback for exiting the application
@@ -74,11 +79,9 @@ func (tm *TrayManager) SetOnExit(callback func()) {
 	tm.onExit = callback
 }
 
-// SetOnToggleProxy sets the callback for toggling the proxy
+// SetOnToggleProxy is deprecated, kept for compatibility
 func (tm *TrayManager) SetOnToggleProxy(callback func()) {
-	tm.mu.Lock()
-	defer tm.mu.Unlock()
-	tm.onToggleProxy = callback
+	// No longer used
 }
 
 // Start starts the system tray
@@ -92,11 +95,11 @@ func (tm *TrayManager) Start() {
 	tm.running = true
 	tm.mu.Unlock()
 
+	log.Println("Starting system tray...")
 	systray.Run(tm.onReady, tm.onQuit)
 }
 
 // StartAsync starts the system tray in a separate goroutine
-// This is useful when you need to start the tray from a non-main goroutine
 func (tm *TrayManager) StartAsync() {
 	go tm.Start()
 }
@@ -115,30 +118,31 @@ func (tm *TrayManager) Stop() {
 
 // onReady is called when the systray is ready
 func (tm *TrayManager) onReady() {
-	tm.mu.RLock()
+	log.Println("System tray ready, initializing menu...")
+
+	tm.mu.Lock()
 	icon := tm.icon
 	tooltip := tm.tooltip
-	tm.mu.RUnlock()
+	tm.ready = true
+	tm.mu.Unlock()
 
 	// Set initial icon and tooltip
 	if len(icon) > 0 {
 		systray.SetIcon(icon)
+		log.Printf("Tray icon set, size: %d bytes", len(icon))
+	} else {
+		log.Println("Warning: No tray icon provided")
 	}
-	systray.SetTitle("EasyDownload")
+	systray.SetTitle("")
 	systray.SetTooltip(tooltip)
 
-	// Create menu items
-	tm.mShow = systray.AddMenuItem("显示窗口", "显示主窗口")
-	tm.mHide = systray.AddMenuItem("隐藏窗口", "隐藏主窗口")
-	tm.mHide.Hide() // Initially hidden since window is visible
-
+	// Create simple menu: Show Window, Settings, Exit
+	tm.mShow = systray.AddMenuItem("📺 显示窗口", "显示主窗口")
+	tm.mSetting = systray.AddMenuItem("⚙️ 设置", "打开设置页面")
 	systray.AddSeparator()
+	tm.mQuit = systray.AddMenuItem("❌ 退出", "退出应用程序")
 
-	tm.mToggleProxy = systray.AddMenuItem("启动代理", "启动/停止代理服务")
-
-	systray.AddSeparator()
-
-	tm.mQuit = systray.AddMenuItem("退出", "退出应用程序")
+	log.Println("Tray menu created successfully")
 
 	// Handle menu clicks
 	go tm.handleMenuClicks()
@@ -148,7 +152,9 @@ func (tm *TrayManager) onReady() {
 func (tm *TrayManager) onQuit() {
 	tm.mu.Lock()
 	tm.running = false
+	tm.ready = false
 	tm.mu.Unlock()
+	log.Println("System tray stopped")
 }
 
 // handleMenuClicks handles menu item clicks
@@ -156,12 +162,13 @@ func (tm *TrayManager) handleMenuClicks() {
 	for {
 		select {
 		case <-tm.mShow.ClickedCh:
+			log.Println("Tray menu: Show window clicked")
 			tm.showWindow()
-		case <-tm.mHide.ClickedCh:
-			tm.hideWindow()
-		case <-tm.mToggleProxy.ClickedCh:
-			tm.toggleProxy()
+		case <-tm.mSetting.ClickedCh:
+			log.Println("Tray menu: Settings clicked")
+			tm.openSetting()
 		case <-tm.mQuit.ClickedCh:
+			log.Println("Tray menu: Quit clicked")
 			tm.quit()
 			return
 		}
@@ -175,45 +182,21 @@ func (tm *TrayManager) showWindow() {
 	tm.windowVisible = true
 	tm.mu.Unlock()
 
-	// Update menu items
-	if tm.mShow != nil {
-		tm.mShow.Hide()
-	}
-	if tm.mHide != nil {
-		tm.mHide.Show()
-	}
-
 	if callback != nil {
 		callback()
 	}
 }
 
-// hideWindow hides the main window
-func (tm *TrayManager) hideWindow() {
+// openSetting opens the settings page
+func (tm *TrayManager) openSetting() {
 	tm.mu.Lock()
-	callback := tm.onHide
-	tm.windowVisible = false
+	callback := tm.onSetting
 	tm.mu.Unlock()
 
-	// Update menu items
-	if tm.mShow != nil {
-		tm.mShow.Show()
-	}
-	if tm.mHide != nil {
-		tm.mHide.Hide()
-	}
+	// First show the window
+	tm.showWindow()
 
-	if callback != nil {
-		callback()
-	}
-}
-
-// toggleProxy toggles the proxy state
-func (tm *TrayManager) toggleProxy() {
-	tm.mu.RLock()
-	callback := tm.onToggleProxy
-	tm.mu.RUnlock()
-
+	// Then trigger settings callback
 	if callback != nil {
 		callback()
 	}
@@ -232,13 +215,18 @@ func (tm *TrayManager) quit() {
 	systray.Quit()
 }
 
-// SetProxyStatus updates the tray icon and menu based on proxy status
+// SetProxyStatus updates the tray icon based on proxy status
 func (tm *TrayManager) SetProxyStatus(running bool) {
 	tm.mu.Lock()
 	tm.proxyRunning = running
 	icon := tm.icon
 	activeIcon := tm.activeIcon
+	ready := tm.ready
 	tm.mu.Unlock()
+
+	if !ready {
+		return
+	}
 
 	// Update icon based on proxy status
 	if running {
@@ -246,17 +234,11 @@ func (tm *TrayManager) SetProxyStatus(running bool) {
 			systray.SetIcon(activeIcon)
 		}
 		systray.SetTooltip("EasyDownload - 代理运行中")
-		if tm.mToggleProxy != nil {
-			tm.mToggleProxy.SetTitle("停止代理")
-		}
 	} else {
 		if len(icon) > 0 {
 			systray.SetIcon(icon)
 		}
 		systray.SetTooltip("EasyDownload")
-		if tm.mToggleProxy != nil {
-			tm.mToggleProxy.SetTitle("启动代理")
-		}
 	}
 }
 
@@ -279,28 +261,9 @@ func (tm *TrayManager) SetWindowVisible(visible bool) {
 	tm.mu.Lock()
 	tm.windowVisible = visible
 	tm.mu.Unlock()
-
-	// Update menu items
-	if visible {
-		if tm.mShow != nil {
-			tm.mShow.Hide()
-		}
-		if tm.mHide != nil {
-			tm.mHide.Show()
-		}
-	} else {
-		if tm.mShow != nil {
-			tm.mShow.Show()
-		}
-		if tm.mHide != nil {
-			tm.mHide.Hide()
-		}
-	}
 }
 
 // ShowNotification displays a system notification
 func (tm *TrayManager) ShowNotification(title, message string) {
-	// Note: systray doesn't have built-in notification support
-	// We'll use a platform-specific implementation
 	showNotification(title, message)
 }
