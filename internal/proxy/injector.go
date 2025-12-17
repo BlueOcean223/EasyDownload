@@ -81,6 +81,11 @@ const downloadButtonScript = `
     lastEmitTs: 0
   };
 
+  // Pending queue for delayed presentation (encfilekey+m keyed)
+  window.__ed_pendingVideos__ = window.__ed_pendingVideos__ || new Map();
+  var __ed_lastSlideDirection__ = 'none';
+  var __ed_lastTouchY__ = null;
+
   // Debug logger (enable via: localStorage.setItem('__easydownload_debug__','1'))
   function __ed_isDebug() {
     try { return localStorage.getItem('__easydownload_debug__') === '1'; } catch (e) { return false; }
@@ -589,17 +594,37 @@ const downloadButtonScript = `
   (function __ed_bindFocusSignals() {
     try {
       var touch = function() { __ed_touchFocus('ui'); };
-      window.addEventListener('wheel', touch, { passive: true });
+      window.addEventListener('wheel', function(e) {
+        __ed_lastSlideDirection__ = (e && e.deltaY > 0) ? 'down' : 'up';
+        touch();
+      }, { passive: true });
       window.addEventListener('scroll', touch, { passive: true });
       window.addEventListener('pointerdown', touch, { passive: true });
-      window.addEventListener('touchstart', touch, { passive: true });
+      window.addEventListener('touchstart', function(e) {
+        __ed_lastTouchY__ = (e && e.touches && e.touches[0]) ? e.touches[0].clientY : null;
+        touch();
+      }, { passive: true });
+      window.addEventListener('touchmove', function(e) {
+        var y = (e && e.touches && e.touches[0]) ? e.touches[0].clientY : null;
+        if (y != null && __ed_lastTouchY__ != null) {
+          var dy = y - __ed_lastTouchY__;
+          if (Math.abs(dy) > 2) __ed_lastSlideDirection__ = dy < 0 ? 'down' : 'up';
+        }
+      }, { passive: true });
       window.addEventListener('keydown', touch, { passive: true });
 
       // media events do not bubble, so use capture
       document.addEventListener('play', function(e) { __ed_touchFocus('playStart', e && e.target); }, true);
       document.addEventListener('playing', function(e) { __ed_touchFocus('playStart', e && e.target); }, true);
       // Keep focus fresh while playing without re-opening the play-start acceptance window.
-      document.addEventListener('timeupdate', function(e) { __ed_touchFocus('playTick', e && e.target); }, true);
+      // Also trigger play confirmation check
+      document.addEventListener('timeupdate', function(e) {
+        var v = e && e.target;
+        __ed_touchFocus('playTick', v);
+        try {
+          if (v && v.tagName === 'VIDEO' && v.currentTime > 0.5 && !v.paused) __ed_onPlayConfirmed();
+        } catch (err) {}
+      }, true);
     } catch (e) {}
   })();
   function __ed_normalizeUrl(u) {
@@ -614,6 +639,121 @@ const downloadButtonScript = `
   }
   function __ed_isValidHttpUrl(u) {
     return !!__ed_normalizeUrl(u);
+  }
+
+  function __ed_extractEncfileKey(u) {
+    try {
+      u = __ed_normalizeUrl(u || '');
+      if (!u) return { key: '', m: '' };
+      var U = new URL(u, (location && location.origin) ? location.origin : undefined);
+      var key = '', m = '';
+      U.searchParams.forEach(function(v, k) {
+        k = String(k || '').toLowerCase();
+        if (k === 'encfilekey') key = String(v || '');
+        if (k === 'm') m = String(v || '');
+      });
+      return { key: key, m: m };
+    } catch (e) { return { key: '', m: '' }; }
+  }
+
+  function __ed_getPendingKeyFromObjectDesc(obj) {
+    try {
+      var media = obj && obj.media && obj.media[0];
+      if (!media) return '';
+      var raw = '' + (media.url || '') + (media.urlToken || '');
+      var parsed = __ed_extractEncfileKey(raw);
+      if (parsed.key) return 'encfilekey:' + parsed.key + (parsed.m ? ':m:' + parsed.m : '');
+      var vid = __ed_computeVideoId(obj);
+      if (vid) return vid;
+      if (media.decodeKey) return 'decodeKey:' + media.decodeKey;
+      if (media.url) return media.url;
+    } catch (e) {}
+    return '';
+  }
+
+  function __ed_cleanupPending() {
+    try {
+      if (!window.__ed_pendingVideos__) return;
+      var now = __ed_now();
+      var expired = [];
+      window.__ed_pendingVideos__.forEach(function(v, k) {
+        if (now - Number(v && v.captureTs || 0) > 30000) expired.push(k);
+      });
+      expired.forEach(function(k) { window.__ed_pendingVideos__.delete(k); });
+    } catch (e) {}
+  }
+  setInterval(__ed_cleanupPending, 5000);
+
+  function __ed_enqueuePending(key, payload) {
+    if (!key) return;
+    try {
+      if (!window.__ed_pendingVideos__) window.__ed_pendingVideos__ = new Map();
+      var prev = window.__ed_pendingVideos__.get(key) || {};
+      window.__ed_pendingVideos__.set(key, {
+        info: payload,
+        captureTs: __ed_now(),
+        presented: !!prev.presented
+      });
+    } catch (e) {}
+  }
+
+  function __ed_postVideoInfo(payload) {
+    fetch("/res-downloader/wechat?type=1", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    }).catch(function(err) {
+      if (window.__easydownload_trace__) window.__easydownload_trace__('video:send:fail', { err: String(err || '') });
+    });
+  }
+
+  function __ed_findMatchingPending(domTitle) {
+    var now = __ed_now();
+    var candidates = [];
+    try {
+      if (!window.__ed_pendingVideos__) return null;
+      window.__ed_pendingVideos__.forEach(function(v, id) {
+        if (!v || v.presented) return;
+        if (now - Number(v.captureTs || 0) > 10000) return;
+        var titleMatch = __ed_titleLooksLikeSame(domTitle, v.info && v.info.description);
+        candidates.push({ id: id, v: v, titleMatch: titleMatch ? 1 : 0, age: now - Number(v.captureTs || 0) });
+      });
+    } catch (e) {}
+    candidates.sort(function(a, b) {
+      if (a.titleMatch !== b.titleMatch) return b.titleMatch - a.titleMatch;
+      return a.age - b.age;
+    });
+    return candidates[0] ? candidates[0].v : null;
+  }
+
+  function __ed_updateCurrentMarker() {
+    try {
+      var dmTitle = __ed_getCurrentDomTitle();
+      var match = __ed_findMatchingPending(dmTitle);
+      if (match && match.info && match.info.id && window.__easydownload_store__) {
+        window.__easydownload_store__.lastVideoId = match.info.id;
+      }
+    } catch (e) {}
+  }
+
+  function __ed_onPlayConfirmed() {
+    if (__ed_lastSlideDirection__ === 'up') {
+      __ed_updateCurrentMarker();
+      return;
+    }
+    var domTitle = __ed_getCurrentDomTitle();
+    var matched = __ed_findMatchingPending(domTitle);
+    if (matched && !matched.presented) {
+      matched.presented = true;
+      __ed_postVideoInfo(matched.info);
+    }
+  }
+
+  function __ed_tryPresentIfConfirmed() {
+    try {
+      var v = __ed_getActiveVideoEl();
+      if (v && v.currentTime > 0.5 && !v.paused) __ed_onPlayConfirmed();
+    } catch (e) {}
   }
 
   function __ed_getActiveVideoEl() {
@@ -1995,14 +2135,11 @@ const downloadButtonScript = `
       source: source || ''
     };
     
-    // Send to backend for display in UI
-    fetch("/res-downloader/wechat?type=1", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload)
-    }).catch(function(err) {
-      if (window.__easydownload_trace__) window.__easydownload_trace__('video:send:fail', { err: String(err || '') });
-    });
+    // Enqueue to pending queue instead of immediate POST
+    var pendingKey = __ed_getPendingKeyFromObjectDesc(objectDesc) || videoId || '';
+    __ed_enqueuePending(pendingKey, payload);
+    if (window.__easydownload_trace__) window.__easydownload_trace__('video:pending', { key: pendingKey || '', id: videoId || '', src: source || '' });
+    __ed_tryPresentIfConfirmed();
 
     // Delayed meta refresh: DOM text/author often appears slightly after worker url/seed message.
     try {
