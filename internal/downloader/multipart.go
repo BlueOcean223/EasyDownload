@@ -76,45 +76,103 @@ type RangeCheckResult struct {
 	Error         error
 }
 
-// CheckRangeSupport checks if the server supports range requests
-func (md *MultipartDownloader) CheckRangeSupport(ctx context.Context, url string) RangeCheckResult {
-	req, err := http.NewRequestWithContext(ctx, "HEAD", url, nil)
+func (md *MultipartDownloader) probeByRange(ctx context.Context, url string) (supportsRange bool, totalSize int64, err error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
-		return RangeCheckResult{Error: err}
+		return false, 0, err
 	}
 
-	// Set default headers
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-
-	// Set custom headers
+	req.Header.Set("Range", "bytes=0-0")
+	req.Header.Set("Accept-Encoding", "identity")
 	for key, value := range md.headers {
 		req.Header.Set(key, value)
 	}
 
 	resp, err := md.client.Do(req)
 	if err != nil {
-		return RangeCheckResult{Error: err}
+		return false, 0, err
 	}
 	defer resp.Body.Close()
+	_, _ = io.CopyN(io.Discard, resp.Body, 1) // drain at most 1 byte
 
-	if resp.StatusCode != http.StatusOK {
-		return RangeCheckResult{Error: fmt.Errorf("HEAD request failed with status: %d", resp.StatusCode)}
+	switch resp.StatusCode {
+	case http.StatusPartialContent:
+		supportsRange = true
+	case http.StatusOK:
+		supportsRange = false
+	default:
+		return false, 0, fmt.Errorf("range probe failed with status: %d", resp.StatusCode)
 	}
 
-	// Check Accept-Ranges header
-	acceptRanges := resp.Header.Get("Accept-Ranges")
-	supportsRange := acceptRanges == "bytes"
-
-	// If Accept-Ranges header is missing, we might still try with a range request
-	// Some servers support range but don't advertise it
-	if acceptRanges == "" && resp.ContentLength > 0 {
-		// Try a small range request to verify
-		supportsRange = md.verifyRangeSupport(ctx, url)
+	if cr := resp.Header.Get("Content-Range"); cr != "" {
+		if n := totalSizeFromContentRange(cr); n > 0 {
+			return supportsRange, n, nil
+		}
 	}
+
+	if resp.ContentLength > 0 {
+		// When range is honored, Content-Length is often 1; ignore that.
+		if supportsRange && resp.ContentLength <= 1 {
+			return supportsRange, 0, fmt.Errorf("range honored but total size missing")
+		}
+		return supportsRange, resp.ContentLength, nil
+	}
+
+	return supportsRange, 0, fmt.Errorf("unable to determine content length")
+}
+
+// CheckRangeSupport checks if the server supports range requests
+func (md *MultipartDownloader) CheckRangeSupport(ctx context.Context, url string) RangeCheckResult {
+	headSupportsRange := false
+	headContentLength := int64(0)
+	headStatus := 0
+	headAcceptRanges := ""
+
+	// Best-effort HEAD (some servers misreport Content-Length on HEAD for VOD URLs).
+	if req, err := http.NewRequestWithContext(ctx, "HEAD", url, nil); err == nil {
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+		for key, value := range md.headers {
+			req.Header.Set(key, value)
+		}
+
+		if resp, err := md.client.Do(req); err == nil && resp != nil {
+			headStatus = resp.StatusCode
+			headAcceptRanges = resp.Header.Get("Accept-Ranges")
+			headSupportsRange = headAcceptRanges == "bytes"
+			headContentLength = resp.ContentLength
+			_ = resp.Body.Close()
+		}
+	}
+
+	// Definitive probe using GET Range, which can provide total length via Content-Range.
+	supportsRange, total, probeErr := md.probeByRange(ctx, url)
+	if probeErr != nil {
+		// If range probe fails, fall back to what we learned from HEAD.
+		if headStatus == http.StatusOK && headContentLength > 0 {
+			logger.Info("Range check fallback to HEAD: status=%d acceptRanges=%q len=%d err=%v", headStatus, headAcceptRanges, headContentLength, probeErr)
+			return RangeCheckResult{SupportsRange: headSupportsRange, ContentLength: headContentLength, Error: nil}
+		}
+		return RangeCheckResult{Error: probeErr}
+	}
+
+	// Merge: if server honored range, always treat as supports range even if HEAD lied.
+	finalSupports := supportsRange || headSupportsRange
+	finalLen := total
+	if finalLen <= 0 && headContentLength > 0 {
+		finalLen = headContentLength
+	}
+
+	// Keep this as INFO: it explains 0MB/partial download issues in the field.
+	logger.Info("Range check: head(status=%d acceptRanges=%q len=%d) probe(supports=%v total=%d) -> supports=%v total=%d",
+		headStatus, headAcceptRanges, headContentLength,
+		supportsRange, total,
+		finalSupports, finalLen,
+	)
 
 	return RangeCheckResult{
-		SupportsRange: supportsRange,
-		ContentLength: resp.ContentLength,
+		SupportsRange: finalSupports,
+		ContentLength: finalLen,
 		Error:         nil,
 	}
 }

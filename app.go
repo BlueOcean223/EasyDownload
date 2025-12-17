@@ -230,7 +230,9 @@ func (a *App) startup(ctx context.Context) {
 
 	// Set download callback for one-click download from video page
 	a.proxyServer.GetWeChatHandler().SetDownloadCallback(func(video proxy.WeChatVideoInfo) {
-		log.Printf("Download requested from video page: %s", video.Title)
+		logger.Info("Download requested from video page: title=%q id=%q pageKey=%q source=%q",
+			video.Title, video.ID, video.PageKey, video.Source,
+		)
 
 		// Create unique ID
 		id := fmt.Sprintf("wechat_%d", time.Now().UnixNano())
@@ -246,7 +248,7 @@ func (a *App) startup(ctx context.Context) {
 			video.DecodeKey,
 		)
 		if err != nil {
-			log.Printf("Failed to add download task: %v", err)
+			logger.Error("Failed to add download task: %v", err)
 			runtime.EventsEmit(a.ctx, "download:error", map[string]interface{}{
 				"error": err.Error(),
 			})
@@ -255,7 +257,7 @@ func (a *App) startup(ctx context.Context) {
 
 		// Start downloading immediately
 		if err := a.downloadManager.StartTask(id); err != nil {
-			log.Printf("Failed to start download task: %v", err)
+			logger.Error("Failed to start download task: %v", err)
 			runtime.EventsEmit(a.ctx, "download:error", map[string]interface{}{
 				"task":  task.TaskToJSON(),
 				"error": err.Error(),

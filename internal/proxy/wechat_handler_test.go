@@ -934,3 +934,149 @@ func TestVideoSpecExtractionProperty(t *testing.T) {
 
 	properties.TestingRun(t)
 }
+
+// **Feature: video-deduplication-fix**
+// **Validates: Stable URL parameter extraction for deduplication**
+// Based on url.md analysis: encfilekey and m are stable across sessions,
+// while token, sign, svrbypass, svrnonce, and decodeKey change on each access.
+
+func TestExtractStableURLParams(t *testing.T) {
+	testCases := []struct {
+		name     string
+		url      string
+		expected string
+	}{
+		{
+			name:     "empty URL",
+			url:      "",
+			expected: "",
+		},
+		{
+			name:     "non-WeChat URL unchanged",
+			url:      "https://example.com/video.mp4?token=abc",
+			expected: "https://example.com/video.mp4?token=abc",
+		},
+		{
+			name:     "WeChat URL with encfilekey and m",
+			url:      "https://finder.video.qq.com/251/20302/stodownload?encfilekey=abc123&hy=SZ&idx=1&m=11f03c01b3c930e34b59143124dc3e38&token=volatile&sign=volatile",
+			expected: "encfilekey:abc123:m:11f03c01b3c930e34b59143124dc3e38",
+		},
+		{
+			name:     "WeChat URL with only encfilekey",
+			url:      "https://finder.video.qq.com/251/20302/stodownload?encfilekey=xyz789&token=volatile",
+			expected: "encfilekey:xyz789",
+		},
+		{
+			name:     "WeChat URL with only m",
+			url:      "https://finder.video.qq.com/251/20302/stodownload?m=hash123&token=volatile",
+			expected: "/251/20302/stodownload:m:hash123",
+		},
+		{
+			name:     "WeChat URL without stable params",
+			url:      "https://finder.video.qq.com/251/20302/stodownload?token=volatile",
+			expected: "https://finder.video.qq.com/251/20302/stodownload",
+		},
+		{
+			name:     "findermp host also processed",
+			url:      "https://findermp.video.qq.com/path?encfilekey=test&m=hash",
+			expected: "encfilekey:test:m:hash",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := extractStableURLParams(tc.url)
+			if result != tc.expected {
+				t.Errorf("extractStableURLParams(%q) = %q, expected %q", tc.url, result, tc.expected)
+			}
+		})
+	}
+}
+
+func TestCanonicalKeyForVideo_StableDeduplication(t *testing.T) {
+	// Test case from url.md: same video with different volatile params
+	// These URLs are for the SAME video but captured at different times
+	testCases := []struct {
+		name   string
+		video1 WeChatVideoInfo
+		video2 WeChatVideoInfo
+		same   bool // Should they produce the same key?
+	}{
+		{
+			name: "same video with different tokens should have same key",
+			video1: WeChatVideoInfo{
+				URL:       "https://finder.video.qq.com/251/20302/stodownload?encfilekey=abc&m=hash&token=token1&sign=sign1",
+				DecodeKey: "1681796139",
+			},
+			video2: WeChatVideoInfo{
+				URL:       "https://finder.video.qq.com/251/20302/stodownload?encfilekey=abc&m=hash&token=token2&sign=sign2",
+				DecodeKey: "1918847917", // Different decodeKey!
+			},
+			same: true,
+		},
+		{
+			name: "different videos should have different keys",
+			video1: WeChatVideoInfo{
+				URL:       "https://finder.video.qq.com/251/20302/stodownload?encfilekey=video1&m=hash1",
+				DecodeKey: "key1",
+			},
+			video2: WeChatVideoInfo{
+				URL:       "https://finder.video.qq.com/251/20302/stodownload?encfilekey=video2&m=hash2",
+				DecodeKey: "key2",
+			},
+			same: false,
+		},
+		{
+			name: "video with ID should use ID as key",
+			video1: WeChatVideoInfo{
+				ID:        "stable-id-123",
+				URL:       "https://finder.video.qq.com/path?token=token1",
+				DecodeKey: "key1",
+			},
+			video2: WeChatVideoInfo{
+				ID:        "stable-id-123",
+				URL:       "https://finder.video.qq.com/path?token=token2",
+				DecodeKey: "key2",
+			},
+			same: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			key1 := canonicalKeyForVideo(tc.video1)
+			key2 := canonicalKeyForVideo(tc.video2)
+
+			if tc.same && key1 != key2 {
+				t.Errorf("Expected same key for same video, got %q and %q", key1, key2)
+			}
+			if !tc.same && key1 == key2 {
+				t.Errorf("Expected different keys for different videos, both got %q", key1)
+			}
+		})
+	}
+}
+
+// Test that decodeKey is NOT used in deduplication (it's volatile)
+func TestCanonicalKeyForVideo_DecodeKeyNotUsed(t *testing.T) {
+	video1 := WeChatVideoInfo{
+		URL:       "https://finder.video.qq.com/path?encfilekey=same&m=same",
+		DecodeKey: "key1",
+	}
+	video2 := WeChatVideoInfo{
+		URL:       "https://finder.video.qq.com/path?encfilekey=same&m=same",
+		DecodeKey: "key2", // Different decodeKey
+	}
+
+	key1 := canonicalKeyForVideo(video1)
+	key2 := canonicalKeyForVideo(video2)
+
+	if key1 != key2 {
+		t.Errorf("DecodeKey should not affect deduplication key. Got %q and %q", key1, key2)
+	}
+
+	// Verify decodeKey is not in the key
+	if strings.Contains(key1, "key1") || strings.Contains(key1, "key2") {
+		t.Errorf("DecodeKey should not be part of canonical key: %q", key1)
+	}
+}

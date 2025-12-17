@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"math"
 	"net/http"
@@ -292,11 +293,27 @@ func (dm *DownloadManager) AddTaskWithDecodeKey(id, rawURL, title, cover, source
 	}
 
 	// Generate filename
-	fileName := sanitizeFileName(title)
-	if fileName == "" {
-		fileName = fmt.Sprintf("video_%s", id)
+	baseName := sanitizeFileName(title)
+	usedFallbackName := false
+	if baseName == "" {
+		usedFallbackName = true
+		safeSource := sanitizeFileName(source)
+		if safeSource == "" {
+			safeSource = "video"
+		}
+		h := fnv.New32a()
+		_, _ = h.Write([]byte(id))
+		hash := fmt.Sprintf("%08x", h.Sum32())
+		baseName = fmt.Sprintf("video_%s_%d_%s", safeSource, time.Now().Unix(), hash)
 	}
-	fileName = fileName + ".mp4"
+	baseName = sanitizeFileName(baseName)
+	if baseName == "" {
+		baseName = fmt.Sprintf("video_%d", time.Now().UnixNano())
+	}
+	fileName := ensureUniqueFileName(dm.downloadDir, baseName, ".mp4")
+	if usedFallbackName {
+		logger.Info("Filename fallback used: id=%q -> %q", shortenForLog(id, 120), fileName)
+	}
 
 	task := &DownloadTask{
 		ID:         id,
@@ -689,6 +706,10 @@ func (dm *DownloadManager) performHTTPDownload(ctx context.Context, task *Downlo
 		task.FileSize = checkResult.ContentLength
 		task.mu.Unlock()
 	}
+	// Heuristic: flag obviously tiny WeChat files (likely chunk/preload) to help diagnostics.
+	if strings.ToLower(strings.TrimSpace(task.Source)) == "wechat" && checkResult.ContentLength > 0 && checkResult.ContentLength < 3*1024*1024 {
+		logger.Warn("[WeChat Download] Suspiciously small content length (%d bytes) for %s", checkResult.ContentLength, task.Title)
+	}
 
 	// Decide whether to use multipart download
 	if ShouldUseMultipart(checkResult.SupportsRange, checkResult.ContentLength) {
@@ -784,7 +805,15 @@ func (dm *DownloadManager) performSequentialHTTPDownload(ctx context.Context, ta
 	// Get file size
 	task.mu.Lock()
 	if task.FileSize == 0 {
-		task.FileSize = resp.ContentLength
+		if resp.StatusCode == http.StatusPartialContent {
+			if total := totalSizeFromContentRange(resp.Header.Get("Content-Range")); total > 0 {
+				task.FileSize = total
+			} else {
+				task.FileSize = resp.ContentLength
+			}
+		} else {
+			task.FileSize = resp.ContentLength
+		}
 	}
 	task.mu.Unlock()
 
@@ -883,19 +912,55 @@ func (dm *DownloadManager) handlePostDownloadDecryption(task *DownloadTask) erro
 			decryptor := NewVideoDecryptor()
 			if err := decryptor.DecryptFile(taskFilePath, decodeKey); err != nil {
 				logger.Error("Failed to decrypt video file: %v", err)
-				// Don't fail the download, just log the error
-				// The file is still saved, user can try manual decryption
+				// Do not fail the download on decrypt error; keep the original file so user can retry with a fresh key.
+				return nil
 			} else {
 				logger.Info("Video decryption completed: %s", taskFilePath)
 				// Validate the decrypted file format
 				if !ValidateVideoFormat(taskFilePath) {
 					logger.Warn("Decrypted file may not be a valid video format: %s", taskFilePath)
+					// Keep file anyway; upstream may have returned partial/chunk content.
+					return nil
 				}
 			}
 		}
 	}
 
 	return nil
+}
+
+func ensureUniqueFileName(dir, base, ext string) string {
+	base = sanitizeFileName(base)
+	if base == "" {
+		base = fmt.Sprintf("video_%d", time.Now().UnixNano())
+	}
+	ext = strings.TrimSpace(ext)
+	if ext == "" {
+		ext = ".mp4"
+	}
+
+	exists := func(name string) bool {
+		_, err := os.Stat(filepath.Join(dir, name))
+		return err == nil
+	}
+
+	name := sanitizeFileName(base) + ext
+	if !exists(name) {
+		return name
+	}
+
+	for i := 2; i <= 99; i++ {
+		candidateBase := sanitizeFileName(fmt.Sprintf("%s_%d", base, i))
+		if candidateBase == "" {
+			candidateBase = fmt.Sprintf("video_%d", time.Now().UnixNano())
+		}
+		candidate := candidateBase + ext
+		if !exists(candidate) {
+			return candidate
+		}
+	}
+
+	return fmt.Sprintf("%s_%d%s", sanitizeFileName(base), time.Now().UnixNano(), ext)
 }
 
 // handleError handles download errors

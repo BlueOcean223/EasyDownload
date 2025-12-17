@@ -32,7 +32,7 @@ const downloadButtonScript = `
   if (window.__easydownload_injected__) return;
   window.__easydownload_injected__ = true;
 
-  console.log('[EasyDownload] Script loaded');
+  // (no console log)
 
   // Diagnostic heartbeat so backend logs can confirm the script actually executed.
   function __ed_ping() {
@@ -58,11 +58,24 @@ const downloadButtonScript = `
     lastMetaById: {},
     lastEmitById: {},
     recentAccepted: {},
+    // Last accepted DOM title (used to avoid binding worker-preload URLs to previous video's title)
+    lastDomTitle: '',
+    lastDomTitleTs: 0,
     // Context gating to avoid reporting preloaded/offscreen videos
     pageKey: '',
     lastHref: '',
     lastFocusTs: 0,
+    // Last time we saw an active video start playing (used for "play-start window" gating)
+    lastPlayStartTs: 0,
+    // Last time we saw an active video actively playing (used as a focus/visibility proxy)
     lastPlayTs: 0,
+    // Home feed: accept at most one "new video id" per play-start window
+    lastPlayAcceptedId: '',
+    lastPlayAcceptedTs: 0,
+    // Home feed: accept at most one new video id per slide (blocks next-video prefetch)
+    lastSlideAcceptedId: '',
+    lastSlideChangeTs: 0,
+    lastSlideIndex: -1,
     acceptedByPageKey: {},
     noKeyAccepted: { id: '', ts: 0 },
     lastEmitTs: 0
@@ -134,13 +147,35 @@ const downloadButtonScript = `
     } catch (e) { return ''; }
   }
 
-  function __ed_touchFocus(reason) {
+  function __ed_touchFocus(reason, target) {
     try {
       var s = window.__easydownload_store__;
       if (!s) return;
       var now = __ed_now();
       s.lastFocusTs = now;
-      if (reason === 'play') s.lastPlayTs = now;
+
+      // Only treat "play start" signals from the active (visible/playing) <video> element as a
+      // new play window. Offscreen/preloaded <video> tags can emit events and must not reset gating.
+      if (reason === 'playStart' || reason === 'playTick') {
+        try {
+          if (target && target.tagName && String(target.tagName).toLowerCase() === 'video') {
+            var vAct = __ed_getActiveVideoEl();
+            var actStarted = false;
+            try { actStarted = !!(vAct && vAct.readyState >= 2 && (vAct.currentTime > 0 || !vAct.paused)); } catch (e0) { actStarted = false; }
+            if (actStarted && vAct && target !== vAct) return;
+          }
+        } catch (e1) {}
+      }
+
+      if (reason === 'playStart') {
+        s.lastPlayStartTs = now;
+        s.lastPlayTs = now;
+        s.lastPlayAcceptedId = '';
+        s.lastPlayAcceptedTs = 0;
+      } else if (reason === 'playTick') {
+        // Keep "focused" while video is playing, but do NOT reset the play-start gating window.
+        s.lastPlayTs = now;
+      }
     } catch (e) {}
   }
 
@@ -194,55 +229,64 @@ const downloadButtonScript = `
       if (!objectDesc || !objectDesc.media || !objectDesc.media.length) return '';
       var media = objectDesc.media[0];
       var parts = [];
-      function __ed_canonForId(u) {
+
+      // Helper: extract stable params from WeChat video URL for deduplication
+      // Based on url.md analysis: encfilekey and m are stable across sessions
+      // Volatile params (token, sign, svrbypass, svrnonce, decodeKey) change on each access
+      function __ed_extractStableUrlId(u) {
         u = __ed_normalizeUrl(u);
         if (!u) return '';
         try {
           var U = new URL(u, (location && location.origin) ? location.origin : undefined);
           var host = (U.hostname || '').toLowerCase();
-          // Only canonicalize WeChat finder download hosts
+          // Only process WeChat finder download hosts
           if (host.indexOf('finder.video.qq.com') === -1 && host.indexOf('findermp.video.qq.com') === -1) {
             return u;
           }
-          // Drop volatile query params that change across scroll/back and cause duplicate IDs
-          var keep = { encfilekey: 1, hy: 1, idx: 1, m: 1, uzid: 1 };
-          var out = [];
+          // Extract only the most stable params: encfilekey and m
+          // These remain constant even when user navigates away and returns
+          var encfilekey = '';
+          var m = '';
           try {
             U.searchParams.forEach(function(v, k) {
               try { k = String(k || '').toLowerCase(); } catch (e) { k = ''; }
-              if (!k) return;
-              if (keep[k]) {
-                try { out.push([k, String(v || '')]); } catch (e2) {}
-              }
+              if (k === 'encfilekey') encfilekey = String(v || '');
+              if (k === 'm') m = String(v || '');
             });
           } catch (e3) {}
-          out.sort(function(a, b) {
-            if (a[0] < b[0]) return -1;
-            if (a[0] > b[0]) return 1;
-            if (a[1] < b[1]) return -1;
-            if (a[1] > b[1]) return 1;
-            return 0;
-          });
-          var qs = '';
-          for (var i = 0; i < out.length; i++) {
-            qs += (i === 0 ? '?' : '&') + encodeURIComponent(out[i][0]) + '=' + encodeURIComponent(out[i][1]);
+          // If we have encfilekey, use it as primary identifier (most stable)
+          if (encfilekey) {
+            return 'encfilekey:' + encfilekey + (m ? ':m:' + m : '');
           }
-          return U.origin + U.pathname + qs;
+          // Fallback: use pathname + m if available
+          if (m) {
+            return U.pathname + ':m:' + m;
+          }
+          return U.origin + U.pathname;
         } catch (e) {
           return u;
         }
       }
+
+      // Priority 1: Use feed.id and objectNonceId (most stable, from WeChat API)
+      // These are the same identifiers used by reference project wx_channels_download
       try {
         if (objectDesc.id) parts.push(String(objectDesc.id));
         if (objectDesc.objectNonceId) parts.push(String(objectDesc.objectNonceId));
       } catch (e) {}
+
+      // Priority 2: Extract stable URL params if no API IDs available
       if (!parts.length && media && (media.url || media.urlToken)) {
         var raw = '';
         try { raw = String(media.url || '') + String(media.urlToken || ''); } catch (e) { raw = String(media.url || ''); }
-        var cu = __ed_canonForId(raw);
-        parts.push(cu || raw || String(media.url || ''));
+        var stableId = __ed_extractStableUrlId(raw);
+        parts.push(stableId || raw || String(media.url || ''));
       }
-      if (media && media.decodeKey) parts.push(String(media.decodeKey));
+
+      // NOTE: Do NOT include decodeKey in ID - it changes across sessions!
+      // Based on url.md analysis: decodeKey values 1681796139, 1918847917, 1584984553
+      // are all for the SAME video but captured at different times
+
       return parts.join(':') || (media && media.url ? String(media.url) : '');
     } catch (e) { return ''; }
   }
@@ -251,18 +295,160 @@ const downloadButtonScript = `
     try {
       var s = window.__easydownload_store__;
       if (!s) return false;
+      var reject = function(reason, extra) {
+        try {
+          if (window.__easydownload_trace_gate__) {
+            window.__easydownload_trace_gate__(reason, Object.assign({
+              id: videoId || '',
+              lastId: (s && s.lastVideoId) ? s.lastVideoId : '',
+              source: (meta && meta.source) ? String(meta.source) : '',
+              pageKey: __ed_getPageKey() || '',
+              isHome: isHome
+            }, extra || {}));
+          }
+        } catch (e) {}
+        return false;
+      };
 
       var now = __ed_now();
       var source = (meta && meta.source) ? String(meta.source) : '';
+      var strong = (source === 'media_getter' || source === 'comment');
       var pageKey = __ed_getPageKey();
+      var isHome = false;
+      try {
+        var path = (location && location.pathname) ? String(location.pathname) : '';
+        isHome = path.indexOf('/pages/home') !== -1;
+        // Home feed often reuses the same pageKey for multiple videos; treat it as unreliable there,
+        // otherwise we "lock" to the first video and every subsequent download maps to the wrong resource.
+        if (isHome) pageKey = '';
+      } catch (e) {}
+      // Home feed often reuses the same pageKey for multiple videos; treat it as unreliable there,
+      // otherwise we "lock" to the first video and every subsequent download maps to the wrong resource.
+      try {
+        // (kept for backward compatibility; isHome/pageKey handled above)
+      } catch (e) {}
       var focused = __ed_recentlyFocused();
       var domTitle = __ed_getCurrentDomTitle();
       var odTitle = __ed_normText(objectDesc && objectDesc.description ? objectDesc.description : '');
+      var playAge = 999999;
+      try {
+        var ps = Number(s.lastPlayStartTs || 0) || Number(s.lastPlayTs || 0);
+        playAge = now - ps;
+      } catch (e0) { playAge = 999999; }
+      var inPlayWindow = playAge >= 0 && playAge <= 1200;
+
+      // Home feed: even strong sources (media_getter/comment) should not surface a different id
+      // until a real slide change occurs. This blocks "next video" prefetch on the same slide.
+      try {
+        if (isHome && strong && videoId && s.lastVideoId && videoId !== s.lastVideoId) {
+          var lastSlideId = s.lastSlideAcceptedId || '';
+          if (lastSlideId && lastSlideId !== videoId) {
+            // Fallback: if slide detection failed but the active video just started (ct small) OR
+            // we are within play-start window, treat this as an implicit slide change and allow.
+            var vSlide = __ed_getActiveVideoEl();
+            var ctSlide = 999;
+            try { ctSlide = vSlide ? Number(vSlide.currentTime || 0) : 999; } catch (eCt) { ctSlide = 999; }
+            var allowImplicit = (ctSlide >= 0 && ctSlide <= 0.8) || (inPlayWindow && ctSlide >= 0 && ctSlide <= 1.5);
+            if (allowImplicit) {
+              try {
+                if (window.__easydownload_trace_gate__) {
+                  window.__easydownload_trace_gate__('strong_allow_implicit_slide', { ct: ctSlide, playAge: playAge, lastSlideId: lastSlideId });
+                }
+                s.lastSlideAcceptedId = '';
+                s.lastSlideChangeTs = now;
+              } catch (e2) {}
+            } else {
+              return reject('strong_same_slide_other_id', { lastSlideId: lastSlideId, ct: ctSlide, playAge: playAge });
+            }
+          }
+        }
+      } catch (e00) {}
+
+      // Home feed: for non-strong sources (worker/fetch/xhr/payload), only accept a NEW id
+      // right after playback starts, and accept at most one id per play window.
+      try {
+        if (isHome && videoId && (!s.lastVideoId || videoId !== s.lastVideoId) && !strong) {
+          if (source === 'worker' || source === 'fetch' || source === 'xhr' || source === 'payload') {
+            var recentlySwiped0 = false;
+            try { recentlySwiped0 = (now - Number(s.lastSlideChangeTs || 0)) <= 2600; } catch (e0x) { recentlySwiped0 = false; }
+            if (!inPlayWindow && !recentlySwiped0) {
+              if (window.__easydownload_trace__) {
+                window.__easydownload_trace__('video:reject', { reason: 'home_outside_play', id: videoId || '', src: source || '', playAge: playAge });
+              }
+              return reject('home_outside_play', { playAge: playAge });
+            }
+            if (s.lastPlayAcceptedId && s.lastPlayAcceptedId !== videoId) {
+              if (window.__easydownload_trace__) {
+                window.__easydownload_trace__('video:reject', { reason: 'home_play_already_accepted', id: videoId || '', kept: s.lastPlayAcceptedId || '', src: source || '' });
+              }
+              return reject('home_play_already_accepted', { kept: s.lastPlayAcceptedId || '' });
+            }
+          }
+        }
+      } catch (e01) {}
       // Title gating is helpful to avoid reporting preloaded/offscreen videos, but it can also
       // block real updates when API payloads omit description/title (cached/preloaded batches).
       // Allow "missing title" when we can confirm the user is interacting and the active video started.
-      var titleOk = __ed_titleLooksLikeSame(domTitle, odTitle) || (!!domTitle && !odTitle && source === 'worker');
-      if (!titleOk && !!domTitle && !odTitle && focused) {
+      var titleOk = __ed_titleLooksLikeSame(domTitle, odTitle);
+      // If DOM title is unavailable/filtered, trust non-empty objectDesc title (it came from WeChat APIs).
+      try {
+        if (!domTitle && odTitle && !__ed_isBadTitle(odTitle)) titleOk = true;
+      } catch (e0) {}
+
+      // Prefetch defense: if videoId changes but user didn't just swipe/switch, reject worker/network hints.
+      // This avoids off-by-one where the NEXT video is prefetched while the current video is playing.
+      try {
+        if (videoId && s.lastVideoId && videoId !== s.lastVideoId && !strong) {
+          var recentlySwiped = false;
+          try { recentlySwiped = (now - Number(s.lastSlideChangeTs || 0)) <= 2200; } catch (e1) { recentlySwiped = false; }
+          var activeTime = 999;
+          try {
+            var vAct = __ed_getActiveVideoEl();
+            activeTime = vAct ? Number(vAct.currentTime || 0) : 999;
+          } catch (e2) { activeTime = 999; }
+          // On home feed, only slide-change is a reliable switch signal. currentTime<=1.5 alone
+          // is too weak and will accept NEXT-video prefetches during initial playback.
+          var isLikelySwitchMoment = recentlySwiped || (!isHome && (activeTime >= 0 && activeTime <= 1.5));
+          if ((source === 'worker' || source === 'fetch' || source === 'xhr' || source === 'payload') && !isLikelySwitchMoment) {
+            if (isHome && source === 'worker' && window.__easydownload_trace__) {
+              window.__easydownload_trace__('video:reject', { reason: 'home_no_swipe', id: videoId || '', lastId: s.lastVideoId || '', ct: activeTime || 0 });
+            }
+            return reject('worker_no_switch', { ct: activeTime || 0, playAge: playAge });
+          }
+        }
+      } catch (e3) {}
+
+      // Worker messages are the most likely to include NEXT-video prefetch URLs.
+      // For a NEW videoId, only accept worker updates after playback starts.
+      // This avoids the classic off-by-one (download B gets C) right after swipe.
+      try {
+        if (source === 'worker' && videoId && s.lastVideoId && videoId !== s.lastVideoId) {
+          var vw = __ed_getActiveVideoEl();
+          var startedW = false;
+          try { startedW = !!(vw && vw.readyState >= 2 && (vw.currentTime > 0 || !vw.paused)); } catch (e) { startedW = false; }
+          if (!startedW) return reject('worker_not_started', { ct: (vw && vw.currentTime) ? vw.currentTime : 0 });
+        }
+      } catch (e4) {}
+      // Worker messages often contain preload URLs for the NEXT video. Never bind a worker URL to the
+      // current DOM title unless the DOM title has changed since the last accepted video (or we have no current yet).
+      if (!isHome && !titleOk && source === 'worker' && !!domTitle && !odTitle) {
+        var lastDom = __ed_normText(s.lastDomTitle || '');
+        if (!s.lastVideoId) {
+          titleOk = true;
+        } else if (lastDom && !__ed_titleLooksLikeSame(domTitle, lastDom)) {
+          titleOk = true;
+        } else if (!lastDom) {
+          // If we never captured a previous DOM title, allow once; it will be stored on accept.
+          titleOk = true;
+        }
+      }
+      if (!titleOk && !!domTitle && !odTitle && focused && source !== 'worker') {
+        var same = !!(videoId && s.lastVideoId && videoId === s.lastVideoId);
+        if (!(strong || same)) {
+          // For NEW video ids: do not bind a title-less payload (usually a preload) to the current DOM title.
+          // This is the main cause of "download B gets C" off-by-one issues.
+          return reject('title_guard_dom_only', { domTitle: domTitle.slice(0, 80), odTitle: odTitle.slice(0, 80) });
+        }
         try {
           var v0 = __ed_getActiveVideoEl();
           var started0 = false;
@@ -275,7 +461,7 @@ const downloadButtonScript = `
       if (videoId) {
         if (!s.lastEmitById) s.lastEmitById = {};
         var lastById = Number(s.lastEmitById[videoId] || 0);
-        if (videoId !== s.lastVideoId && lastById && (now - lastById) < 2000) return false;
+        if (videoId !== s.lastVideoId && lastById && (now - lastById) < 2000) return reject('per_id_throttle', { lastById: lastById });
       }
 
       // Always allow meta refresh for the already-accepted current video.
@@ -284,34 +470,46 @@ const downloadButtonScript = `
       // Global throttle to avoid bursts even if gating fails (ms)
       if (now - Number(s.lastEmitTs || 0) < 350) {
         // Still allow same-video meta updates (handled above)
-        return false;
+        return reject('global_throttle', { lastEmitTs: Number(s.lastEmitTs || 0) });
       }
 
       // Prefer pageKey gating when available
       if (pageKey) {
         var recent = s.recentAccepted && s.recentAccepted[pageKey] ? s.recentAccepted[pageKey] : null;
         if (recent && recent.id && videoId && recent.id === videoId && (now - Number(recent.ts || 0)) < 8000) {
-          return false;
+          return reject('pageKey_recent_same', { recentTs: Number(recent.ts || 0), accepted: recent.id || '' });
         }
         var accepted = s.acceptedByPageKey ? s.acceptedByPageKey[pageKey] : '';
         if (accepted) {
           // Only allow updates for the accepted video of this pageKey
           if (videoId && accepted === videoId) return true;
-          return false;
+          return reject('pageKey_locked', { accepted: accepted || '' });
         }
 
         // First time seeing this pageKey: require recent focus
-        if (!focused) return false;
+        if (!focused) return reject('pageKey_no_focus', {});
 
         // Require title match for non-worker sources to avoid preloads (but allow started video w/ missing title)
         if (source && source !== 'worker') {
-          if (!titleOk) return false;
+          if (!titleOk) return reject('pageKey_title_mismatch', { domTitle: domTitle.slice(0, 80), odTitle: odTitle.slice(0, 80) });
         } else {
           // Worker fallback: allow if active video is present and started
           var v = __ed_getActiveVideoEl();
           var started = false;
           try { started = !!(v && v.readyState >= 2 && (v.currentTime > 0 || !v.paused)); } catch (e) { started = false; }
-          if (!started && !titleOk) return false;
+          if (!started) return reject('pageKey_worker_not_started', {});
+          if (!titleOk) {
+            // If we cannot get a reliable DOM title, allow worker updates only during a likely switch moment.
+            // This keeps "URL/decodeKey for current video" working while still rejecting background prefetch.
+            var swOk = false;
+            try {
+              var rs = (now - Number(s.lastSlideChangeTs || 0)) <= 2200;
+              var ct = 999;
+              try { ct = v ? Number(v.currentTime || 0) : 999; } catch (e2) { ct = 999; }
+              swOk = rs || (ct >= 0 && ct <= 1.5);
+            } catch (e3) { swOk = false; }
+            if (!swOk) return reject('pageKey_worker_no_switch', { ct: ct, rs: rs });
+          }
         }
 
         // Accept and bind this pageKey to this videoId
@@ -323,14 +521,36 @@ const downloadButtonScript = `
       }
 
       // No pageKey: fallback to (focused + title match) and dedupe by last accepted id
-      if (!focused) return false;
-      if (!titleOk) return false;
+      if (!focused) return reject('nokey_no_focus', {});
+      if (!titleOk) {
+        // Same idea as pageKey+worker fallback: allow during switch moment only.
+        var swOk2 = false;
+        try {
+          var rs2 = (now - Number(s.lastSlideChangeTs || 0)) <= 2200;
+          var v2 = __ed_getActiveVideoEl();
+          var ct2 = 999;
+          try { ct2 = v2 ? Number(v2.currentTime || 0) : 999; } catch (e4) { ct2 = 999; }
+          // For the FIRST accept on home feed, allow title-less updates right after play starts.
+          var firstHomeOk = false;
+          try { firstHomeOk = !!(isHome && !s.lastVideoId && inPlayWindow); } catch (e5) { firstHomeOk = false; }
+          swOk2 = rs2 || (!isHome && (ct2 >= 0 && ct2 <= 1.5)) || firstHomeOk;
+        } catch (e5) { swOk2 = false; }
+        if (!swOk2) return reject('nokey_title_guard', { rs: rs2, ct: ct2 });
+      }
       if (!s.noKeyAccepted) s.noKeyAccepted = { id: '', ts: 0 };
       if (s.noKeyAccepted.id && s.noKeyAccepted.id === videoId && now - Number(s.noKeyAccepted.ts || 0) < 8000) {
-        return false;
+        return reject('nokey_recent_same', { lastTs: Number(s.noKeyAccepted.ts || 0) });
       }
       s.noKeyAccepted.id = videoId || 'unknown';
       s.noKeyAccepted.ts = now;
+      try {
+        var rs3 = false;
+        try { rs3 = (now - Number(s.lastSlideChangeTs || 0)) <= 2600; } catch (e7) { rs3 = false; }
+        if (isHome && videoId && (!s.lastVideoId || videoId !== s.lastVideoId) && (inPlayWindow || rs3) && !strong) {
+          s.lastPlayAcceptedId = videoId;
+          s.lastPlayAcceptedTs = now;
+        }
+      } catch (e6) {}
       return true;
     } catch (e) {
       return false;
@@ -354,6 +574,10 @@ const downloadButtonScript = `
             __ed_touchFocus('page');
             try {
               if (s && s.noKeyAccepted) s.noKeyAccepted = { id: '', ts: 0 };
+              if (s) {
+                s.lastSlideAcceptedId = '';
+                s.lastSlideChangeTs = __ed_now();
+              }
             } catch (e) {}
           }
         } catch (e) {}
@@ -372,9 +596,10 @@ const downloadButtonScript = `
       window.addEventListener('keydown', touch, { passive: true });
 
       // media events do not bubble, so use capture
-      document.addEventListener('play', function() { __ed_touchFocus('play'); }, true);
-      document.addEventListener('loadeddata', function() { __ed_touchFocus('play'); }, true);
-      document.addEventListener('timeupdate', function() { __ed_touchFocus('play'); }, true);
+      document.addEventListener('play', function(e) { __ed_touchFocus('playStart', e && e.target); }, true);
+      document.addEventListener('playing', function(e) { __ed_touchFocus('playStart', e && e.target); }, true);
+      // Keep focus fresh while playing without re-opening the play-start acceptance window.
+      document.addEventListener('timeupdate', function(e) { __ed_touchFocus('playTick', e && e.target); }, true);
     } catch (e) {}
   })();
   function __ed_normalizeUrl(u) {
@@ -410,15 +635,72 @@ const downloadButtonScript = `
     }
   }
 
+  function __ed_getSlideInfo(container) {
+    var info = { idx: 0, ok: false, y: 0, unit: '', transform: '', cssText: '' };
+    if (!container) return info;
+    try { info.cssText = container.style && container.style.cssText ? String(container.style.cssText) : ''; } catch (e) {}
+    var t = '';
+    try {
+      if (info.cssText) {
+        var m = info.cssText.match(/transform\s*:\s*([^;]+)/i);
+        if (m && m[1]) t = m[1].trim();
+        if (!t) {
+          var m2 = info.cssText.match(/translate3d\([^)]+\)/i);
+          if (m2 && m2[0]) t = m2[0];
+        }
+      }
+    } catch (e1) {}
+    if (!t) {
+      try {
+        var cs = window.getComputedStyle(container);
+        t = cs && (cs.transform || cs.webkitTransform || '') || '';
+      } catch (e2) {}
+    }
+    info.transform = t || '';
+    function parseY(transformText) {
+      if (!transformText) return null;
+      var m = transformText.match(/translate3d\(\s*[-0-9.]+px\s*,\s*([-0-9.]+)(%|px)\s*,/i);
+      if (m) return { y: parseFloat(m[1]), unit: m[2] };
+      m = transformText.match(/translateY\(\s*([-0-9.]+)(%|px)\s*\)/i);
+      if (m) return { y: parseFloat(m[1]), unit: m[2] };
+      m = transformText.match(/translate\(\s*[^,]+,\s*([-0-9.]+)(%|px)\s*\)/i);
+      if (m) return { y: parseFloat(m[1]), unit: m[2] };
+      if (transformText.indexOf('matrix3d(') === 0) {
+        var vals3d = transformText.slice(9, -1).split(',');
+        if (vals3d.length >= 14) return { y: parseFloat(vals3d[13]), unit: 'px' };
+      }
+      if (transformText.indexOf('matrix(') === 0) {
+        var vals = transformText.slice(7, -1).split(',');
+        if (vals.length >= 6) return { y: parseFloat(vals[5]), unit: 'px' };
+      }
+      return null;
+    }
+    var parsed = parseY(info.transform);
+    if (parsed && !isNaN(parsed.y)) {
+      info.y = parsed.y;
+      info.unit = parsed.unit || '';
+      if (info.unit === '%') {
+        info.idx = Math.round(Math.abs(info.y) / 100);
+        info.ok = true;
+      } else if (info.unit === 'px') {
+        var h = 0;
+        try { h = container.getBoundingClientRect().height || container.clientHeight || 0; } catch (e3) { h = 0; }
+        if (h > 0) {
+          info.idx = Math.round(Math.abs(info.y) / h);
+          info.ok = true;
+        }
+      }
+    }
+    return info;
+  }
+
   function __ed_getCurrentSlideItem() {
     // First, try legacy feed layout (slides-scroll / slides-item)
     try {
       var container = document.querySelector('.slides-scroll');
       if (container) {
-        var cssText = container.style.cssText || '';
-        var re = /translate3d\([0-9]+px,\s*-?([0-9]+)%/;
-        var matched = cssText.match(re);
-        var idx = matched ? Number(matched[1]) / 100 : 0;
+        var info = __ed_getSlideInfo(container);
+        var idx = info && typeof info.idx === 'number' ? info.idx : 0;
         var items = document.querySelectorAll('.slides-item');
         if (items && idx < items.length) return items[idx];
       }
@@ -471,12 +753,18 @@ const downloadButtonScript = `
     // Filter common browser/system UI strings that sometimes leak into DOM selection
     try {
       var low = String(txt).toLowerCase();
+      // Common accessibility strings on some WeChat/Chromium builds
+      if (low.indexOf('this is a modal window') !== -1) return true;
+      if (low.indexOf('modal window') !== -1 && low.indexOf('this is') !== -1) return true;
       if (low.indexOf('beginning of dialog window') !== -1) return true;
       if (low.indexOf('escape will cancel') !== -1) return true;
       if (low.indexOf('cancel and close the window') !== -1) return true;
       if (low === 'play video' || low.indexOf('play video') !== -1) return true;
       if (low.indexOf('restore all settings to the default values') !== -1) return true;
       if (low.indexOf('video player is loading') !== -1) return true;
+      // Player UI option text sometimes gets picked as "title" (e.g. danmaku transparency menu)
+      if (low.indexOf('transparency') !== -1 && low.indexOf('opaque') !== -1) return true;
+      if (low === 'transparency' || low === 'opaque' || low === 'semi-transparent' || low === 'semi transparent') return true;
     } catch (e) {}
     // Obvious UI labels / nav items (avoid picking buttons as title)
     var bad = ['下载','收藏','关注','举报','分享','更多','清晰度','倍速','设置','登录','搜索','推荐','朋友','直播','音乐','游戏','影视','美食','旅游','生活','知识','评论','转发'];
@@ -486,6 +774,8 @@ const downloadButtonScript = `
     }
     if (/^\d{1,2}:\d{2}$/.test(txt)) return true;
     if (/[0-9]{1,2}:[0-9]{2}\s*\/\s*[0-9]{1,2}:[0-9]{2}/.test(txt)) return true;
+    // Playback speed menu text sometimes gets picked as title/author (e.g. "0.5x 1x 1.25x 1.5x 2x 3x")
+    if (/\b0\.5x\b/.test(txt) && /\b1x\b/.test(txt) && /\b2x\b/.test(txt)) return true;
     if (/(自动续播|小窗模式|默认值)/.test(txt)) return true;
     return false;
   }
@@ -525,6 +815,7 @@ const downloadButtonScript = `
     if (a.indexOf('#') !== -1) return true;
     if (a.indexOf('关注') !== -1 || a.indexOf('下载') !== -1 || a.indexOf('投诉') !== -1) return true;
     if (/^\d{1,2}:\d{2}$/.test(a)) return true;
+    if (/\b0\.5x\b/.test(a) && /\b1x\b/.test(a) && /\b2x\b/.test(a)) return true;
     return false;
   }
 
@@ -539,6 +830,11 @@ const downloadButtonScript = `
       for (var i = 0; i < nodes.length; i++) {
         var el = nodes[i];
         if (!el) continue;
+        // Skip hidden/aria-only nodes (they often contain accessibility hints like "This is a modal window.")
+        try {
+          if (el.getAttribute && String(el.getAttribute('aria-hidden') || '') === 'true') continue;
+          if (el.offsetParent === null && el.getClientRects && (!el.getClientRects() || el.getClientRects().length === 0)) continue;
+        } catch (e0) {}
         var txt = '';
         try { txt = el.innerText || el.textContent || ''; } catch (e) {}
         txt = __ed_trim(String(txt || '').replace(/\s+/g, ' '));
@@ -560,7 +856,7 @@ const downloadButtonScript = `
     } catch (e) {}
     try {
       // Fallback: any reasonably long text block
-      var nodes = root.querySelectorAll('[class*="desc"],[class*="content"],[class*="text"],p,div');
+      var nodes = root.querySelectorAll('[class*="desc"],[class*="content"],p,div');
       if (!nodes || !nodes.length) return null;
       var bestEl = null;
       var bestLen = 0;
@@ -625,8 +921,11 @@ const downloadButtonScript = `
   function __ed_guessTitle(root) {
     root = root || document;
     // Prefer "desc" like areas; avoid generic ".title" which is too broad on Channels pages
-    var t = __ed_pickBestText(root, '.feed-desc,[class*="feed-desc"],.desc,[class*="desc"],[class*="content"],[class*="text"]', 2, 220);
+    var t = __ed_pickBestText(root, '.feed-desc,[class*="feed-desc"],.desc,[class*="desc"]', 2, 220);
     if (t && !__ed_isBadTitle(t)) return t;
+    // Fallback: some builds use caption/title-like classes without "desc"
+    var t2 = __ed_pickBestText(root, '[class*="caption"],[class*="title"],[class*="content"]', 2, 220);
+    if (t2 && !__ed_isBadTitle(t2)) return t2;
     // Fallback to meta title/description
     try {
       var mt = document.querySelector('meta[property=\"og:title\"]') || document.querySelector('meta[name=\"description\"]');
@@ -828,6 +1127,10 @@ const downloadButtonScript = `
   function __ed_collectDomMeta() {
     var root = __ed_getCurrentSlideItem() || document;
     var title = __ed_guessTitle(root);
+    // Hard drop obviously wrong accessibility strings (e.g. "This is a modal window.")
+    try {
+      if (title && __ed_isBadTitle(title)) title = '';
+    } catch (e) {}
     var author = __ed_guessCreator(root);
     var avatar = __ed_guessAvatar(root);
     var cover = __ed_guessCover(root);
@@ -835,6 +1138,15 @@ const downloadButtonScript = `
     var contact = null;
     author = __ed_cleanAuthorName(author);
     if (author && __ed_isBadAuthorName(author)) author = '';
+    // Safety: DOM title heuristics sometimes pick author nickname; never treat that as the video title.
+    try {
+      var tn = __ed_normText(title);
+      var an = __ed_normText(author);
+      if (tn && an) {
+        if (tn === an) title = '';
+        else if (tn.indexOf(an) === 0 && tn.length <= an.length + 2) title = '';
+      }
+    } catch (e) {}
     if (author || avatar) {
       contact = { nickname: author || '', head_url: avatar || '' };
     }
@@ -1022,8 +1334,9 @@ const downloadButtonScript = `
       try {
         if (!eventName) return;
         var now = Date.now();
-        if (now - lastTs < 800) return; // throttle
-        if (count >= 15) return; // cap to avoid spam
+        // Allow denser tracing for debugging: shorter throttle and higher cap.
+        if (now - lastTs < 300) return; // throttle
+        if (count >= 80) return; // cap to avoid spam
         lastTs = now;
         count++;
         fetch("/res-downloader/wechat?type=trace", {
@@ -1032,6 +1345,32 @@ const downloadButtonScript = `
           body: JSON.stringify({
             ts: now,
             event: String(eventName),
+            href: (function(){ try { return location.href; } catch(e){ return ""; } })(),
+            data: data || null
+          })
+        }).catch(function(){});
+      } catch (e) {}
+    };
+  })();
+
+  // Gate-specific trace helper (separate budget, milder throttle)
+  window.__easydownload_trace_gate__ = (function() {
+    var lastTs = 0;
+    var count = 0;
+    return function(reason, data) {
+      try {
+        if (!reason) return;
+        var now = Date.now();
+        if (now - lastTs < 120) return; // finer throttle for gating
+        if (count >= 200) return;       // prevent runaway
+        lastTs = now;
+        count++;
+        fetch("/res-downloader/wechat?type=trace", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            ts: now,
+            event: String(reason),
             href: (function(){ try { return location.href; } catch(e){ return ""; } })(),
             data: data || null
           })
@@ -1259,7 +1598,9 @@ const downloadButtonScript = `
               try { domT = __ed_getCurrentDomTitle(); } catch (e) { domT = ''; }
               try { if (domT && __ed_isBadTitle(domT)) domT = ''; } catch (e) {}
               var fake = {
-                description: domT || '',
+                // IMPORTANT: never bind worker URLs to the current DOM title here.
+                // Worker URLs frequently belong to NEXT-video prefetch and will cause off-by-one.
+                description: '',
                 media: [{
                   url: u,
                   urlToken: '',
@@ -1373,10 +1714,34 @@ const downloadButtonScript = `
     if (!objectDesc || !objectDesc.media || objectDesc.media.length === 0) {
       return;
     }
-    
+
+    // Deep copy to avoid modifying original page data
+    try {
+      objectDesc = JSON.parse(JSON.stringify(objectDesc));
+      if (contact) contact = JSON.parse(JSON.stringify(contact));
+    } catch (e) {}
+
+    // Sanitize obviously wrong titles coming from accessibility overlays
+    try {
+      if (__ed_isBadTitle(objectDesc.description || '')) {
+        objectDesc.description = '';
+      } else {
+        objectDesc.description = __ed_trim(objectDesc.description || '');
+      }
+    } catch (e) {}
+
     var media = objectDesc.media[0];
     var m = meta || {};
     var source = m && m.source ? String(m.source) : '';
+    var descFromDom = false;
+    var hadDesc = false;
+    try { hadDesc = !!__ed_trim(objectDesc.description); } catch (e) { hadDesc = false; }
+    var isHome = false;
+    try {
+      var path0 = (location && location.pathname) ? String(location.pathname) : '';
+      isHome = path0.indexOf('/pages/home') !== -1;
+    } catch (e) { isHome = false; }
+    var isStrong = (source === 'media_getter' || source === 'comment');
 
     // Guard: only surface likely VOD URLs; reject worker/edge URLs that frequently lead to corrupt downloads.
     try {
@@ -1396,19 +1761,77 @@ const downloadButtonScript = `
       }
     } catch (e) {}
 
-    // Fill missing metadata from DOM (title/author/cover/duration/resolution) BEFORE gating.
-    // This reduces false negatives when network payloads omit description/title (common in cached/preload flows).
+    // Compute stable id for gating BEFORE any DOM merge; otherwise a worker-preload URL can get
+    // incorrectly paired with the previous video's DOM title.
+    var videoIdPre = __ed_computeVideoId(objectDesc);
+    // Drop updates that are not the current (visible/recent) video
+    if (!__ed_shouldAcceptUpdate(objectDesc, videoIdPre, { source: source })) {
+      return;
+    }
+    try { window.__easydownload_store__.lastEmitTs = __ed_now(); } catch (e) {}
+
+    // After gating: Fill missing metadata from DOM (title/author/cover/duration/resolution).
+    // This reduces false negatives when network payloads omit description/title (cached/preload flows),
+    // but only after we've confirmed this update belongs to the current/visible video.
     try {
       var dm = __ed_collectDomMeta();
       if (dm) {
-        if (!__ed_trim(objectDesc.description) && __ed_trim(dm.title) && !__ed_isBadTitle(dm.title)) {
-          objectDesc.description = dm.title;
+        // Never use DOM title as a fallback for worker messages (they are frequently prefetch/next-video hints).
+        var allowDomTitle = (source !== 'worker');
+        // Home feed: never bind DOM metadata to NEW ids from non-strong sources. This is the main
+        // reason "resource is b/c but title/cover is a" duplicates appear.
+        try {
+          var sH = window.__easydownload_store__;
+          var sameAsLast = !!(sH && sH.lastVideoId && videoIdPre && videoIdPre === sH.lastVideoId);
+          if (isHome && !sameAsLast && !isStrong && source !== 'worker') {
+            allowDomTitle = false;
+          }
+        } catch (e0) {}
+        if (!allowDomTitle) {
+          // Worker is often the first signal; allow DOM title only after playback starts to reduce prefetch risk.
+          try {
+            var vAct2 = __ed_getActiveVideoEl();
+            var started2 = !!(vAct2 && vAct2.readyState >= 2 && (vAct2.currentTime > 0 || !vAct2.paused));
+            // Home feed: only allow worker DOM title near play start (prevents next-video prefetch).
+            var sP = window.__easydownload_store__;
+            var playAge = 999999;
+            try {
+              var ps2 = Number(sP.lastPlayStartTs || 0) || Number(sP.lastPlayTs || 0);
+              playAge = __ed_now() - ps2;
+            } catch (e3) { playAge = 999999; }
+            if (started2 && (!isHome || (playAge >= 0 && playAge <= 1200))) allowDomTitle = true;
+          } catch (e) {}
         }
-        if (media && !__ed_trim(media.coverUrl) && __ed_trim(dm.coverUrl)) {
-          media.coverUrl = dm.coverUrl;
+        if (allowDomTitle && !hadDesc && __ed_trim(dm.title) && !__ed_isBadTitle(dm.title)) {
+          objectDesc.description = dm.title;
+          descFromDom = true;
+        }
+        // For worker signals, never merge DOM cover/author immediately (DOM often still shows previous slide).
+        // Delayed meta refresh will re-run updateCurrentVideo once DOM is stable.
+        if (source !== 'worker') {
+          // Home feed: only merge DOM cover for strong sources or same-video meta refresh.
+          var allowCover = true;
+          try {
+            var sC = window.__easydownload_store__;
+            var sameAsLast2 = !!(sC && sC.lastVideoId && videoIdPre && videoIdPre === sC.lastVideoId);
+            if (isHome && !sameAsLast2 && !isStrong) allowCover = false;
+          } catch (e1) { allowCover = true; }
+          if (media && !__ed_trim(media.coverUrl) && __ed_trim(dm.coverUrl)) {
+            if (allowCover) media.coverUrl = dm.coverUrl;
+          }
         }
         // Merge author/contact info from DOM if missing (but ignore friend/social hints)
-        if (dm.contact) {
+        if (source !== 'worker' && dm.contact) {
+          // Home feed: only merge DOM author for strong sources or same-video meta refresh.
+          var allowAuthor = true;
+          try {
+            var sA = window.__easydownload_store__;
+            var sameAsLast3 = !!(sA && sA.lastVideoId && videoIdPre && videoIdPre === sA.lastVideoId);
+            if (isHome && !sameAsLast3 && !isStrong) allowAuthor = false;
+          } catch (e2) { allowAuthor = true; }
+          if (!allowAuthor) {
+            // no-op
+          } else {
           try {
             var dn = dm.contact.nickname ? __ed_cleanAuthorName(dm.contact.nickname) : '';
             var da = dm.contact.head_url ? __ed_trim(dm.contact.head_url) : '';
@@ -1424,6 +1847,7 @@ const downloadButtonScript = `
               if (!ca && da) contact.head_url = da;
             }
           } catch (e) {}
+          }
         }
         if (media && (!media.spec || !media.spec.length) && (dm.durationMs || dm.width || dm.height)) {
           media.spec = [{
@@ -1436,13 +1860,15 @@ const downloadButtonScript = `
       }
     } catch (e) {}
 
-    // Compute stable id for gating (after best-effort DOM merge)
-    var videoIdPre = __ed_computeVideoId(objectDesc);
-    // Drop updates that are not the current (visible/recent) video
-    if (!__ed_shouldAcceptUpdate(objectDesc, videoIdPre, { source: source })) {
-      return;
-    }
-    try { window.__easydownload_store__.lastEmitTs = __ed_now(); } catch (e) {}
+    // Cache last accepted DOM title (for worker preload avoidance)
+    try {
+      var s2 = window.__easydownload_store__;
+      var dt2 = __ed_normText(__ed_getCurrentDomTitle());
+      if (s2 && dt2 && !__ed_isBadTitle(dt2)) {
+        s2.lastDomTitle = dt2;
+        s2.lastDomTitleTs = __ed_now();
+      }
+    } catch (e) {}
 
     // Prefer stable identifiers if present; fallback to url + decodeKey
     var videoId = __ed_computeVideoId(objectDesc);
@@ -1518,7 +1944,12 @@ const downloadButtonScript = `
     window.__easydownload_store__.contact = contact || null;
     try {
       if (!window.__easydownload_store__.lastMetaById) window.__easydownload_store__.lastMetaById = {};
+      window.__easydownload_store__.lastSlideAcceptedId = videoId || '';
       var snapMedia = media ? {
+        url: media.url || '',
+        urlToken: media.urlToken || '',
+        decodeKey: media.decodeKey || '',
+        mediaType: media.mediaType || 0,
         coverUrl: media.coverUrl || '',
         fileSize: media.fileSize || 0,
         spec: media.spec ? JSON.parse(JSON.stringify(media.spec)) : []
@@ -1527,13 +1958,20 @@ const downloadButtonScript = `
       window.__easydownload_store__.lastMetaById[videoId] = {
         objectDesc: { description: objectDesc.description || '', media: [snapMedia] },
         contact: snapContact,
-        ts: __ed_now()
+        ts: __ed_now(),
+        pageKey: __ed_getPageKey(),
+        href: __ed_getHrefSafe(),
+        domTitle: __ed_getCurrentDomTitle(),
+        source: source || '',
+        descFromDom: !!descFromDom
       };
       if (!window.__easydownload_store__.lastEmitById) window.__easydownload_store__.lastEmitById = {};
       window.__easydownload_store__.lastEmitById[videoId] = __ed_now();
     } catch (e) {}
-    
-    console.log('[EasyDownload] Current video updated:', objectDesc.description || 'Unknown');
+
+    if (window.__easydownload_trace__) {
+      window.__easydownload_trace__('video:accept', { id: videoId || '', source: source || '', descFromDom: !!descFromDom });
+    }
     
     // Build full data payload with contact info
     // Final safety: sanitize contact nickname before sending
@@ -1548,6 +1986,8 @@ const downloadButtonScript = `
       id: videoId || '',
       media: objectDesc.media,
       description: objectDesc.description,
+      title: (dm && dm.title) ? dm.title : '',
+      domTitle: __ed_getCurrentDomTitle(),
       contact: contact,
       pageKey: __ed_getPageKey(),
       href: __ed_getHrefSafe(),
@@ -1561,7 +2001,7 @@ const downloadButtonScript = `
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload)
     }).catch(function(err) {
-      console.log('[EasyDownload] Failed to send video info:', err);
+      if (window.__easydownload_trace__) window.__easydownload_trace__('video:send:fail', { err: String(err || '') });
     });
 
     // Delayed meta refresh: DOM text/author often appears slightly after worker url/seed message.
@@ -1628,33 +2068,115 @@ const downloadButtonScript = `
 
   // Handle download button click
   function handleDownloadClick() {
-    var video = window.__easydownload_store__.currentVideo;
-    if (!video) {
-      console.log('[EasyDownload] No video data available');
+    function __ed_pickDownloadCandidate() {
+      try {
+        var s = window.__easydownload_store__;
+        if (!s) return null;
+
+        var now = Date.now();
+        var dm = null;
+        try { dm = __ed_collectDomMeta(); } catch (e) { dm = null; }
+        var domTitle = __ed_normText(dm && dm.title ? dm.title : '');
+        var pageKey = __ed_getPageKey();
+
+        // Prefer current video if it matches DOM title.
+        try {
+          if (s.currentVideo && s.lastVideoId) {
+            var curDesc = __ed_normText(s.currentVideo.description || '');
+            if (!domTitle || __ed_titleLooksLikeSame(domTitle, curDesc)) {
+              return {
+                id: s.lastVideoId,
+                objectDesc: s.currentVideo,
+                contact: s.contact || null,
+                domTitle: domTitle,
+                pageKey: pageKey,
+                chosenSource: 'current'
+              };
+            }
+          }
+        } catch (e0) {}
+
+        // Otherwise scan cache for a better match by DOM title / pageKey.
+        var best = null;
+        var bestId = '';
+        var bestScore = -1;
+        function scoreEntry(id, entry) {
+          if (!entry || !entry.objectDesc || !entry.objectDesc.media || !entry.objectDesc.media.length) return -1;
+          if (now - Number(entry.ts || 0) > 60000) return -1; // don't use stale prefetch entries
+          var od = entry.objectDesc;
+          var desc = __ed_normText(od.description || '');
+          var entryDom = __ed_normText(entry.domTitle || '');
+          if (domTitle && !__ed_titleLooksLikeSame(domTitle, entryDom || desc)) return -1;
+
+          var sc = 0;
+          if (pageKey && entry.pageKey && String(entry.pageKey) === String(pageKey)) sc += 40;
+          if (domTitle) sc += 25;
+          var src = entry.source ? String(entry.source) : '';
+          if (src === 'media_getter' || src === 'comment') sc += 20;
+          var age = Math.max(0, Math.floor((now - Number(entry.ts || 0)) / 1000));
+          sc += Math.max(0, 18 - age);
+          return sc;
+        }
+        try {
+          if (s.lastMetaById) {
+            for (var k in s.lastMetaById) {
+              if (!Object.prototype.hasOwnProperty.call(s.lastMetaById, k)) continue;
+              var e = s.lastMetaById[k];
+              var sc2 = scoreEntry(k, e);
+              if (sc2 > bestScore) {
+                bestScore = sc2;
+                best = e;
+                bestId = k;
+              }
+            }
+          }
+        } catch (e1) {}
+
+        if (best && best.objectDesc && best.objectDesc.media && best.objectDesc.media.length) {
+          return {
+            id: bestId,
+            objectDesc: best.objectDesc,
+            contact: best.contact || null,
+            domTitle: domTitle,
+            pageKey: pageKey,
+            chosenSource: best.source || ''
+          };
+        }
+      } catch (e) {}
+      return null;
+    }
+
+    __ed_touchFocus('ui');
+    var picked = __ed_pickDownloadCandidate();
+    if (!picked || !picked.objectDesc) {
       showToast('未检测到视频信息，请稍后重试');
+      if (window.__easydownload_trace__) window.__easydownload_trace__('download:miss', {});
       return;
     }
-    
-    // Build payload with contact info
+
+    var video = picked.objectDesc;
     var payload = {
-      id: (window.__easydownload_store__ && window.__easydownload_store__.lastVideoId) ? window.__easydownload_store__.lastVideoId : '',
+      id: picked.id || '',
       media: video.media,
       description: video.description,
-      contact: window.__easydownload_store__.contact
+      contact: picked.contact || (window.__easydownload_store__ ? window.__easydownload_store__.contact : null),
+      pageKey: picked.pageKey || __ed_getPageKey(),
+      href: __ed_getHrefSafe(),
+      ts: Date.now(),
+      source: 'download_click:' + (picked.chosenSource || ''),
+      domTitle: picked.domTitle || '',
+      chosenSource: picked.chosenSource || ''
     };
-    
+
     showToast('正在准备下载...');
-    
-    // Send download request to backend (type=download for triggering download)
     fetch("/res-downloader/wechat?type=download", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload)
     }).catch(function(err) {
-      console.log('[EasyDownload] Failed to send download request:', err);
+      if (window.__easydownload_trace__) window.__easydownload_trace__('download:send:fail', { err: String(err || '') });
     });
-    
-    console.log('[EasyDownload] Download request sent for:', video.description || 'Unknown');
+    if (window.__easydownload_trace__) window.__easydownload_trace__('download:sent', { id: payload.id || '', domTitle: payload.domTitle || '', chosenSource: payload.chosenSource || '' });
   }
 
   // Detect video switch on home page by monitoring slide changes
@@ -1664,36 +2186,50 @@ const downloadButtonScript = `
     setInterval(function() {
       var container = document.querySelector('.slides-scroll');
       if (!container) return;
-      
-      var cssText = container.style.cssText;
-      var re = /translate3d\([0-9]+px,\s*-?([0-9]+)%/;
-      var matched = cssText.match(re);
-      var idx = matched ? Number(matched[1]) / 100 : 0;
-      
+      var info = __ed_getSlideInfo(container);
+      if (!info.ok) {
+        if (window.__easydownload_trace_gate__) {
+          window.__easydownload_trace_gate__('slide:parse_fail', {
+            css: (info.cssText || '').slice(0, 120),
+            transform: (info.transform || '').slice(0, 120)
+          });
+        }
+        return;
+      }
+      var idx = info.idx;
+
+      // First observation: initialize without treating as a swipe/change. This avoids
+      // misclassifying initial load as a switch moment (which lets prefetch steal "current").
+      if (lastSlideIndex === -1) {
+        lastSlideIndex = idx;
+        try {
+          var s0 = window.__easydownload_store__;
+          if (s0) s0.lastSlideIndex = idx;
+        } catch (e) {}
+        return;
+      }
+
       if (idx !== lastSlideIndex) {
         lastSlideIndex = idx;
-        console.log('[EasyDownload] Video slide changed to index:', idx);
         // Sliding to the next video in home feed often does NOT change URL (no oid/nid),
         // so our pageKey-based gating can get "stuck". Treat slide change as a hard context switch.
         try {
           __ed_touchFocus('page');
           var s = window.__easydownload_store__;
           if (s) {
-            // Force next capture to be treated as new
-            s.lastVideoId = null;
-            s.currentVideo = null;
-            s.lastEmitTs = 0;
+            // Do NOT clear lastVideoId/currentVideo here; doing so allows prefetch payloads to "steal"
+            // the current slot and causes the classic off-by-one (download B gets C).
+            s.lastSlideIndex = idx;
+            s.lastSlideChangeTs = __ed_now();
+            s.lastSlideAcceptedId = '';
+            try { s.lastSlideDomTitle = __ed_getCurrentDomTitle(); } catch (e2) {}
             // Reset no-key acceptance window (home feed commonly has no pageKey)
             if (s.noKeyAccepted) s.noKeyAccepted = { id: '', ts: 0 };
-            // If we DO have a pageKey, drop its binding so the next video can be accepted
-            try {
-              var pk = __ed_getPageKey();
-              if (pk && s.acceptedByPageKey && s.acceptedByPageKey[pk]) {
-                delete s.acceptedByPageKey[pk];
-              }
-            } catch (e) {}
+            // Home feed pageKey isn't per-video; reset bindings on slide change.
+            try { if (s.acceptedByPageKey) s.acceptedByPageKey = {}; } catch (e) {}
+            try { if (s.recentAccepted) s.recentAccepted = {}; } catch (e) {}
           }
-          if (window.__easydownload_trace__) window.__easydownload_trace__('slide:change', { idx: idx });
+          if (window.__easydownload_trace__) window.__easydownload_trace__('slide:change', { idx: idx, y: info.y || 0, unit: info.unit || '' });
         } catch (e) {}
         // Re-inject button for new slide
         setTimeout(function() {
@@ -1711,10 +2247,8 @@ const downloadButtonScript = `
     if (!container) return false;
 
     // Find current slide index
-    var cssText = container.style.cssText;
-    var re = /translate3d\([0-9]+px,\s*-?([0-9]+)%/;
-    var matched = cssText.match(re);
-    var idx = matched ? Number(matched[1]) / 100 : 0;
+    var info = __ed_getSlideInfo(container);
+    var idx = info && typeof info.idx === 'number' ? info.idx : 0;
 
     var items = document.querySelectorAll('.slides-item');
     if (idx >= items.length) return false;
@@ -1730,7 +2264,7 @@ const downloadButtonScript = `
     var btn = createDownloadIconHome();
     btn.onclick = handleDownloadClick;
     opItem.parentElement.appendChild(btn);
-    console.log('[EasyDownload] Download button injected (home page)');
+    // (no console log)
     return true;
   }
 
@@ -1750,7 +2284,7 @@ const downloadButtonScript = `
       } else {
         oprWrp.appendChild(btn);
       }
-      console.log('[EasyDownload] Download button injected (detail page - col)');
+      // (no console log)
       return true;
     }
 
@@ -1768,7 +2302,7 @@ const downloadButtonScript = `
       } else {
         oprWrp.appendChild(btn);
       }
-      console.log('[EasyDownload] Download button injected (detail page - row)');
+      // (no console log)
       return true;
     }
 
@@ -1777,7 +2311,7 @@ const downloadButtonScript = `
 
   // Main injection function
   async function injectDownloadButton() {
-    console.log('[EasyDownload] Waiting to inject download button...');
+    // (no console log)
     
     // Check if on home page
     if (window.location.pathname.includes('/pages/home')) {
@@ -1799,6 +2333,10 @@ const downloadButtonScript = `
         if (window.__easydownload_store__) {
           window.__easydownload_store__.currentVideo = null;
           window.__easydownload_store__.contact = null;
+          window.__easydownload_store__.lastVideoId = null;
+          window.__easydownload_store__.lastSlideAcceptedId = '';
+          window.__easydownload_store__.lastSlideChangeTs = 0;
+          window.__easydownload_store__.lastSlideIndex = -1;
         }
       } catch (e) {}
       setTimeout(injectDownloadButton, 500);
@@ -1871,7 +2409,7 @@ func (ji *JSInjector) InjectMediaCapture(jsContent string) string {
 									if(__ed_obj && __ed_obj.media && __ed_obj.media.length && (__ed_obj.media[0].url || __ed_obj.media[0].decodeKey || __ed_obj.media[0].urlToken)){
 										var _contact = this.contact || __ed_obj.contact || null;
 									if(window.__easydownload_updateVideo__){
-											window.__easydownload_updateVideo__(__ed_obj, _contact);
+											window.__easydownload_updateVideo__(__ed_obj, _contact, { source: 'media_getter' });
 									}else{
 										var _payload = {
 												media: __ed_obj.media,
@@ -1925,7 +2463,7 @@ func (ji *JSInjector) InjectCommentCapture(jsContent string) string {
 										if (_od) {
 											var _contact = res?.data?.object?.contact || res?.data?.object?.object?.contact || null;
 											if (window.__easydownload_updateVideo__) {
-												window.__easydownload_updateVideo__(_od, _contact);
+												window.__easydownload_updateVideo__(_od, _contact, { source: 'comment' });
 											} else {
 										var _payload = {
 													media: _od.media,

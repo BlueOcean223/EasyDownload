@@ -129,6 +129,42 @@ func (ps *ProxyServer) SetDebug(enabled bool) {
 	ps.debug = enabled
 }
 
+// setupTransport configures the HTTP transport with optimized settings.
+// This is always called regardless of upstream proxy configuration.
+// Key optimizations:
+// - Disable HTTP/2 to avoid multiplexing issues with video streaming
+// - Connection pooling for better performance
+// - Reasonable timeouts for stability
+func (ps *ProxyServer) setupTransport() {
+	transport := &http.Transport{
+		DisableKeepAlives: false,
+		ForceAttemptHTTP2: false, // Disable HTTP/2 to avoid video streaming issues
+		TLSNextProto:      make(map[string]func(authority string, c *tls.Conn) http.RoundTripper),
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout: 10 * time.Second,
+		IdleConnTimeout:     90 * time.Second,
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 10,
+	}
+
+	// Add upstream proxy if configured
+	if ps.upstreamProxy != "" {
+		proxyURL, err := url.Parse(ps.upstreamProxy)
+		if err != nil {
+			logger.Error("Invalid upstream proxy URL: %v", err)
+		} else {
+			transport.Proxy = http.ProxyURL(proxyURL)
+			logger.Info("Using upstream proxy: %s", ps.upstreamProxy)
+		}
+	}
+
+	ps.proxy.Tr = transport
+	logger.Info("Transport configured: HTTP/2 disabled, connection pooling enabled")
+}
+
 // Start starts the proxy server
 func (ps *ProxyServer) Start() error {
 	ps.mu.Lock()
@@ -168,26 +204,8 @@ func (ps *ProxyServer) Start() error {
 	// Set up request/response handlers
 	ps.setupHandlers()
 
-	// Configure upstream proxy if set
-	if ps.upstreamProxy != "" {
-		proxyURL, err := url.Parse(ps.upstreamProxy)
-		if err != nil {
-			logger.Error("Invalid upstream proxy URL: %v", err)
-		} else {
-			transport := &http.Transport{
-				Proxy: http.ProxyURL(proxyURL),
-				DialContext: (&net.Dialer{
-					Timeout:   60 * time.Second,
-					KeepAlive: 30 * time.Second,
-				}).DialContext,
-				TLSHandshakeTimeout:   60 * time.Second,
-				ResponseHeaderTimeout: 60 * time.Second,
-				IdleConnTimeout:       30 * time.Second,
-			}
-			ps.proxy.Tr = transport
-			logger.Info("Using upstream proxy: %s", ps.upstreamProxy)
-		}
-	}
+	// Configure optimized transport (always, regardless of upstream proxy)
+	ps.setupTransport()
 
 	// Start listening
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", ps.port))
@@ -298,35 +316,25 @@ func PassThroughDomains() []string {
 
 // setupHandlers configures the goproxy request and response handlers
 func (ps *ProxyServer) setupHandlers() {
-	// Unified CONNECT handler:
-	// - MITM only for allowlisted page/static domains (channels.weixin.qq.com, res.wx.qq.com, wxapp.tc.qq.com)
-	// - Direct pass-through for video streaming domains to avoid slow playback
-	// - Default pass-through for everything else to reduce overhead
-	videoStreamingPattern := regexp.MustCompile(`(finder\.video\.qq\.com|findermp\.video\.qq\.com|szextshort\.weixin\.qq\.com|mpvideo\.qpic\.cn)`)
+	// Use selective MITM: only MITM for domains where we need to inject scripts
+	// Video streaming domains are passed through directly (no MITM) to ensure smooth playback
 	ps.proxy.OnRequest().HandleConnectFunc(func(host string, ctx *goproxy.ProxyCtx) (*goproxy.ConnectAction, string) {
-		start := time.Now()
-		action := "OK"
-		switch {
-		case videoStreamingPattern.MatchString(host):
-			action = "OK(stream)"
-			if ps.debug {
-				logger.Info("[proxy-debug] CONNECT %s -> %s (%s)", host, action, time.Since(start))
+		// Check if this is a video streaming domain that should pass through
+		for _, domain := range PassThroughDomains() {
+			if strings.Contains(host, domain) {
+				if ps.debug {
+					logger.Info("[proxy-debug] CONNECT pass-through (no MITM): %s", host)
+				}
+				return goproxy.OkConnect, host // Direct tunnel, no MITM
 			}
-			return goproxy.OkConnect, host
-		case ps.shouldInterceptHost(host):
-			action = "MITM"
-			if ps.debug {
-				logger.Info("[proxy-debug] CONNECT %s -> %s (%s)", host, action, time.Since(start))
-			}
-			return goproxy.MitmConnect, host
-		default:
-			if ps.debug {
-				logger.Info("[proxy-debug] CONNECT %s -> %s (%s)", host, action, time.Since(start))
-			}
-			return goproxy.OkConnect, host
 		}
+		// For all other domains, use MITM
+		if ps.debug {
+			logger.Info("[proxy-debug] CONNECT MITM: %s", host)
+		}
+		return goproxy.MitmConnect, host
 	})
-	logger.Info("Configured CONNECT handling: MITM allowlist + streaming passthrough")
+	logger.Info("Configured CONNECT handling: selective MITM (video streaming domains pass-through)")
 
 	// Set up WeChat-specific handlers
 	ps.setupWeChatHandlers()
@@ -389,6 +397,15 @@ func (ps *ProxyServer) ClearDetectedURLs() {
 
 // setupWeChatHandlers configures WeChat-specific request and response handlers
 func (ps *ProxyServer) setupWeChatHandlers() {
+	// Video streaming domains - pass through without any modification
+	// This is critical for smooth video playback with AlwaysMitm strategy
+	videoStreamingPattern := regexp.MustCompile(`(finder\.video\.qq\.com|findermp\.video\.qq\.com|szextshort\.weixin\.qq\.com|mpvideo\.qpic\.cn)`)
+	ps.proxy.OnResponse(goproxy.ReqHostMatches(videoStreamingPattern)).
+		DoFunc(func(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
+			// Return response as-is without any modification
+			return resp
+		})
+
 	// Handle requests to /res-downloader/wechat endpoint (from injected JS)
 	ps.proxy.OnRequest(goproxy.ReqHostMatches(regexp.MustCompile(`wxapp\.tc\.qq\.com`))).
 		DoFunc(ps.handleWeChatAPIRequest)

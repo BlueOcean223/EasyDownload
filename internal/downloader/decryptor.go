@@ -82,26 +82,48 @@ func (vd *VideoDecryptor) DecryptFile(filePath string, decodeKey string) error {
 	}
 
 	// Read the file
-	data, err := os.ReadFile(filePath)
+	original, err := os.ReadFile(filePath)
 	if err != nil {
 		return fmt.Errorf("failed to read file: %w", err)
 	}
 
-	// Decrypt the data (typically only the first portion needs decryption)
-	// WeChat videos encrypt the first 128KB (131072 bytes)
-	encLen := uint32(DefaultEncryptedLength)
-	if uint32(len(data)) < encLen {
-		encLen = uint32(len(data))
+	// Progressive decryption: WeChat may encrypt more than the initial header area for some builds.
+	// Try increasing prefix sizes and only write back once the result looks like a real container.
+	candidates := []int{
+		DefaultEncryptedLength,
+		512 * 1024,
+		2 * 1024 * 1024,
+		8 * 1024 * 1024,
+		len(original),
+	}
+	seen := make(map[int]struct{}, len(candidates))
+	for _, cand := range candidates {
+		if cand <= 0 {
+			continue
+		}
+		if cand > len(original) {
+			cand = len(original)
+		}
+		if _, ok := seen[cand]; ok {
+			continue
+		}
+		seen[cand] = struct{}{}
+
+		data := make([]byte, len(original))
+		copy(data, original)
+
+		DecryptData(data, uint32(cand), encKey)
+
+		if isLikelyValidContainer(data) {
+			// Write the decrypted data back
+			if err := os.WriteFile(filePath, data, 0644); err != nil {
+				return fmt.Errorf("failed to write decrypted file: %w", err)
+			}
+			return nil
+		}
 	}
 
-	DecryptData(data, encLen, encKey)
-
-	// Write the decrypted data back
-	if err := os.WriteFile(filePath, data, 0644); err != nil {
-		return fmt.Errorf("failed to write decrypted file: %w", err)
-	}
-
-	return nil
+	return fmt.Errorf("decryption did not produce a valid video container")
 }
 
 // DecryptBytes decrypts a byte slice in-place using the XOR algorithm
@@ -158,6 +180,76 @@ func IsValidVideoHeader(header []byte) bool {
 	// Already covered by WebM check
 
 	return false
+}
+
+func isLikelyValidContainer(data []byte) bool {
+	if len(data) < 12 {
+		return false
+	}
+	if !IsValidVideoHeader(data[:12]) {
+		return false
+	}
+	// For MP4/MOV, validate a small prefix of box structure to avoid accepting
+	// "ftyp" coincidences after wrong decryption.
+	if len(data) >= 8 && string(data[4:8]) == "ftyp" {
+		return looksLikeValidMP4Boxes(data)
+	}
+	return true
+}
+
+func looksLikeValidMP4Boxes(data []byte) bool {
+	const maxScan = 4 * 1024 * 1024
+	limit := len(data)
+	if limit > maxScan {
+		limit = maxScan
+	}
+	off := 0
+	boxes := 0
+	seenMoov := false
+	seenMdat := false
+	for off+8 <= limit && boxes < 256 {
+		size32 := binary.BigEndian.Uint32(data[off : off+4])
+		typ := data[off+4 : off+8]
+		// Box type should be printable ASCII
+		for _, b := range typ {
+			if b < 0x20 || b > 0x7E {
+				return false
+			}
+		}
+		boxType := string(typ)
+		headerSize := 8
+		var boxSize uint64
+		switch size32 {
+		case 0:
+			boxSize = uint64(len(data) - off)
+		case 1:
+			if off+16 > len(data) {
+				return false
+			}
+			headerSize = 16
+			boxSize = binary.BigEndian.Uint64(data[off+8 : off+16])
+		default:
+			boxSize = uint64(size32)
+		}
+		if boxSize < uint64(headerSize) {
+			return false
+		}
+		if off+int(boxSize) > len(data) {
+			return false
+		}
+		if boxType == "moov" {
+			seenMoov = true
+		}
+		if boxType == "mdat" {
+			seenMdat = true
+		}
+		off += int(boxSize)
+		boxes++
+		if boxes >= 2 && (seenMoov || seenMdat) && off >= 32 {
+			return true
+		}
+	}
+	return boxes >= 2 && (seenMoov || seenMdat)
 }
 
 // RandCtx64 is the ISAAC64 random number generator context

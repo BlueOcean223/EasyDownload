@@ -111,14 +111,19 @@ export const useAppStore = defineStore('app', () => {
       const s = String(t).trim()
       if (!s) return true
       const low = s.toLowerCase()
+      if (low.includes('this is a modal window')) return true
+      if (low.includes('modal window') && low.includes('this is')) return true
       if (low.includes('beginning of dialog window')) return true
       if (low.includes('escape will cancel')) return true
       if (low.includes('cancel and close the window')) return true
       if (low === 'play video' || low.includes('play video')) return true
       if (low.includes('restore all settings to the default values')) return true
       if (low.includes('video player is loading')) return true
+      if (low.includes('transparency') && low.includes('opaque')) return true
+      if (low === 'transparency' || low === 'opaque' || low.includes('semi-transparent') || low.includes('semi transparent')) return true
       if (/[0-9]{1,2}:[0-9]{2}\s*\/\s*[0-9]{1,2}:[0-9]{2}/.test(s)) return true
       if (s.includes('自动续播') || s.includes('小窗模式') || s.includes('默认值')) return true
+      if (s === '未知标题') return true
       return false
     }
 
@@ -132,6 +137,7 @@ export const useAppStore = defineStore('app', () => {
       if (low.includes('escape will cancel')) return true
       if (low.includes('restore all settings to the default values')) return true
       if (low.includes('video player is loading')) return true
+      if (s === '未知作者') return true
       return false
     }
 
@@ -153,34 +159,88 @@ export const useAppStore = defineStore('app', () => {
     }
 
     function mergePreferExisting(oldV: DetectedVideo, next: DetectedVideo): DetectedVideo {
-      // Never allow "degradation" from incomplete/incorrect payloads.
-      const merged: DetectedVideo = { ...oldV, ...next }
+      // "First valid value locks" strategy:
+      // Once a field has a valid value, it won't be overwritten by subsequent updates
+      // (except for numeric fields where larger values are considered better)
+      const merged: DetectedVideo = { ...oldV }
 
-      // url: prefer a likely-good VOD url; keep old if new looks bad
-      if (next.url && isLikelyBadWeChatURL(next.url) && oldV.url) {
-        merged.url = oldV.url
+      // id: always use the stable id (should be the same anyway)
+      if (next.id) merged.id = next.id
+
+      // url: only update if old is bad and new is good
+      const oldUrlBad = !oldV.url || isLikelyBadWeChatURL(oldV.url)
+      const newUrlGood = next.url && !isLikelyBadWeChatURL(next.url)
+      if (oldUrlBad && newUrlGood) {
+        merged.url = next.url
       }
 
-      // title/author: ignore obvious UI placeholders
-      if (isBadWeChatTitle(next.title) && !isBadWeChatTitle(oldV.title)) merged.title = oldV.title
-      if (isBadWeChatAuthor(next.author) && !isBadWeChatAuthor(oldV.author)) merged.author = oldV.author
-
-      // cover: keep old if new is empty
-      if (!next.cover && oldV.cover) merged.cover = oldV.cover
-
-      // duration/fileSize/wh: keep old if new is missing/zero
-      if ((!next.duration || next.duration <= 0) && oldV.duration && oldV.duration > 0) merged.duration = oldV.duration
-      if ((!next.fileSize || next.fileSize <= 0) && oldV.fileSize && oldV.fileSize > 0) merged.fileSize = oldV.fileSize
-      if ((!next.width || next.width <= 0) && oldV.width && oldV.width > 0) merged.width = oldV.width
-      if ((!next.height || next.height <= 0) && oldV.height && oldV.height > 0) merged.height = oldV.height
-
-      // fileFormats: keep old if new is empty
-      if ((!next.fileFormats || next.fileFormats.length === 0) && oldV.fileFormats && oldV.fileFormats.length > 0) {
-        merged.fileFormats = oldV.fileFormats
+      // title: only update if old is bad and new is good (first valid locks)
+      const oldTitleBad = isBadWeChatTitle(oldV.title)
+      const newTitleGood = !isBadWeChatTitle(next.title)
+      if (oldTitleBad && newTitleGood) {
+        merged.title = next.title
       }
 
-      // isCurrentVideo: preserve true if either says true
-      if (oldV.isCurrentVideo && !next.isCurrentVideo) merged.isCurrentVideo = true
+      // author: only update if old is bad and new is good (first valid locks)
+      const oldAuthorBad = isBadWeChatAuthor(oldV.author)
+      const newAuthorGood = !isBadWeChatAuthor(next.author)
+      if (oldAuthorBad && newAuthorGood) {
+        merged.author = next.author
+      }
+
+      // cover: only update if old is empty and new is not
+      if (!oldV.cover && next.cover) {
+        merged.cover = next.cover
+      }
+
+      // authorAvatar: only update if old is empty and new is not
+      if (!oldV.authorAvatar && next.authorAvatar) {
+        merged.authorAvatar = next.authorAvatar
+      }
+
+      // duration: only update if old is 0/missing and new is positive
+      if ((!oldV.duration || oldV.duration <= 0) && next.duration && next.duration > 0) {
+        merged.duration = next.duration
+      }
+
+      // fileSize: update if old is 0/missing, or if new is significantly larger (more accurate)
+      if ((!oldV.fileSize || oldV.fileSize <= 0) && next.fileSize && next.fileSize > 0) {
+        merged.fileSize = next.fileSize
+      } else if (oldV.fileSize && oldV.fileSize > 0 && next.fileSize && next.fileSize > oldV.fileSize * 1.2) {
+        // New fileSize is >20% larger, likely more accurate (full size vs chunk size)
+        merged.fileSize = next.fileSize
+      }
+
+      // width/height: only update if old is 0/missing and new is positive
+      if ((!oldV.width || oldV.width <= 0) && next.width && next.width > 0) {
+        merged.width = next.width
+      }
+      if ((!oldV.height || oldV.height <= 0) && next.height && next.height > 0) {
+        merged.height = next.height
+      }
+
+      // fileFormats: only update if old is empty and new is not
+      if ((!oldV.fileFormats || oldV.fileFormats.length === 0) && next.fileFormats && next.fileFormats.length > 0) {
+        merged.fileFormats = next.fileFormats
+      }
+
+      // specs: only update if old is empty and new is not
+      if ((!oldV.specs || oldV.specs.length === 0) && next.specs && next.specs.length > 0) {
+        merged.specs = next.specs
+      }
+
+      // decodeKey: only update if old is empty and new is not
+      if (!oldV.decodeKey && next.decodeKey) {
+        merged.decodeKey = next.decodeKey
+      }
+
+      // isCurrentVideo: always take the latest value (this is a state flag, not content)
+      merged.isCurrentVideo = next.isCurrentVideo
+
+      // source/quality/timestamp: take from next (metadata fields)
+      if (next.source) merged.source = next.source
+      if (next.quality) merged.quality = next.quality
+      if (next.timestamp) merged.timestamp = next.timestamp
 
       return merged
     }
@@ -303,15 +363,14 @@ export const useAppStore = defineStore('app', () => {
 
   async function downloadDetectedVideo(video: DetectedVideo, selectedFormat?: string) {
     try {
-      console.log('[Store] downloadDetectedVideo called')
-      console.log('[Store] video.url:', video.url)
-      console.log('[Store] selectedFormat:', selectedFormat)
-      console.log('[Store] video.quality:', video.quality)
-      console.log('[Store] Final quality param:', selectedFormat || video.quality || '')
+      // DetectedVideo.id is a stable identifier used for dedupe in the sniffer list.
+      // Download tasks must use a unique ID per download attempt; otherwise the backend
+      // rejects duplicates ("task with ID ... already exists") and subsequent downloads fail.
+      const downloadTaskId = `${video.source}_${video.id}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
       
       // Use DownloadVideoWithKey if decodeKey is present (for encrypted WeChat videos)
       const task = await DownloadVideoWithKey(
-        video.id,
+        downloadTaskId,
         video.url,
         video.title,
         video.cover,
@@ -442,4 +501,3 @@ export const useAppStore = defineStore('app', () => {
     setAppLanguage
   }
 })
-

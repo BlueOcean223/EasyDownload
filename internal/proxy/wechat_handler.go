@@ -30,6 +30,11 @@ type WeChatVideoInfo struct {
 	Width          int               `json:"width"`          // Video width
 	Height         int               `json:"height"`         // Video height
 	IsCurrentVideo bool              `json:"isCurrentVideo"` // Whether this is the current playing video
+	// Diagnostics / context from injected JS (optional)
+	PageKey string `json:"pageKey,omitempty"`
+	Href    string `json:"href,omitempty"`
+	TS      int64  `json:"ts,omitempty"`
+	Source  string `json:"source,omitempty"`
 }
 
 // WeChatVideoSpec represents video specification for a specific quality
@@ -72,6 +77,8 @@ type videoPayload struct {
 	ID          string             `json:"id"`
 	Media       []objectDescMedia  `json:"media"`
 	Description string             `json:"description"`
+	Title       string             `json:"title,omitempty"`
+	DomTitle    string             `json:"domTitle,omitempty"`
 	Contact     *objectDescContact `json:"contact"`
 	PageKey     string             `json:"pageKey"`
 	Href        string             `json:"href"`
@@ -186,7 +193,17 @@ func (wh *WeChatHandler) HandleWeChatRequestWithType(body []byte, reqType string
 	// FileSize from worker messages is often chunk-sized. Probe total size via HTTP Range if needed.
 	wh.maybeProbeAndUpdateFileSize(videoInfo)
 
-	logger.Info("WeChat video detected: %s (by %s)", videoInfo.Title, videoInfo.Author)
+	logger.Info("WeChat video detected: id=%q title=%q author=%q stable=%q url=%q pageKey=%q source=%q href=%q ts=%d",
+		shortenForLog(videoInfo.ID, 120),
+		shortenForLog(videoInfo.Title, 160),
+		shortenForLog(videoInfo.Author, 80),
+		shortenForLog(extractStableURLParams(videoInfo.URL), 220),
+		shortenForLog(videoInfo.URL, 220),
+		shortenForLog(videoInfo.PageKey, 120),
+		shortenForLog(videoInfo.Source, 40),
+		shortenForLog(videoInfo.Href, 200),
+		videoInfo.TS,
+	)
 	return nil
 }
 
@@ -194,12 +211,18 @@ func (wh *WeChatHandler) maybeProbeAndUpdateFileSize(videoInfo *WeChatVideoInfo)
 	if videoInfo == nil || videoInfo.URL == "" {
 		return
 	}
-	// If missing or suspiciously small, probe.
-	if videoInfo.FileSize > 0 && videoInfo.FileSize >= 1024*1024 {
+
+	lu := strings.ToLower(strings.TrimSpace(videoInfo.URL))
+	if !strings.Contains(lu, "finder.video.qq.com") && !strings.Contains(lu, "findermp.video.qq.com") {
 		return
 	}
-	// Ensure we only probe each URL once per session.
-	if _, loaded := wh.probedSizes.LoadOrStore(videoInfo.URL, struct{}{}); loaded {
+
+	// Ensure we only probe each video once per session (use stable key, not volatile URL tokens).
+	probeKey := canonicalKeyForVideo(*videoInfo)
+	if strings.TrimSpace(probeKey) == "" {
+		probeKey = videoInfo.URL
+	}
+	if _, loaded := wh.probedSizes.LoadOrStore(probeKey, struct{}{}); loaded {
 		return
 	}
 
@@ -208,15 +231,26 @@ func (wh *WeChatHandler) maybeProbeAndUpdateFileSize(videoInfo *WeChatVideoInfo)
 	go func() {
 		size, err := probeContentLengthByRange(urlToProbe)
 		if err != nil || size <= 0 {
+			// Allow retry on later events if the probe failed (URL token may have expired).
+			wh.probedSizes.Delete(probeKey)
 			return
 		}
 
 		// Update current video if still the same URL.
 		wh.currentVideoMu.Lock()
 		if wh.currentVideo != nil && wh.currentVideo.URL == urlToProbe {
+			old := wh.currentVideo.FileSize
 			wh.currentVideo.FileSize = float64(size)
 			base.FileSize = float64(size)
 			base.IsCurrentVideo = true
+			if old <= 0 || float64(size) > old*1.2 {
+				logger.Info("[WeChat Probe] FileSize updated: old=%.0f new=%d stable=%q url=%q",
+					old,
+					size,
+					shortenForLog(extractStableURLParams(urlToProbe), 220),
+					shortenForLog(urlToProbe, 160),
+				)
+			}
 		} else {
 			wh.currentVideoMu.Unlock()
 			return
@@ -241,12 +275,17 @@ func probeContentLengthByRange(rawURL string) (int64, error) {
 	req.Header.Set("Range", "bytes=0-0")
 	req.Header.Set("Accept-Encoding", "identity")
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36")
+	req.Header.Set("Referer", "https://channels.weixin.qq.com/")
 
 	resp, err := client.Do(req)
 	if err != nil {
 		return 0, err
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+		return 0, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	}
 
 	// Prefer Content-Range: bytes 0-0/12345
 	cr := resp.Header.Get("Content-Range")
@@ -286,13 +325,39 @@ func (wh *WeChatHandler) handleDownloadRequest(body []byte) error {
 		wh.currentVideoMu.RUnlock()
 
 		if current != nil {
+			logger.Warn("[WeChat Download] Payload parse failed, falling back to current video: %v", err)
 			videoInfo = current
 		} else {
 			return err
 		}
 	}
+	sanitizeWeChatVideo(videoInfo)
 
-	logger.Info("Download requested for: %s", videoInfo.Title)
+	key := extractStableURLParams(videoInfo.URL)
+	logger.Info("[WeChat Download] Requested id=%q title=%q author=%q stable=%q url=%q pageKey=%q source=%q href=%q ts=%d",
+		shortenForLog(videoInfo.ID, 120),
+		shortenForLog(videoInfo.Title, 160),
+		shortenForLog(videoInfo.Author, 80),
+		shortenForLog(key, 220),
+		shortenForLog(videoInfo.URL, 220),
+		shortenForLog(videoInfo.PageKey, 120),
+		shortenForLog(videoInfo.Source, 40),
+		shortenForLog(videoInfo.Href, 200),
+		videoInfo.TS,
+	)
+	wh.currentVideoMu.RLock()
+	cur := wh.currentVideo
+	wh.currentVideoMu.RUnlock()
+	if cur != nil && strings.TrimSpace(cur.ID) != "" && strings.TrimSpace(videoInfo.ID) != "" && strings.TrimSpace(cur.ID) != strings.TrimSpace(videoInfo.ID) {
+		logger.Warn("[WeChat Download] Mismatch vs current: currentId=%q currentTitle=%q currentStable=%q currentPageKey=%q currentSource=%q currentHref=%q",
+			shortenForLog(cur.ID, 120),
+			shortenForLog(cur.Title, 160),
+			shortenForLog(extractStableURLParams(cur.URL), 220),
+			shortenForLog(cur.PageKey, 120),
+			shortenForLog(cur.Source, 40),
+			shortenForLog(cur.Href, 200),
+		)
+	}
 
 	if wh.onDownloadRequest != nil {
 		wh.onDownloadRequest(*videoInfo)
@@ -378,13 +443,24 @@ func (wh *WeChatHandler) ParseVideoPayload(data []byte) (*WeChatVideoInfo, error
 	}
 
 	// Build video info with default values
-	title := payload.Description
+	titleFrom := "description"
+	title := strings.TrimSpace(payload.Description)
 	if title == "" {
-		title = "未知标题"
+		title = strings.TrimSpace(payload.Title)
+		if title != "" {
+			titleFrom = "title"
+		}
 	}
+	if title == "" {
+		title = strings.TrimSpace(payload.DomTitle)
+		if title != "" {
+			titleFrom = "domTitle"
+		}
+	}
+	// Keep empty titles as-is; frontend will show fallback and allow later updates.
 
 	// Extract author info from contact (now at top level)
-	author := "未知作者"
+	author := ""
 	authorAvatar := ""
 	if payload.Contact != nil {
 		if payload.Contact.Nickname != "" {
@@ -403,6 +479,15 @@ func (wh *WeChatHandler) ParseVideoPayload(data []byte) (*WeChatVideoInfo, error
 		id = fmt.Sprintf("%d", time.Now().UnixNano())
 	}
 
+	if title != "" && titleFrom != "description" {
+		logger.Info("[WeChat Meta] Title fallback used: from=%s title=%q id=%q source=%q",
+			titleFrom,
+			shortenForLog(title, 120),
+			shortenForLog(payload.ID, 120),
+			shortenForLog(payload.Source, 40),
+		)
+	}
+
 	return &WeChatVideoInfo{
 		ID:           id,
 		URL:          fullURL,
@@ -418,6 +503,10 @@ func (wh *WeChatHandler) ParseVideoPayload(data []byte) (*WeChatVideoInfo, error
 		Duration:     duration,
 		Width:        width,
 		Height:       height,
+		PageKey:      strings.TrimSpace(payload.PageKey),
+		Href:         strings.TrimSpace(payload.Href),
+		TS:           payload.TS,
+		Source:       strings.TrimSpace(payload.Source),
 	}, nil
 }
 
@@ -439,9 +528,7 @@ func (wh *WeChatHandler) ParseWxProfile(data []byte) (*WeChatVideoInfo, error) {
 
 	// Title
 	title := strings.TrimSpace(p.Title)
-	if title == "" {
-		title = "未知标题"
-	}
+	// Keep empty titles as-is; frontend will show fallback and allow later updates.
 
 	// File formats and specs
 	formats := make([]string, 0)
@@ -486,7 +573,7 @@ func (wh *WeChatHandler) ParseWxProfile(data []byte) (*WeChatVideoInfo, error) {
 	}
 
 	// Author info
-	author := "未知作者"
+	author := ""
 	authorAvatar := ""
 	if p.Contact != nil {
 		if strings.TrimSpace(p.Contact.Nickname) != "" {
@@ -590,12 +677,10 @@ func (wh *WeChatHandler) ParseObjectDesc(data []byte) (*WeChatVideoInfo, error) 
 
 	// Build video info with default values
 	title := desc.Description
-	if title == "" {
-		title = "未知标题"
-	}
+	// Keep empty titles as-is; frontend will show fallback and allow later updates.
 
 	// Extract author info with default value
-	author := "未知作者"
+	author := ""
 	authorAvatar := ""
 	if desc.Contact != nil {
 		if desc.Contact.Nickname != "" {
@@ -710,10 +795,10 @@ func sanitizeWeChatVideo(v *WeChatVideoInfo) {
 		return
 	}
 	if isBadWeChatTitle(v.Title) {
-		v.Title = "未知标题"
+		v.Title = ""
 	}
 	if isBadWeChatAuthor(v.Author) {
-		v.Author = "未知作者"
+		v.Author = ""
 	}
 }
 
@@ -723,10 +808,23 @@ func isBadWeChatTitle(t string) bool {
 		return true
 	}
 	low := strings.ToLower(s)
+	if strings.Contains(low, "this is a modal window") {
+		return true
+	}
+	if strings.Contains(low, "modal window") && strings.Contains(low, "this is") {
+		return true
+	}
 	if strings.Contains(low, "restore all settings to the default values") {
 		return true
 	}
 	if strings.Contains(low, "video player is loading") {
+		return true
+	}
+	// Player UI option text sometimes leaks into DOM capture
+	if strings.Contains(low, "transparency") && strings.Contains(low, "opaque") {
+		return true
+	}
+	if low == "transparency" || low == "opaque" || strings.Contains(low, "semi-transparent") || strings.Contains(low, "semi transparent") {
 		return true
 	}
 	if strings.Contains(low, "自动续播") || strings.Contains(low, "小窗模式") || strings.Contains(low, "倍速") {
@@ -756,21 +854,61 @@ func isBadWeChatAuthor(a string) bool {
 	return false
 }
 
+// extractStableURLParams extracts stable parameters from WeChat video URL for deduplication.
+// Based on url.md analysis: encfilekey and m are stable across sessions.
+// Volatile params (token, sign, svrbypass, svrnonce) change on each access.
+func extractStableURLParams(videoURL string) string {
+	videoURL = strings.TrimSpace(videoURL)
+	if videoURL == "" {
+		return ""
+	}
+
+	parsed, err := url.Parse(videoURL)
+	if err != nil {
+		return videoURL
+	}
+
+	host := strings.ToLower(parsed.Host)
+	// Only process WeChat finder download hosts
+	if !strings.Contains(host, "finder.video.qq.com") && !strings.Contains(host, "findermp.video.qq.com") {
+		return videoURL
+	}
+
+	// Extract only the most stable params: encfilekey and m
+	encfilekey := parsed.Query().Get("encfilekey")
+	m := parsed.Query().Get("m")
+
+	// If we have encfilekey, use it as primary identifier (most stable)
+	if encfilekey != "" {
+		result := "encfilekey:" + encfilekey
+		if m != "" {
+			result += ":m:" + m
+		}
+		return result
+	}
+
+	// Fallback: use pathname + m if available
+	if m != "" {
+		return parsed.Path + ":m:" + m
+	}
+
+	return parsed.Scheme + "://" + parsed.Host + parsed.Path
+}
+
 func canonicalKeyForVideo(v WeChatVideoInfo) string {
+	// Priority 1: Use video ID (most stable, from WeChat API)
 	if strings.TrimSpace(v.ID) != "" {
 		return strings.TrimSpace(v.ID)
 	}
-	parts := make([]string, 0, 2)
+
+	// Priority 2: Extract stable URL params
+	// NOTE: Do NOT include DecodeKey - it changes across sessions!
+	// Based on url.md analysis: decodeKey values change for the SAME video
 	if strings.TrimSpace(v.URL) != "" {
-		parts = append(parts, strings.TrimSpace(v.URL))
+		return extractStableURLParams(v.URL)
 	}
-	if strings.TrimSpace(v.DecodeKey) != "" {
-		parts = append(parts, strings.TrimSpace(v.DecodeKey))
-	}
-	if len(parts) == 0 {
-		return ""
-	}
-	return strings.Join(parts, "::")
+
+	return ""
 }
 
 func hasServerImprovement(prev, next WeChatVideoInfo) bool {
@@ -846,4 +984,16 @@ func (wh *WeChatHandler) ClearDetectedURLs() {
 func (wh *WeChatHandler) HasDetectedURL(videoURL string) bool {
 	_, exists := wh.detectedURLs.Load(videoURL)
 	return exists
+}
+
+func shortenForLog(s string, max int) string {
+	s = strings.TrimSpace(s)
+	if max <= 0 || s == "" {
+		return s
+	}
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max]) + "…"
 }
