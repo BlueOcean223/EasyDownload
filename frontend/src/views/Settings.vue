@@ -14,8 +14,8 @@ import {
   DesktopOutline,
   SaveOutline
 } from '@vicons/ionicons5'
-import { 
-  GetBilibiliSessData, 
+import {
+  HasBilibiliSessData,
   SetBilibiliSessData,
   OpenLogDir,
   GetLogDir,
@@ -31,18 +31,19 @@ const message = useMessage()
 
 const installing = ref(false)
 const uninstalling = ref(false)
-const sessData = ref('')
+const sessData = ref('')  // Only for new input, not loaded from storage
+const hasSessData = ref(false)  // Whether SESSDATA is already set
 const savingSessData = ref(false)
 const logDir = ref('')
 const upstreamProxyInput = ref('')
 const proxyDebug = ref(false)
 
 onMounted(async () => {
-  // Load SESSDATA
+  // Check if SESSDATA is set (without exposing the actual value for security)
   try {
-    sessData.value = await GetBilibiliSessData()
+    hasSessData.value = await HasBilibiliSessData()
   } catch (e) {
-    console.error('Failed to load SESSDATA:', e)
+    console.error('Failed to check SESSDATA status:', e)
   }
   
   // Load log directory
@@ -103,10 +104,16 @@ async function selectFolder() {
 }
 
 async function saveSessData() {
+  if (!sessData.value.trim()) {
+    message.warning('请输入 SESSDATA')
+    return
+  }
   savingSessData.value = true
   try {
     await SetBilibiliSessData(sessData.value)
-    message.success('SESSDATA 已保存')
+    hasSessData.value = true  // Update status after successful save
+    sessData.value = ''  // Clear input for security
+    message.success('SESSDATA 已保存到安全存储')
   } catch (e: any) {
     message.error(e.message || '保存失败')
   } finally {
@@ -368,21 +375,33 @@ async function saveUpstreamProxy() {
             <template #icon>
               <InformationCircleOutline class="w-5 h-5" />
             </template>
-            登录B站账号后，在浏览器开发者工具中获取 SESSDATA Cookie，可解锁更高画质。
+            <div>
+              <p>B站对未登录用户限制画质（最高480P），这是B站官方策略。</p>
+              <p class="mt-1">获取 SESSDATA 的方式：</p>
+              <ul class="list-disc list-inside mt-1 text-xs">
+                <li>推荐：在「B站下载」页面点击右上角登录按钮，扫码自动获取</li>
+                <li>手动：在浏览器登录B站后，通过开发者工具获取 Cookie 中的 SESSDATA</li>
+              </ul>
+            </div>
           </NAlert>
           
           <div>
-            <p class="text-sm font-medium mb-2">SESSDATA (可选)</p>
+            <p class="text-sm font-medium mb-2">
+              SESSDATA (可选)
+              <NTag v-if="hasSessData" type="success" size="small" class="ml-2">已设置</NTag>
+              <NTag v-else type="default" size="small" class="ml-2">未设置</NTag>
+            </p>
             <div class="flex gap-2">
-              <NInput 
+              <NInput
                 v-model:value="sessData"
                 type="password"
-                placeholder="输入 SESSDATA Cookie 以解锁高画质"
+                :placeholder="hasSessData ? '输入新的 SESSDATA 以覆盖' : '输入 SESSDATA Cookie 以解锁高画质'"
                 show-password-on="click"
+                autocomplete="off"
                 class="flex-1"
               />
-              <NButton 
-                type="primary" 
+              <NButton
+                type="primary"
                 size="small"
                 :loading="savingSessData"
                 @click="saveSessData"
@@ -393,6 +412,9 @@ async function saveUpstreamProxy() {
                 保存
               </NButton>
             </div>
+            <p class="text-xs text-text-tertiary mt-2">
+              提示：扫码登录后会自动填充此项，无需手动输入。凭据已安全存储在系统凭据管理器中。
+            </p>
           </div>
         </div>
       </NCard>

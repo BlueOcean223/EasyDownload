@@ -545,6 +545,38 @@ func (a *App) GetBilibiliVideoInfo(url string) (*downloader.BilibiliVideo, error
 	return a.bilibiliDownloader.GetVideoInfo(bvid)
 }
 
+// GetBilibiliVideoInfoWithAllParts fetches video info with stream info for all parts
+// This is used for the multi-part selector UI to show size estimates for each part
+func (a *App) GetBilibiliVideoInfoWithAllParts(url string) (*downloader.BilibiliVideo, error) {
+	bvid, err := a.bilibiliDownloader.ParseURL(url)
+	if err != nil {
+		return nil, err
+	}
+
+	video, err := a.bilibiliDownloader.GetVideoInfoWithParts(bvid)
+	if err != nil {
+		return nil, err
+	}
+
+	// Get stream info for all parts
+	if err := a.bilibiliDownloader.GetAllPartsStreams(video); err != nil {
+		log.Printf("Warning: failed to get all parts streams: %v", err)
+		// Continue anyway, streams will be empty for failed parts
+	}
+
+	// Also get streams for the first part to maintain backward compatibility
+	if len(video.Parts) > 0 {
+		aid := int64(0)
+		fmt.Sscanf(video.AV, "av%d", &aid)
+		streams, err := a.bilibiliDownloader.GetPartStreams(video, 0)
+		if err == nil {
+			video.Streams = streams
+		}
+	}
+
+	return video, nil
+}
+
 // DownloadBilibiliVideo downloads a Bilibili video
 func (a *App) DownloadBilibiliVideo(url string, quality int) (string, error) {
 	video, err := a.GetBilibiliVideoInfo(url)
@@ -661,10 +693,52 @@ func (a *App) SetBilibiliSessData(sessData string) error {
 	return a.bilibiliDownloader.SaveSessData(sessData)
 }
 
-// GetBilibiliSessData gets the Bilibili session cookie
-func (a *App) GetBilibiliSessData() string {
+// HasBilibiliSessData checks if Bilibili SESSDATA exists (without exposing the value)
+func (a *App) HasBilibiliSessData() bool {
 	sessData, _ := a.bilibiliDownloader.LoadSessData()
-	return sessData
+	return sessData != ""
+}
+
+// GetBilibiliQRCode generates a QR code for Bilibili login
+func (a *App) GetBilibiliQRCode() (*downloader.BilibiliQRCode, error) {
+	logger.Info("API call: GetBilibiliQRCode")
+	qr, err := a.bilibiliDownloader.GetQRCode()
+	if err != nil {
+		logger.Warn("GetBilibiliQRCode failed: %v", err)
+	}
+	return qr, err
+}
+
+// PollBilibiliQRCode checks the QR code scan status
+func (a *App) PollBilibiliQRCode(qrcodeKey string) (*downloader.BilibiliLoginStatus, error) {
+	logger.Debug("API call: PollBilibiliQRCode")
+	status, err := a.bilibiliDownloader.PollQRCodeStatus(qrcodeKey)
+	if err != nil {
+		logger.Debug("PollBilibiliQRCode error: %v", err)
+		return nil, err
+	}
+	if status.Code == 0 {
+		logger.Info("Bilibili login successful via QR code")
+	}
+	return status, nil
+}
+
+// GetBilibiliUserInfo gets the current logged in user info
+func (a *App) GetBilibiliUserInfo() (*downloader.BilibiliUserInfo, error) {
+	logger.Debug("API call: GetBilibiliUserInfo")
+	return a.bilibiliDownloader.GetUserInfo()
+}
+
+// BilibiliLogout clears the saved SESSDATA
+func (a *App) BilibiliLogout() error {
+	logger.Info("API call: BilibiliLogout")
+	err := a.bilibiliDownloader.Logout()
+	if err != nil {
+		logger.Warn("BilibiliLogout failed: %v", err)
+	} else {
+		logger.Info("Bilibili logout successful")
+	}
+	return err
 }
 
 // ==================== Douyin Methods ====================

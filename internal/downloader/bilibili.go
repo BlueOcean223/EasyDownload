@@ -2,6 +2,7 @@ package downloader
 
 import (
 	"EasyDownload/internal/config"
+	"EasyDownload/internal/credential"
 	"EasyDownload/internal/logger"
 	"context"
 	"encoding/json"
@@ -14,6 +15,8 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"sync"
+	"time"
 )
 
 // BilibiliVideo represents a Bilibili video information
@@ -31,10 +34,11 @@ type BilibiliVideo struct {
 
 // BilibiliPart represents a video part (分P) information
 type BilibiliPart struct {
-	CID      int64  `json:"cid"`
-	Page     int    `json:"page"`
-	PartName string `json:"partName"`
-	Duration int    `json:"duration"`
+	CID      int64            `json:"cid"`
+	Page     int              `json:"page"`
+	PartName string           `json:"partName"`
+	Duration int              `json:"duration"`
+	Streams  []BilibiliStream `json:"streams,omitempty"` // Stream info for this part (optional, loaded on demand)
 }
 
 // BilibiliStream represents a video stream option
@@ -57,9 +61,48 @@ type FFmpegManagerInterface interface {
 // BilibiliDownloader handles Bilibili video downloads
 type BilibiliDownloader struct {
 	sessData      string // Cookie SESSDATA for higher quality
+	sessDataMu    sync.RWMutex // Protects sessData access
 	ffmpegPath    string
 	ffmpegManager FFmpegManagerInterface
 	configManager ConfigManagerInterface
+	rateLimiter   *QRCodeRateLimiter // Rate limiter for QR code polling
+}
+
+// QRCodeRateLimiter implements rate limiting for QR code polling
+type QRCodeRateLimiter struct {
+	lastPoll map[string]time.Time
+	mu       sync.Mutex
+}
+
+// NewQRCodeRateLimiter creates a new rate limiter
+func NewQRCodeRateLimiter() *QRCodeRateLimiter {
+	return &QRCodeRateLimiter{
+		lastPoll: make(map[string]time.Time),
+	}
+}
+
+// Allow checks if a request is allowed based on rate limiting
+func (rl *QRCodeRateLimiter) Allow(key string, minInterval time.Duration) bool {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	now := time.Now()
+	lastTime, exists := rl.lastPoll[key]
+
+	if exists && now.Sub(lastTime) < minInterval {
+		return false
+	}
+
+	rl.lastPoll[key] = now
+
+	// Clean up old entries (older than 10 minutes)
+	for k, t := range rl.lastPoll {
+		if now.Sub(t) > 10*time.Minute {
+			delete(rl.lastPoll, k)
+		}
+	}
+
+	return true
 }
 
 // ConfigManagerInterface defines the interface for config management
@@ -70,7 +113,9 @@ type ConfigManagerInterface interface {
 
 // NewBilibiliDownloader creates a new BilibiliDownloader
 func NewBilibiliDownloader() *BilibiliDownloader {
-	return &BilibiliDownloader{}
+	return &BilibiliDownloader{
+		rateLimiter: NewQRCodeRateLimiter(),
+	}
 }
 
 // SetConfigManager sets the config manager for SESSDATA persistence
@@ -78,35 +123,288 @@ func (bd *BilibiliDownloader) SetConfigManager(cm ConfigManagerInterface) {
 	bd.configManager = cm
 }
 
-// SaveSessData saves the SESSDATA to persistent storage via config manager
+// SaveSessData saves the SESSDATA to secure credential storage
 func (bd *BilibiliDownloader) SaveSessData(sessData string) error {
+	bd.sessDataMu.Lock()
 	bd.sessData = sessData
-	if bd.configManager != nil {
-		return bd.configManager.Set("bilibiliSessData", sessData)
+	bd.sessDataMu.Unlock()
+
+	// Store to secure credential storage (Windows Credential Manager, macOS Keychain, etc.)
+	if err := credential.StoreBilibiliSessData(sessData); err != nil {
+		logger.Error("Failed to store SESSDATA: credential storage unavailable")
+		return fmt.Errorf("failed to store credential securely")
 	}
+	logger.Info("SESSDATA stored to secure credential storage")
 	return nil
 }
 
-// LoadSessData loads the SESSDATA from persistent storage via config manager
+// LoadSessData loads the SESSDATA from secure credential storage
 func (bd *BilibiliDownloader) LoadSessData() (string, error) {
-	if bd.configManager != nil {
-		cfg := bd.configManager.Get()
-		if cfg != nil && cfg.BilibiliSessData != "" {
-			bd.sessData = cfg.BilibiliSessData
-			return bd.sessData, nil
-		}
+	// Load from secure credential storage
+	sessData, err := credential.GetBilibiliSessData()
+	if err != nil {
+		logger.Error("Failed to load SESSDATA: credential storage unavailable")
+		return "", fmt.Errorf("failed to load credential securely")
 	}
-	return bd.sessData, nil
+	if sessData != "" {
+		bd.sessDataMu.Lock()
+		bd.sessData = sessData
+		bd.sessDataMu.Unlock()
+		logger.Debug("SESSDATA loaded from secure credential storage")
+	}
+	return sessData, nil
 }
 
-// GetSessData returns the current SESSDATA
+// GetSessData returns the current SESSDATA (thread-safe)
 func (bd *BilibiliDownloader) GetSessData() string {
+	bd.sessDataMu.RLock()
+	defer bd.sessDataMu.RUnlock()
 	return bd.sessData
 }
 
-// SetSessData sets the Bilibili session cookie for authenticated requests
+// SetSessData sets the Bilibili session cookie for authenticated requests (thread-safe)
 func (bd *BilibiliDownloader) SetSessData(sessData string) {
+	bd.sessDataMu.Lock()
+	defer bd.sessDataMu.Unlock()
 	bd.sessData = sessData
+}
+
+// BilibiliQRCode represents QR code login info
+type BilibiliQRCode struct {
+	URL       string `json:"url"`       // QR code URL to display
+	QRCodeKey string `json:"qrcodeKey"` // Key for polling login status
+}
+
+// BilibiliLoginStatus represents the login polling result
+type BilibiliLoginStatus struct {
+	Code     int    `json:"code"`     // 0=success, 86038=expired, 86090=scanned waiting confirm, 86101=not scanned
+	Message  string `json:"message"`  // Status message
+	SessData string `json:"sessData"` // SESSDATA cookie (only when code=0)
+}
+
+// BilibiliUserInfo represents logged in user info
+type BilibiliUserInfo struct {
+	IsLogin   bool   `json:"isLogin"`
+	UID       int64  `json:"uid"`
+	Username  string `json:"username"`
+	Face      string `json:"face"`      // Avatar URL
+	IsVIP     bool   `json:"isVip"`     // Is active 大会员 (type > 0 AND status == 1)
+	VIPType   int    `json:"vipType"`   // 0=无, 1=月度, 2=年度
+	VIPStatus int    `json:"vipStatus"` // 0=无效/过期, 1=有效
+}
+
+// GetQRCode generates a QR code for Bilibili login
+func (bd *BilibiliDownloader) GetQRCode() (*BilibiliQRCode, error) {
+	apiURL := "https://passport.bilibili.com/x/passport-login/web/qrcode/generate"
+
+	req, err := http.NewRequest("GET", apiURL, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	bd.setHeaders(req)
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var result struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+		Data    struct {
+			URL       string `json:"url"`
+			QRCodeKey string `json:"qrcode_key"`
+		} `json:"data"`
+	}
+
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, err
+	}
+
+	if result.Code != 0 {
+		return nil, fmt.Errorf("failed to generate QR code: %s", result.Message)
+	}
+
+	return &BilibiliQRCode{
+		URL:       result.Data.URL,
+		QRCodeKey: result.Data.QRCodeKey,
+	}, nil
+}
+
+// PollQRCodeStatus checks the QR code scan status with rate limiting
+func (bd *BilibiliDownloader) PollQRCodeStatus(qrcodeKey string) (*BilibiliLoginStatus, error) {
+	// Rate limiting: minimum 1.5 seconds between polls for the same QR code
+	if !bd.rateLimiter.Allow(qrcodeKey, 1500*time.Millisecond) {
+		return nil, fmt.Errorf("polling too frequently, please wait")
+	}
+
+	apiURL := fmt.Sprintf("https://passport.bilibili.com/x/passport-login/web/qrcode/poll?qrcode_key=%s", qrcodeKey)
+
+	req, err := http.NewRequest("GET", apiURL, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	bd.setHeaders(req)
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var result struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+		Data    struct {
+			URL          string `json:"url"`
+			RefreshToken string `json:"refresh_token"`
+			Timestamp    int64  `json:"timestamp"`
+			Code         int    `json:"code"`
+			Message      string `json:"message"`
+		} `json:"data"`
+	}
+
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, err
+	}
+
+	status := &BilibiliLoginStatus{
+		Code:    result.Data.Code,
+		Message: result.Data.Message,
+	}
+
+	// Code meanings:
+	// 0 = success
+	// 86038 = QR code expired
+	// 86090 = QR code scanned, waiting for confirmation
+	// 86101 = QR code not scanned
+
+	if result.Data.Code == 0 {
+		// Login successful, extract SESSDATA from cookies in response header
+		for _, cookie := range resp.Cookies() {
+			if cookie.Name == "SESSDATA" {
+				status.SessData = cookie.Value
+				break
+			}
+		}
+
+		// If SESSDATA not in cookies, try to parse from URL
+		if status.SessData == "" && result.Data.URL != "" {
+			// URL format: https://passport.bilibili.com/...?SESSDATA=xxx&...
+			if strings.Contains(result.Data.URL, "SESSDATA=") {
+				parts := strings.Split(result.Data.URL, "SESSDATA=")
+				if len(parts) > 1 {
+					sessData := strings.Split(parts[1], "&")[0]
+					status.SessData = sessData
+				}
+			}
+		}
+
+		// Auto-save SESSDATA if obtained
+		if status.SessData != "" {
+			bd.SaveSessData(status.SessData)
+			logger.Info("Bilibili login successful, SESSDATA saved")
+		}
+	}
+
+	return status, nil
+}
+
+// GetUserInfo gets the current logged in user info
+func (bd *BilibiliDownloader) GetUserInfo() (*BilibiliUserInfo, error) {
+	if bd.sessData == "" {
+		return &BilibiliUserInfo{IsLogin: false}, nil
+	}
+
+	apiURL := "https://api.bilibili.com/x/web-interface/nav"
+
+	req, err := http.NewRequest("GET", apiURL, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	bd.setHeaders(req)
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var result struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+		Data    struct {
+			IsLogin bool   `json:"isLogin"`
+			Mid     int64  `json:"mid"`
+			Uname   string `json:"uname"`
+			Face    string `json:"face"`
+			VipType int    `json:"vipType"`
+			VIP     struct {
+				Type   int `json:"type"`
+				Status int `json:"status"`
+			} `json:"vip"`
+		} `json:"data"`
+	}
+
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, err
+	}
+
+	// VIP status: type > 0 AND status == 1 means active VIP
+	// type: 0=无会员, 1=月度大会员, 2=年度大会员
+	// status: 0=无效/过期, 1=有效
+	isVIP := result.Data.VIP.Type > 0 && result.Data.VIP.Status == 1
+
+	userInfo := &BilibiliUserInfo{
+		IsLogin:   result.Data.IsLogin,
+		UID:       result.Data.Mid,
+		Username:  result.Data.Uname,
+		Face:      result.Data.Face,
+		VIPType:   result.Data.VIP.Type,
+		VIPStatus: result.Data.VIP.Status,
+		IsVIP:     isVIP,
+	}
+
+	logger.Debug("Bilibili user info: uid=%d, username=%s, vipType=%d, vipStatus=%d, isVIP=%v",
+		userInfo.UID, userInfo.Username, userInfo.VIPType, userInfo.VIPStatus, userInfo.IsVIP)
+
+	return userInfo, nil
+}
+
+// Logout clears the saved SESSDATA from secure storage
+func (bd *BilibiliDownloader) Logout() error {
+	bd.sessDataMu.Lock()
+	bd.sessData = ""
+	bd.sessDataMu.Unlock()
+
+	if err := credential.DeleteBilibiliSessData(); err != nil {
+		logger.Error("Failed to delete SESSDATA: credential storage unavailable")
+		return fmt.Errorf("failed to delete credential securely")
+	}
+	logger.Info("SESSDATA deleted from secure credential storage")
+	return nil
 }
 
 // SetFFmpegPath sets the path to ffmpeg executable
@@ -430,6 +728,28 @@ func (bd *BilibiliDownloader) GetPartStreams(video *BilibiliVideo, partIndex int
 	fmt.Sscanf(video.AV, "av%d", &aid)
 
 	return bd.getStreamInfo(video.BV, aid, video.Parts[partIndex].CID, video.Parts[partIndex].Duration)
+}
+
+// GetAllPartsStreams fetches stream info for all parts of a video
+// This is useful for displaying size estimates in the part selector UI
+func (bd *BilibiliDownloader) GetAllPartsStreams(video *BilibiliVideo) error {
+	if video == nil || len(video.Parts) == 0 {
+		return fmt.Errorf("no parts available")
+	}
+
+	aid := int64(0)
+	fmt.Sscanf(video.AV, "av%d", &aid)
+
+	for i := range video.Parts {
+		streams, err := bd.getStreamInfo(video.BV, aid, video.Parts[i].CID, video.Parts[i].Duration)
+		if err != nil {
+			logger.Debug("Failed to get streams for part %d: %v", i, err)
+			continue
+		}
+		video.Parts[i].Streams = streams
+	}
+
+	return nil
 }
 
 // DownloadPart downloads a specific part of a Bilibili video
@@ -1068,8 +1388,13 @@ func (bd *BilibiliDownloader) setHeaders(req *http.Request) {
 	req.Header.Set("Origin", "https://www.bilibili.com")
 	req.Header.Set("Referer", "https://www.bilibili.com/")
 
-	if bd.sessData != "" {
-		req.Header.Set("Cookie", fmt.Sprintf("SESSDATA=%s", bd.sessData))
+	// Thread-safe access to sessData
+	bd.sessDataMu.RLock()
+	sessData := bd.sessData
+	bd.sessDataMu.RUnlock()
+
+	if sessData != "" {
+		req.Header.Set("Cookie", fmt.Sprintf("SESSDATA=%s", sessData))
 	}
 }
 

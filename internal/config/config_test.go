@@ -109,7 +109,7 @@ func TestConfigPersistenceRoundTrip(t *testing.T) {
 	))
 
 	properties.Property("string config values round trip correctly", prop.ForAll(
-		func(sessData, version string) bool {
+		func(version string) bool {
 			tempDir, err := os.MkdirTemp("", "config_test")
 			if err != nil {
 				return false
@@ -121,7 +121,7 @@ func TestConfigPersistenceRoundTrip(t *testing.T) {
 			cm := NewConfigManager(configPath)
 			cm.Load()
 
-			cm.Set("bilibiliSessData", sessData)
+			// Note: bilibiliSessData removed - now stored in secure credential storage
 			// Version must be non-empty to be preserved (empty means use default)
 			if version != "" {
 				cm.Set("version", version)
@@ -133,10 +133,8 @@ func TestConfigPersistenceRoundTrip(t *testing.T) {
 			cm2.Load()
 			loadedConfig := cm2.Get()
 
-			return loadedConfig.BilibiliSessData == originalConfig.BilibiliSessData &&
-				loadedConfig.Version == originalConfig.Version
+			return loadedConfig.Version == originalConfig.Version
 		},
-		gen.AnyString(),
 		gen.AnyString().SuchThat(func(s string) bool { return len(s) > 0 }),
 	))
 
@@ -218,7 +216,7 @@ func TestConfigExportCompleteness(t *testing.T) {
 	properties := gopter.NewProperties(parameters)
 
 	properties.Property("exported config contains all fields with correct values", prop.ForAll(
-		func(proxyPort, maxConcurrent int, autoRetry, minimizeToTray bool, sessData string) bool {
+		func(proxyPort, maxConcurrent int, autoRetry, minimizeToTray bool) bool {
 			tempDir, err := os.MkdirTemp("", "config_test")
 			if err != nil {
 				return false
@@ -239,7 +237,7 @@ func TestConfigExportCompleteness(t *testing.T) {
 			}
 			cm.Set("autoRetry", autoRetry)
 			cm.Set("minimizeToTray", minimizeToTray)
-			cm.Set("bilibiliSessData", sessData)
+			// Note: bilibiliSessData removed - now stored in secure credential storage
 
 			// Export to bytes
 			exportedData, err := cm.ExportToBytes()
@@ -256,14 +254,13 @@ func TestConfigExportCompleteness(t *testing.T) {
 			// Get current config
 			currentConfig := cm.Get()
 
-			// Verify all fields match
+			// Verify all fields match (excluding BilibiliSessData which is now in secure storage)
 			return exportedConfig.ProxyPort == currentConfig.ProxyPort &&
 				exportedConfig.APIPort == currentConfig.APIPort &&
 				exportedConfig.DownloadDir == currentConfig.DownloadDir &&
 				exportedConfig.MaxConcurrent == currentConfig.MaxConcurrent &&
 				exportedConfig.AutoRetry == currentConfig.AutoRetry &&
 				exportedConfig.MaxRetryCount == currentConfig.MaxRetryCount &&
-				exportedConfig.BilibiliSessData == currentConfig.BilibiliSessData &&
 				exportedConfig.MinimizeToTray == currentConfig.MinimizeToTray &&
 				exportedConfig.ShowNotification == currentConfig.ShowNotification &&
 				exportedConfig.FirstRunComplete == currentConfig.FirstRunComplete &&
@@ -273,7 +270,6 @@ func TestConfigExportCompleteness(t *testing.T) {
 		gen.IntRange(1, 10),
 		gen.Bool(),
 		gen.Bool(),
-		gen.AnyString(),
 	))
 
 	properties.Property("export to file creates valid JSON", prop.ForAll(

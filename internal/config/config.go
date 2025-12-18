@@ -21,8 +21,8 @@ type Config struct {
 	AutoRetry     bool   `json:"autoRetry"`
 	MaxRetryCount int    `json:"maxRetryCount"`
 
-	// Bilibili settings
-	BilibiliSessData string `json:"bilibiliSessData"`
+	// Bilibili settings - SESSDATA moved to secure credential storage
+	// BilibiliSessData is no longer stored in config file for security
 
 	// System settings
 	MinimizeToTray   bool `json:"minimizeToTray"`
@@ -60,7 +60,6 @@ func DefaultConfig() *Config {
 		MaxConcurrent:    3,
 		AutoRetry:        true,
 		MaxRetryCount:    3,
-		BilibiliSessData: "",
 		MinimizeToTray:   true,
 		ShowNotification: true,
 		FirstRunComplete: false,
@@ -163,9 +162,9 @@ func (cm *ConfigManager) Save() error {
 
 // saveInternal saves config without locking (must be called with lock held)
 func (cm *ConfigManager) saveInternal() error {
-	// Ensure directory exists
+	// Ensure directory exists with secure permissions (only owner can access)
 	dir := filepath.Dir(cm.configPath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return fmt.Errorf("failed to create config directory: %w", err)
 	}
 
@@ -174,7 +173,8 @@ func (cm *ConfigManager) saveInternal() error {
 		return fmt.Errorf("failed to marshal config: %w", err)
 	}
 
-	if err := os.WriteFile(cm.configPath, data, 0644); err != nil {
+	// Write config file with secure permissions (only owner can read/write)
+	if err := os.WriteFile(cm.configPath, data, 0600); err != nil {
 		return fmt.Errorf("failed to write config file: %w", err)
 	}
 
@@ -244,12 +244,7 @@ func (cm *ConfigManager) Set(key string, value any) error {
 		} else {
 			return fmt.Errorf("invalid type for maxRetryCount")
 		}
-	case "bilibiliSessData":
-		if v, ok := value.(string); ok {
-			cm.config.BilibiliSessData = v
-		} else {
-			return fmt.Errorf("invalid type for bilibiliSessData")
-		}
+	// Note: bilibiliSessData removed - now stored in secure credential storage
 	case "minimizeToTray":
 		if v, ok := value.(bool); ok {
 			cm.config.MinimizeToTray = v
@@ -397,13 +392,14 @@ func (cm *ConfigManager) Export(exportPath string) error {
 		return fmt.Errorf("failed to marshal config for export: %w", err)
 	}
 
-	// Ensure directory exists
+	// Ensure directory exists with secure permissions
 	dir := filepath.Dir(exportPath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return fmt.Errorf("failed to create export directory: %w", err)
 	}
 
-	if err := os.WriteFile(exportPath, data, 0644); err != nil {
+	// Write export file with secure permissions
+	if err := os.WriteFile(exportPath, data, 0600); err != nil {
 		return fmt.Errorf("failed to write export file: %w", err)
 	}
 

@@ -60,12 +60,37 @@ export interface BilibiliStream {
   audioUrl: string
 }
 
+// Bilibili QR code for login
+export interface BilibiliQRCode {
+  url: string
+  qrcodeKey: string
+}
+
+// Bilibili login status
+export interface BilibiliLoginStatus {
+  code: number    // 0=success, 86038=expired, 86090=scanned waiting, 86101=not scanned
+  message: string
+  sessData: string
+}
+
+// Bilibili user info
+export interface BilibiliUserInfo {
+  isLogin: boolean
+  uid: number
+  username: string
+  face: string      // Avatar URL
+  isVip: boolean    // Is active 大会员 (type > 0 AND status == 1)
+  vipType: number   // 0=无, 1=月度, 2=年度
+  vipStatus: number // 0=无效/过期, 1=有效
+}
+
 // Bilibili video part (分P)
 export interface BilibiliPart {
   cid: number
   page: number
   partName: string
   duration: number
+  streams?: BilibiliStream[]  // Stream info for this part (optional, loaded on demand)
 }
 
 // Bilibili video info

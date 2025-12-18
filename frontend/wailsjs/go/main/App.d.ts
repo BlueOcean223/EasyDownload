@@ -4,6 +4,8 @@ import {downloader} from '../models';
 import {api} from '../models';
 import {douyin} from '../models';
 
+export function BilibiliLogout():Promise<void>;
+
 export function CancelDownload(arg1:string):Promise<void>;
 
 export function ClearDetectedVideos():Promise<void>;
@@ -20,9 +22,13 @@ export function DownloadVideoWithKey(arg1:string,arg2:string,arg3:string,arg4:st
 
 export function GetAppInfo():Promise<Record<string, any>>;
 
-export function GetBilibiliSessData():Promise<string>;
+export function GetBilibiliQRCode():Promise<downloader.BilibiliQRCode>;
+
+export function GetBilibiliUserInfo():Promise<downloader.BilibiliUserInfo>;
 
 export function GetBilibiliVideoInfo(arg1:string):Promise<downloader.BilibiliVideo>;
+
+export function GetBilibiliVideoInfoWithAllParts(arg1:string):Promise<downloader.BilibiliVideo>;
 
 export function GetCertPath():Promise<string>;
 
@@ -45,6 +51,8 @@ export function GetProxyPort():Promise<number>;
 export function GetTheme():Promise<string>;
 
 export function GetUpstreamProxy():Promise<string>;
+
+export function HasBilibiliSessData():Promise<boolean>;
 
 export function InstallCert():Promise<void>;
 
@@ -71,6 +79,8 @@ export function OpenFile(arg1:string):Promise<void>;
 export function OpenLogDir():Promise<void>;
 
 export function PauseDownload(arg1:string):Promise<void>;
+
+export function PollBilibiliQRCode(arg1:string):Promise<downloader.BilibiliLoginStatus>;
 
 export function RemoveDetectedVideo(arg1:string):Promise<void>;
 

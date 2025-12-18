@@ -2,32 +2,49 @@
 import { ref, computed, watch } from 'vue'
 import { 
   NModal, NCard, NDataTable, NButton, NSpace, 
-  NCheckbox, NTag, NEmpty, NScrollbar
+  NCheckbox, NTag, NEmpty, NScrollbar, NSelect, NSpin
 } from 'naive-ui'
 import type { DataTableColumns } from 'naive-ui'
-import type { BilibiliPart } from '@/types'
-import { TimeOutline, ListOutline } from '@vicons/ionicons5'
+import type { BilibiliPart, BilibiliStream } from '@/types'
+import { TimeOutline, ListOutline, CloudDownloadOutline } from '@vicons/ionicons5'
 
 const props = defineProps<{
   show: boolean
   parts: BilibiliPart[]
   videoTitle: string
+  streams?: BilibiliStream[]  // Available quality options from first part
+  selectedQuality?: number    // Currently selected quality
 }>()
 
 const emit = defineEmits<{
   (e: 'update:show', value: boolean): void
   (e: 'select', parts: number[]): void
   (e: 'cancel'): void
+  (e: 'update:selectedQuality', quality: number): void
 }>()
 
 const selectedParts = ref<number[]>([])
 const selectAll = ref(false)
+const localSelectedQuality = ref<number | null>(null)
 
 // Reset selection when modal opens
 watch(() => props.show, (newVal) => {
   if (newVal) {
     selectedParts.value = []
     selectAll.value = false
+    // Initialize local quality from prop
+    if (props.selectedQuality !== undefined) {
+      localSelectedQuality.value = props.selectedQuality
+    } else if (props.streams && props.streams.length > 0) {
+      localSelectedQuality.value = props.streams[0].quality
+    }
+  }
+})
+
+// Sync quality changes back to parent
+watch(localSelectedQuality, (newVal) => {
+  if (newVal !== null) {
+    emit('update:selectedQuality', newVal)
   }
 })
 
@@ -45,6 +62,15 @@ watch(selectedParts, (newVal) => {
   selectAll.value = newVal.length === props.parts.length && props.parts.length > 0
 }, { deep: true })
 
+// Quality options for selector
+const qualityOptions = computed(() => {
+  if (!props.streams || props.streams.length === 0) return []
+  return props.streams.map(s => ({
+    label: s.qualityName,
+    value: s.quality
+  }))
+})
+
 const hasSelection = computed(() => selectedParts.value.length > 0)
 
 const totalDuration = computed(() => {
@@ -53,10 +79,57 @@ const totalDuration = computed(() => {
   }, 0)
 })
 
+// Get estimated size for a part at the selected quality
+function getPartSize(part: BilibiliPart): number | null {
+  if (!part.streams || part.streams.length === 0 || localSelectedQuality.value === null) {
+    return null
+  }
+  const stream = part.streams.find(s => s.quality === localSelectedQuality.value)
+  return stream?.size || null
+}
+
+// Calculate total size of selected parts
+const totalSelectedSize = computed(() => {
+  if (localSelectedQuality.value === null) return null
+  
+  let total = 0
+  let hasAnySize = false
+  
+  for (const index of selectedParts.value) {
+    const part = props.parts[index]
+    if (part) {
+      const size = getPartSize(part)
+      if (size && size > 0) {
+        total += size
+        hasAnySize = true
+      }
+    }
+  }
+  
+  return hasAnySize ? total : null
+})
+
+// Check if any part has stream info
+const hasPartStreams = computed(() => {
+  return props.parts.some(p => p.streams && p.streams.length > 0)
+})
+
 function formatDuration(seconds: number) {
   const mins = Math.floor(seconds / 60)
   const secs = seconds % 60
   return `${mins}:${secs.toString().padStart(2, '0')}`
+}
+
+function formatFileSize(bytes?: number | null) {
+  if (!bytes || bytes <= 0) return '-'
+  const units = ['B', 'KB', 'MB', 'GB']
+  let unitIndex = 0
+  let size = bytes
+  while (size >= 1024 && unitIndex < units.length - 1) {
+    size /= 1024
+    unitIndex++
+  }
+  return `${size.toFixed(1)} ${units[unitIndex]}`
 }
 
 function togglePart(index: number) {
@@ -82,31 +155,48 @@ function cancel() {
   emit('update:show', false)
 }
 
-const columns: DataTableColumns<BilibiliPart & { index: number }> = [
-  {
-    type: 'selection',
-    disabled: () => false,
-  },
-  {
-    title: 'P',
-    key: 'page',
-    width: 50,
-    render: (row) => `P${row.page}`
-  },
-  {
-    title: '标题',
-    key: 'partName',
-    ellipsis: {
-      tooltip: true
+const columns = computed<DataTableColumns<BilibiliPart & { index: number }>>(() => {
+  const cols: DataTableColumns<BilibiliPart & { index: number }> = [
+    {
+      type: 'selection',
+      disabled: () => false,
+    },
+    {
+      title: 'P',
+      key: 'page',
+      width: 50,
+      render: (row) => `P${row.page}`
+    },
+    {
+      title: '标题',
+      key: 'partName',
+      ellipsis: {
+        tooltip: true
+      }
+    },
+    {
+      title: '时长',
+      key: 'duration',
+      width: 80,
+      render: (row) => formatDuration(row.duration)
     }
-  },
-  {
-    title: '时长',
-    key: 'duration',
-    width: 80,
-    render: (row) => formatDuration(row.duration)
+  ]
+  
+  // Add size column if any part has stream info
+  if (hasPartStreams.value) {
+    cols.push({
+      title: '预估大小',
+      key: 'size',
+      width: 100,
+      render: (row) => {
+        const size = getPartSize(row)
+        return size ? formatFileSize(size) : '-'
+      }
+    })
   }
-]
+  
+  return cols
+})
 
 const tableData = computed(() => {
   return props.parts.map((part, index) => ({
@@ -122,7 +212,7 @@ const checkedRowKeys = computed({
   }
 })
 
-// Row key function for NDataTable - defined here to avoid TypeScript syntax in template
+// Row key function for NDataTable
 const getRowKey = (row: BilibiliPart & { index: number }) => row.index
 </script>
 
@@ -130,7 +220,7 @@ const getRowKey = (row: BilibiliPart & { index: number }) => row.index
   <NModal 
     :show="show" 
     preset="card"
-    style="width: 600px; max-height: 80vh"
+    style="width: 700px; max-height: 80vh"
     :title="`选择分P - ${videoTitle}`"
     :mask-closable="true"
     @update:show="emit('update:show', $event)"
@@ -154,14 +244,35 @@ const getRowKey = (row: BilibiliPart & { index: number }) => row.index
 
       <!-- Parts list -->
       <template v-else>
-        <div class="mb-3 flex items-center justify-between">
-          <NCheckbox v-model:checked="selectAll">
-            全选
-          </NCheckbox>
-          <span v-if="hasSelection" class="text-sm text-text-secondary">
-            已选 {{ selectedParts.length }} P，
-            总时长 {{ formatDuration(totalDuration) }}
-          </span>
+        <!-- Quality selector and selection info -->
+        <div class="mb-3 flex items-center justify-between flex-wrap gap-2">
+          <div class="flex items-center gap-3">
+            <NCheckbox v-model:checked="selectAll">
+              全选
+            </NCheckbox>
+            
+            <!-- Quality selector -->
+            <div v-if="qualityOptions.length > 0" class="flex items-center gap-2">
+              <span class="text-sm text-text-secondary">画质:</span>
+              <NSelect 
+                v-model:value="localSelectedQuality"
+                :options="qualityOptions"
+                size="small"
+                style="width: 130px"
+              />
+            </div>
+          </div>
+          
+          <!-- Selection summary -->
+          <div v-if="hasSelection" class="text-sm text-text-secondary flex items-center gap-2">
+            <span>已选 {{ selectedParts.length }} P</span>
+            <span>·</span>
+            <span>总时长 {{ formatDuration(totalDuration) }}</span>
+            <template v-if="totalSelectedSize">
+              <span>·</span>
+              <span class="text-primary">预估 {{ formatFileSize(totalSelectedSize) }}</span>
+            </template>
+          </div>
         </div>
 
         <NScrollbar style="max-height: 400px">
@@ -178,15 +289,25 @@ const getRowKey = (row: BilibiliPart & { index: number }) => row.index
     </div>
 
     <template #footer>
-      <div class="flex justify-end gap-3">
-        <NButton @click="cancel">取消</NButton>
-        <NButton 
-          type="primary" 
-          :disabled="!hasSelection"
-          @click="confirm"
-        >
-          下载选中 ({{ selectedParts.length }})
-        </NButton>
+      <div class="flex justify-between items-center">
+        <div class="text-sm text-text-secondary">
+          <template v-if="hasSelection && totalSelectedSize">
+            总计: {{ formatFileSize(totalSelectedSize) }}
+          </template>
+        </div>
+        <div class="flex gap-3">
+          <NButton @click="cancel">取消</NButton>
+          <NButton 
+            type="primary" 
+            :disabled="!hasSelection"
+            @click="confirm"
+          >
+            <template #icon>
+              <CloudDownloadOutline class="w-4 h-4" />
+            </template>
+            下载选中 ({{ selectedParts.length }})
+          </NButton>
+        </div>
       </div>
     </template>
   </NModal>
@@ -195,5 +316,9 @@ const getRowKey = (row: BilibiliPart & { index: number }) => row.index
 <style scoped>
 .part-selector-content {
   min-height: 200px;
+}
+
+.text-primary {
+  color: var(--primary-color, #18a058);
 }
 </style>
