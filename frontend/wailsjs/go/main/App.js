@@ -18,6 +18,10 @@ export function DownloadBilibiliVideo(arg1, arg2) {
   return window['go']['main']['App']['DownloadBilibiliVideo'](arg1, arg2);
 }
 
+export function DownloadDouyinVideo(arg1, arg2) {
+  return window['go']['main']['App']['DownloadDouyinVideo'](arg1, arg2);
+}
+
 export function DownloadVideo(arg1, arg2, arg3, arg4, arg5, arg6) {
   return window['go']['main']['App']['DownloadVideo'](arg1, arg2, arg3, arg4, arg5, arg6);
 }
@@ -44,6 +48,10 @@ export function GetCertPath() {
 
 export function GetDetectedVideos() {
   return window['go']['main']['App']['GetDetectedVideos']();
+}
+
+export function GetDouyinVideoInfo(arg1) {
+  return window['go']['main']['App']['GetDouyinVideoInfo'](arg1);
 }
 
 export function GetDownloadDir() {

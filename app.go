@@ -11,6 +11,7 @@ import (
 	"EasyDownload/assets/icons"
 	"EasyDownload/internal/api"
 	"EasyDownload/internal/config"
+	"EasyDownload/internal/douyin"
 	"EasyDownload/internal/downloader"
 	"EasyDownload/internal/ffmpeg"
 	"EasyDownload/internal/logger"
@@ -30,6 +31,9 @@ type App struct {
 	internalAPI        *api.InternalAPI
 	downloadManager    *downloader.DownloadManager
 	bilibiliDownloader *downloader.BilibiliDownloader
+	douyinParser       *douyin.Parser
+	douyinClient       *douyin.Client
+	douyinDownloader   *douyin.Downloader
 	trayManager        *tray.TrayManager
 	ffmpegManager      *ffmpeg.FFmpegManager
 	configManager      *config.ConfigManager
@@ -161,6 +165,11 @@ func (a *App) startup(ctx context.Context) {
 			log.Printf("Failed to load Bilibili SESSDATA: %v", err)
 		}
 	}
+
+	// Initialize Douyin downloader
+	a.douyinParser = douyin.NewParser()
+	a.douyinClient = douyin.NewClient()
+	a.douyinDownloader = douyin.NewDownloader()
 
 	// Initialize FFmpeg manager with embedded FFmpeg
 	a.ffmpegManager = ffmpeg.NewFFmpegManager()
@@ -656,6 +665,68 @@ func (a *App) SetBilibiliSessData(sessData string) error {
 func (a *App) GetBilibiliSessData() string {
 	sessData, _ := a.bilibiliDownloader.LoadSessData()
 	return sessData
+}
+
+// ==================== Douyin Methods ====================
+
+// GetDouyinVideoInfo fetches video or album info from Douyin share text
+func (a *App) GetDouyinVideoInfo(shareText string) (*douyin.DouyinItem, error) {
+	awemeID, err := a.douyinParser.Parse(shareText)
+	if err != nil {
+		return nil, err
+	}
+	return a.douyinClient.GetItemInfo(awemeID)
+}
+
+// DownloadDouyinVideo downloads a Douyin video or album
+func (a *App) DownloadDouyinVideo(shareText string, qualityKey string) (string, error) {
+	item, err := a.GetDouyinVideoInfo(shareText)
+	if err != nil {
+		return "", err
+	}
+
+	id := fmt.Sprintf("douyin_%s_%d", item.ID, time.Now().Unix())
+
+	douyinDownloadFunc := a.createDouyinDownloader(item, qualityKey)
+	task, err := a.downloadManager.AddTaskWithDownloader(id, shareText, item.Title, item.Cover, "douyin", qualityKey, douyinDownloadFunc)
+	if err != nil {
+		return "", err
+	}
+
+	// Update file extension for album type
+	if item.Type == "album" || len(item.Images) > 0 {
+		if task.FileName != "" {
+			ext := filepath.Ext(task.FileName)
+			base := task.FileName
+			if ext != "" {
+				base = task.FileName[:len(task.FileName)-len(ext)]
+			}
+			task.FileName = base + ".zip"
+			task.FilePath = filepath.Join(a.downloadDir, task.FileName)
+		}
+	}
+
+	if err := a.downloadManager.StartTask(id); err != nil {
+		return "", err
+	}
+
+	runtime.EventsEmit(a.ctx, "download:start", task.TaskToJSON())
+	return id, nil
+}
+
+func (a *App) createDouyinDownloader(item *douyin.DouyinItem, qualityKey string) downloader.DownloadFunc {
+	base := a.douyinDownloader.BuildDownloadFunc(item, qualityKey, a.downloadDir)
+	return func(ctx context.Context, task *downloader.DownloadTask, onProgress func(downloaded, total int64), onComplete func(outputPath string)) error {
+		return base(ctx, task, onProgress, func(outputPath string) {
+			if task != nil && outputPath != "" {
+				task.FilePath = outputPath
+				task.FileName = filepath.Base(outputPath)
+			}
+			if onComplete != nil {
+				onComplete(outputPath)
+			}
+		})
+	}
 }
 
 // IsFFmpegAvailable checks if ffmpeg is available and caches the path

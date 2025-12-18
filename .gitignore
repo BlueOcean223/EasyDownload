@@ -103,6 +103,7 @@ certs/
 # AI/IDE assistant folders
 .kiro/
 .cursor/
+.claude/
 .aider*
 
 # Reference folder (if you don't want to track it)

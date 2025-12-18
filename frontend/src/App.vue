@@ -14,7 +14,8 @@ import {
   CloudDownloadOutline,
   SettingsOutline,
   PlayOutline,
-  StopOutline
+  StopOutline,
+  LogoTiktok
 } from '@vicons/ionicons5'
 import { h } from 'vue'
 import WelcomeWizard from '@/components/WelcomeWizard.vue'
@@ -52,6 +53,11 @@ const menuOptions: MenuOption[] = [
     label: 'B站下载',
     key: 'Bilibili',
     icon: () => h(BilibiliIcon, { class: 'w-5 h-5' })
+  },
+  {
+    label: '抖音下载',
+    key: 'Douyin',
+    icon: () => h(LogoTiktok, { class: 'w-5 h-5' })
   },
   {
     label: '下载管理',

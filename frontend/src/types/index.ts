@@ -102,3 +102,34 @@ export interface AppStatus {
   ffmpegAvailable: boolean
 }
 
+// Douyin stream (field names match Go exported struct)
+export interface DouyinStream {
+  QualityKey: string
+  QualityName: string
+  Width: number
+  Height: number
+  Bitrate: number
+  URL: string
+  Size: number // File size in bytes (estimated via HEAD request)
+}
+
+// Douyin image (field names match Go exported struct)
+export interface DouyinImage {
+  URL: string
+  Width: number
+  Height: number
+}
+
+// Douyin item (video or album) (field names match Go exported struct)
+export interface DouyinItem {
+  Type: string // 'video' | 'album'
+  ID: string
+  Title: string
+  Cover: string
+  Author: string
+  AuthorID: string
+  Duration: number
+  Streams: DouyinStream[]
+  Images: DouyinImage[]
+}
+

@@ -18,6 +18,12 @@ const routes: RouteRecordRaw[] = [
     meta: { title: 'B站下载' }
   },
   {
+    path: '/douyin',
+    name: 'Douyin',
+    component: () => import('@/views/Douyin.vue'),
+    meta: { title: '抖音下载' }
+  },
+  {
     path: '/downloads',
     name: 'Downloads',
     component: () => import('@/views/Downloads.vue'),

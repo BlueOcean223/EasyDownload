@@ -18,6 +18,7 @@ import type { BilibiliVideo, BilibiliStream } from '@/types'
 import { GetBilibiliVideoInfo, DownloadBilibiliVideo, DownloadBilibiliPart } from '../../wailsjs/go/main/App'
 import PartSelector from '@/components/PartSelector.vue'
 import ProxiedImage from '@/components/ProxiedImage.vue'
+import BilibiliIcon from '@/components/BilibiliIcon.vue'
 
 const store = useAppStore()
 const message = useMessage()
@@ -144,7 +145,10 @@ function handleKeydown(e: KeyboardEvent) {
   <div class="bilibili-page h-full flex flex-col">
     <!-- Header -->
     <div class="header p-4 border-b border-border">
-      <h2 class="text-xl font-semibold mb-4">B站视频下载</h2>
+      <h2 class="text-xl font-semibold mb-4 flex items-center gap-2">
+        <BilibiliIcon class="w-6 h-6" />
+        B站视频下载
+      </h2>
       
       <!-- URL Input -->
       <div class="flex gap-3">
