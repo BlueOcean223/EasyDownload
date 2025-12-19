@@ -211,6 +211,131 @@ func (d *Downloader) downloadAlbumWithContext(ctx context.Context, item *DouyinI
 	return nil
 }
 
+// DownloadAlbumPartial downloads only the specified image indices (0-based) into a ZIP.
+func (d *Downloader) DownloadAlbumPartial(item *DouyinItem, indices []int, destPath string, progressFn func(float64)) error {
+	return d.DownloadAlbumPartialWithContext(context.Background(), item, indices, destPath, progressFn)
+}
+
+// DownloadAlbumPartialWithContext is the context-aware variant used by DownloadManager for cancellation.
+func (d *Downloader) DownloadAlbumPartialWithContext(ctx context.Context, item *DouyinItem, indices []int, destPath string, progressFn func(float64)) error {
+	if item == nil {
+		return fmt.Errorf("nil douyin item")
+	}
+	if len(item.Images) == 0 {
+		return ErrNoImages
+	}
+	if destPath == "" {
+		return fmt.Errorf("empty dest path")
+	}
+	if len(indices) == 0 {
+		return fmt.Errorf("empty indices")
+	}
+
+	normalized := make([]int, 0, len(indices))
+	seen := make(map[int]struct{}, len(indices))
+	for _, idx := range indices {
+		if idx < 0 || idx >= len(item.Images) {
+			return fmt.Errorf("index out of range: %d", idx)
+		}
+		if _, ok := seen[idx]; ok {
+			continue
+		}
+		seen[idx] = struct{}{}
+		normalized = append(normalized, idx)
+	}
+	if len(normalized) == 0 {
+		return fmt.Errorf("empty indices")
+	}
+
+	client := d.getHTTPClient()
+	if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+		return err
+	}
+
+	type imgResult struct {
+		index int
+		name  string
+		data  []byte
+	}
+
+	results := make([]imgResult, len(normalized))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, albumConcurrency)
+	var firstErr error
+	var mu sync.Mutex
+	var downloadedCount int64
+
+	for pos, idx := range normalized {
+		pos := pos
+		idx := idx
+		img := item.Images[idx]
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			data, err := d.downloadImageWithRetry(ctx, client, img.URL)
+			if err != nil {
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = err
+				}
+				mu.Unlock()
+				return
+			}
+
+			results[pos] = imgResult{
+				index: idx,
+				name:  imageFileName(idx, img.URL),
+				data:  data,
+			}
+
+			mu.Lock()
+			downloadedCount++
+			if progressFn != nil {
+				progressFn(float64(downloadedCount) / float64(len(normalized)) * 100)
+			}
+			mu.Unlock()
+		}()
+	}
+
+	wg.Wait()
+	if firstErr != nil {
+		return firstErr
+	}
+
+	outFile, err := os.Create(destPath)
+	if err != nil {
+		return err
+	}
+	defer outFile.Close()
+
+	zw := zip.NewWriter(outFile)
+	for _, res := range results {
+		if res.data == nil {
+			return fmt.Errorf("missing data for image %d", res.index)
+		}
+		writer, err := zw.Create(res.name)
+		if err != nil {
+			return err
+		}
+		if _, err := writer.Write(res.data); err != nil {
+			return err
+		}
+	}
+	if err := zw.Close(); err != nil {
+		return err
+	}
+
+	if progressFn != nil {
+		progressFn(100)
+	}
+
+	return nil
+}
+
 func (d *Downloader) BuildDownloadFunc(item *DouyinItem, qualityKey string, outputDir string) downloader.DownloadFunc {
 	return func(ctx context.Context, task *downloader.DownloadTask, onProgress func(downloaded, total int64), onComplete func(outputPath string)) error {
 		isAlbum := strings.ToLower(strings.TrimSpace(item.Type)) == "album" || len(item.Images) > 0

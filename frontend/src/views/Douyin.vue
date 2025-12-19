@@ -9,17 +9,21 @@ import {
   PersonOutline,
   PlayCircleOutline,
   SearchOutline,
-  TimeOutline
+  TimeOutline,
+  ListOutline
 } from '@vicons/ionicons5'
 import type { DouyinItem } from '@/types'
-import { GetDouyinVideoInfo, DownloadDouyinVideo } from '../../wailsjs/go/main/App'
+import { GetDouyinVideoInfo, DownloadDouyinVideo, DownloadDouyinAlbumPartial } from '../../wailsjs/go/main/App'
 import ProxiedImage from '@/components/ProxiedImage.vue'
+import ImageSelector from '@/components/ImageSelector.vue'
 
 const message = useMessage()
 
 const url = ref('')
 const loading = ref(false)
 const downloading = ref(false)
+const downloadingPartial = ref(false)
+const showImageSelector = ref(false)
 const douyinItem = ref<DouyinItem | null>(null)
 const selectedQuality = ref<string | null>(null)
 const error = ref('')
@@ -106,6 +110,19 @@ async function downloadDouyin() {
     message.error(e.message || '下载失败')
   } finally {
     downloading.value = false
+  }
+}
+
+async function downloadPartialAlbum(indices: number[]) {
+  if (!douyinItem.value || indices.length === 0) return
+  downloadingPartial.value = true
+  try {
+    await DownloadDouyinAlbumPartial(url.value, indices)
+    message.success('已添加到下载队列')
+  } catch (e: any) {
+    message.error(e.message || '下载失败')
+  } finally {
+    downloadingPartial.value = false
   }
 }
 
@@ -243,12 +260,27 @@ function handleKeydown(e: KeyboardEvent) {
                   将下载为 ZIP 压缩包
                 </div>
 
-                <NButton type="primary" :loading="downloading" :disabled="!canDownload" @click="downloadDouyin">
-                  <template #icon>
-                    <CloudDownloadOutline class="w-4 h-4" />
-                  </template>
-                  {{ isVideo ? '下载视频' : '下载图集' }}
-                </NButton>
+                <div class="flex gap-2">
+                  <NButton 
+                    v-if="isAlbum"
+                    secondary
+                    :loading="downloadingPartial"
+                    :disabled="!canDownload"
+                    @click="showImageSelector = true"
+                  >
+                    <template #icon>
+                      <ListOutline class="w-4 h-4" />
+                    </template>
+                    选择部分
+                  </NButton>
+
+                  <NButton type="primary" :loading="downloading" :disabled="!canDownload" @click="downloadDouyin">
+                    <template #icon>
+                      <CloudDownloadOutline class="w-4 h-4" />
+                    </template>
+                    {{ isVideo ? '下载视频' : '下载图集' }}
+                  </NButton>
+                </div>
               </div>
             </div>
           </div>
@@ -269,6 +301,13 @@ function handleKeydown(e: KeyboardEvent) {
             </div>
           </div>
         </div>
+
+        <ImageSelector
+          v-model:show="showImageSelector"
+          :images="douyinItem?.Images || []"
+          :title="douyinItem?.Title || '选择图片'"
+          @select="downloadPartialAlbum"
+        />
       </div>
     </div>
   </div>

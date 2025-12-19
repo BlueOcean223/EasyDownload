@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -470,5 +471,404 @@ func TestDownloadVideoUnexpectedStatus(t *testing.T) {
 	err := dl.DownloadVideo(item, "any", filepath.Join(t.TempDir(), "video.mp4"), nil)
 	if err == nil {
 		t.Fatal("expected error for 500 status")
+	}
+}
+
+// ==================== DownloadAlbumPartial Tests ====================
+
+func TestDownloadAlbumPartial_Success(t *testing.T) {
+	runPartialVariants(t, func(t *testing.T, withCtx bool) {
+		indices := []int{0, 2, 4}
+
+		bodies := map[string]string{
+			"/img1.jpg": "one",
+			"/img2.jpg": "two",
+			"/img3.jpg": "three",
+			"/img4.jpg": "four",
+			"/img5.jpg": "five",
+		}
+
+		ts, state := newAlbumImageServer(t, bodies)
+		defer ts.Close()
+
+		item := &DouyinItem{
+			Type: "album",
+			Images: []Image{
+				{URL: ts.URL + "/img1.jpg"},
+				{URL: ts.URL + "/img2.jpg"},
+				{URL: ts.URL + "/img3.jpg"},
+				{URL: ts.URL + "/img4.jpg"},
+				{URL: ts.URL + "/img5.jpg"},
+			},
+		}
+
+		dl := NewDownloader()
+		dl.httpClient = ts.Client()
+
+		dest := filepath.Join(t.TempDir(), "album_partial.zip")
+		var progress []float64
+		err := downloadAlbumPartialVariant(dl, item, indices, dest, func(p float64) {
+			progress = append(progress, p)
+		}, withCtx)
+		if err != nil {
+			t.Fatalf("download error: %v", err)
+		}
+
+		if len(progress) == 0 || progress[len(progress)-1] < 99 {
+			t.Fatalf("progress not completed: %v", progress)
+		}
+
+		zipFiles := readZipFiles(t, dest)
+		if len(zipFiles) != 3 {
+			t.Fatalf("expected 3 zip entries, got %d", len(zipFiles))
+		}
+
+		var names []string
+		for name := range zipFiles {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+
+		expectedNames := []string{
+			imageFileName(0, item.Images[0].URL),
+			imageFileName(2, item.Images[2].URL),
+			imageFileName(4, item.Images[4].URL),
+		}
+		sort.Strings(expectedNames)
+
+		if !equalStrings(names, expectedNames) {
+			t.Fatalf("unexpected zip names: %v", names)
+		}
+
+		state.mu.Lock()
+		defer state.mu.Unlock()
+
+		if len(state.badReferers) > 0 {
+			t.Fatalf("unexpected referer(s): %v", state.badReferers)
+		}
+		if state.hits["/img1.jpg"] != 1 || state.hits["/img3.jpg"] != 1 || state.hits["/img5.jpg"] != 1 {
+			t.Fatalf("unexpected hit counts: %v", state.hits)
+		}
+		if state.hits["/img2.jpg"] != 0 || state.hits["/img4.jpg"] != 0 {
+			t.Fatalf("unexpected extra downloads: %v", state.hits)
+		}
+	})
+}
+
+func TestDownloadAlbumPartial_EmptyIndices(t *testing.T) {
+	runPartialVariants(t, func(t *testing.T, withCtx bool) {
+		bodies := map[string]string{"/img1.jpg": "one"}
+		ts, state := newAlbumImageServer(t, bodies)
+		defer ts.Close()
+
+		item := &DouyinItem{
+			Type:   "album",
+			Images: []Image{{URL: ts.URL + "/img1.jpg"}},
+		}
+
+		dl := NewDownloader()
+		dl.httpClient = ts.Client()
+
+		dest := filepath.Join(t.TempDir(), "album_partial.zip")
+		err := downloadAlbumPartialVariant(dl, item, []int{}, dest, nil, withCtx)
+		if err == nil || !strings.Contains(err.Error(), "empty indices") {
+			t.Fatalf("expected empty indices error, got %v", err)
+		}
+
+		state.mu.Lock()
+		defer state.mu.Unlock()
+		if len(state.hits) != 0 {
+			t.Fatalf("expected no http calls, got %v", state.hits)
+		}
+	})
+}
+
+func TestDownloadAlbumPartial_IndexOutOfRange(t *testing.T) {
+	runPartialVariants(t, func(t *testing.T, withCtx bool) {
+		bodies := map[string]string{
+			"/img1.jpg": "one",
+			"/img2.jpg": "two",
+		}
+		ts, state := newAlbumImageServer(t, bodies)
+		defer ts.Close()
+
+		item := &DouyinItem{
+			Type: "album",
+			Images: []Image{
+				{URL: ts.URL + "/img1.jpg"},
+				{URL: ts.URL + "/img2.jpg"},
+			},
+		}
+
+		dl := NewDownloader()
+		dl.httpClient = ts.Client()
+
+		dest := filepath.Join(t.TempDir(), "album_partial.zip")
+		err := downloadAlbumPartialVariant(dl, item, []int{2}, dest, nil, withCtx)
+		if err == nil || !strings.Contains(err.Error(), "index out of range") {
+			t.Fatalf("expected out of range error, got %v", err)
+		}
+
+		state.mu.Lock()
+		defer state.mu.Unlock()
+		if len(state.hits) != 0 {
+			t.Fatalf("expected no http calls, got %v", state.hits)
+		}
+	})
+}
+
+func TestDownloadAlbumPartial_SingleImage(t *testing.T) {
+	runPartialVariants(t, func(t *testing.T, withCtx bool) {
+		bodies := map[string]string{
+			"/img1.jpg": "one",
+			"/img2.jpg": "two",
+			"/img3.jpg": "three",
+		}
+		ts, state := newAlbumImageServer(t, bodies)
+		defer ts.Close()
+
+		item := &DouyinItem{
+			Type: "album",
+			Images: []Image{
+				{URL: ts.URL + "/img1.jpg"},
+				{URL: ts.URL + "/img2.jpg"},
+				{URL: ts.URL + "/img3.jpg"},
+			},
+		}
+
+		dl := NewDownloader()
+		dl.httpClient = ts.Client()
+
+		dest := filepath.Join(t.TempDir(), "album_partial.zip")
+		err := downloadAlbumPartialVariant(dl, item, []int{0}, dest, nil, withCtx)
+		if err != nil {
+			t.Fatalf("download error: %v", err)
+		}
+
+		zipFiles := readZipFiles(t, dest)
+		if len(zipFiles) != 1 {
+			t.Fatalf("expected 1 zip entry, got %d", len(zipFiles))
+		}
+		name := imageFileName(0, item.Images[0].URL)
+		if !bytes.Equal(zipFiles[name], []byte(bodies["/img1.jpg"])) {
+			t.Fatalf("unexpected content for %s", name)
+		}
+
+		state.mu.Lock()
+		defer state.mu.Unlock()
+		if state.hits["/img1.jpg"] != 1 || state.hits["/img2.jpg"] != 0 || state.hits["/img3.jpg"] != 0 {
+			t.Fatalf("unexpected hit counts: %v", state.hits)
+		}
+	})
+}
+
+func TestDownloadAlbumPartial_NilItem(t *testing.T) {
+	runPartialVariants(t, func(t *testing.T, withCtx bool) {
+		dl := NewDownloader()
+		dest := filepath.Join(t.TempDir(), "album_partial.zip")
+
+		err := downloadAlbumPartialVariant(dl, nil, []int{0}, dest, nil, withCtx)
+		if err == nil {
+			t.Fatal("expected error for nil item")
+		}
+	})
+}
+
+func TestDownloadAlbumPartial_DuplicateIndices(t *testing.T) {
+	runPartialVariants(t, func(t *testing.T, withCtx bool) {
+		bodies := map[string]string{
+			"/img1.jpg": "one",
+			"/img2.jpg": "two",
+			"/img3.jpg": "three",
+		}
+		ts, state := newAlbumImageServer(t, bodies)
+		defer ts.Close()
+
+		item := &DouyinItem{
+			Type: "album",
+			Images: []Image{
+				{URL: ts.URL + "/img1.jpg"},
+				{URL: ts.URL + "/img2.jpg"},
+				{URL: ts.URL + "/img3.jpg"},
+			},
+		}
+
+		dl := NewDownloader()
+		dl.httpClient = ts.Client()
+
+		dest := filepath.Join(t.TempDir(), "album_partial.zip")
+		err := downloadAlbumPartialVariant(dl, item, []int{0, 0, 1}, dest, nil, withCtx)
+		if err != nil {
+			t.Fatalf("download error: %v", err)
+		}
+
+		zipFiles := readZipFiles(t, dest)
+		if len(zipFiles) != 2 {
+			t.Fatalf("expected 2 zip entries, got %d", len(zipFiles))
+		}
+
+		expectedNames := []string{
+			imageFileName(0, item.Images[0].URL),
+			imageFileName(1, item.Images[1].URL),
+		}
+		sort.Strings(expectedNames)
+
+		var names []string
+		for name := range zipFiles {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+
+		if !equalStrings(names, expectedNames) {
+			t.Fatalf("unexpected zip names: %v", names)
+		}
+
+		state.mu.Lock()
+		defer state.mu.Unlock()
+		if state.hits["/img1.jpg"] != 1 || state.hits["/img2.jpg"] != 1 || state.hits["/img3.jpg"] != 0 {
+			t.Fatalf("unexpected hit counts: %v", state.hits)
+		}
+	})
+}
+
+type albumServerState struct {
+	mu          sync.Mutex
+	hits        map[string]int
+	badReferers []string
+}
+
+func runPartialVariants(t *testing.T, fn func(t *testing.T, withCtx bool)) {
+	t.Helper()
+
+	t.Run("DownloadAlbumPartial", func(t *testing.T) {
+		fn(t, false)
+	})
+	t.Run("DownloadAlbumPartialWithContext", func(t *testing.T) {
+		fn(t, true)
+	})
+}
+
+func downloadAlbumPartialVariant(dl *Downloader, item *DouyinItem, indices []int, dest string, progressFn func(float64), withCtx bool) error {
+	if withCtx {
+		return dl.DownloadAlbumPartialWithContext(context.Background(), item, indices, dest, progressFn)
+	}
+	return dl.DownloadAlbumPartial(item, indices, dest, progressFn)
+}
+
+func newAlbumImageServer(t *testing.T, bodies map[string]string) (*httptest.Server, *albumServerState) {
+	t.Helper()
+
+	state := &albumServerState{
+		hits: make(map[string]int),
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		state.mu.Lock()
+		state.hits[r.URL.Path]++
+		if got := r.Header.Get("Referer"); got != defaultReferer {
+			state.badReferers = append(state.badReferers, got)
+		}
+		state.mu.Unlock()
+
+		body, ok := bodies[r.URL.Path]
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_, _ = w.Write([]byte(body))
+	}))
+
+	return ts, state
+}
+
+func readZipFiles(t *testing.T, zipPath string) map[string][]byte {
+	t.Helper()
+
+	zr, err := zip.OpenReader(zipPath)
+	if err != nil {
+		t.Fatalf("open zip: %v", err)
+	}
+	defer zr.Close()
+
+	out := make(map[string][]byte, len(zr.File))
+	for _, f := range zr.File {
+		rc, err := f.Open()
+		if err != nil {
+			t.Fatalf("open zip entry %s: %v", f.Name, err)
+		}
+		data, readErr := io.ReadAll(rc)
+		_ = rc.Close()
+		if readErr != nil {
+			t.Fatalf("read zip entry %s: %v", f.Name, readErr)
+		}
+		out[f.Name] = data
+	}
+	return out
+}
+
+func TestDownloadAlbumPartial_EmptyDestPath(t *testing.T) {
+	dl := NewDownloader()
+	item := &DouyinItem{
+		Type:   "album",
+		Images: []Image{{URL: "http://example.com/img.jpg"}},
+	}
+	err := dl.DownloadAlbumPartial(item, []int{0}, "", nil)
+	if err == nil || !strings.Contains(err.Error(), "empty dest path") {
+		t.Fatalf("expected empty dest path error, got %v", err)
+	}
+}
+
+func TestDownloadAlbumPartial_NoImages(t *testing.T) {
+	dl := NewDownloader()
+	item := &DouyinItem{Type: "album", Images: []Image{}}
+	err := dl.DownloadAlbumPartial(item, []int{0}, "/tmp/test.zip", nil)
+	if !errors.Is(err, ErrNoImages) {
+		t.Fatalf("expected ErrNoImages, got %v", err)
+	}
+}
+
+func TestDownloadAlbumPartial_NegativeIndex(t *testing.T) {
+	dl := NewDownloader()
+	item := &DouyinItem{
+		Type:   "album",
+		Images: []Image{{URL: "http://example.com/img.jpg"}},
+	}
+	err := dl.DownloadAlbumPartial(item, []int{-1}, "/tmp/test.zip", nil)
+	if err == nil || !strings.Contains(err.Error(), "index out of range") {
+		t.Fatalf("expected index out of range error, got %v", err)
+	}
+}
+
+func TestEffectiveHeadersCustom(t *testing.T) {
+	dl := &Downloader{
+		userAgent: "CustomUA",
+		referer:   "https://custom.com/",
+	}
+	headers := dl.effectiveHeaders()
+	if headers["User-Agent"] != "CustomUA" {
+		t.Fatalf("expected custom UA, got %s", headers["User-Agent"])
+	}
+	if headers["Referer"] != "https://custom.com/" {
+		t.Fatalf("expected custom referer, got %s", headers["Referer"])
+	}
+}
+
+func TestParseContentRangeTotal(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected int64
+	}{
+		{"bytes 0-99/1000", 1000},
+		{"bytes 0-99/*", 0},
+		{"", 0},
+		{"invalid", 0},
+		{"bytes 0-99/abc", 0},
+		{"bytes 0-99/-1", 0},
+	}
+	for _, tc := range tests {
+		got := parseContentRangeTotal(tc.input)
+		if got != tc.expected {
+			t.Errorf("parseContentRangeTotal(%q) = %d, want %d", tc.input, got, tc.expected)
+		}
 	}
 }

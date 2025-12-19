@@ -803,6 +803,119 @@ func (a *App) createDouyinDownloader(item *douyin.DouyinItem, qualityKey string)
 	}
 }
 
+// DownloadDouyinAlbumPartial downloads a subset of album images (0-based indices) into a ZIP.
+func (a *App) DownloadDouyinAlbumPartial(shareText string, indices []int) (string, error) {
+	item, err := a.GetDouyinVideoInfo(shareText)
+	if err != nil {
+		return "", err
+	}
+	if item == nil {
+		return "", fmt.Errorf("nil douyin item")
+	}
+	if len(indices) == 0 {
+		return "", fmt.Errorf("empty indices")
+	}
+	if len(item.Images) == 0 {
+		return "", douyin.ErrNoImages
+	}
+
+	seen := make(map[int]struct{}, len(indices))
+	unique := make([]int, 0, len(indices))
+	for _, idx := range indices {
+		if idx < 0 || idx >= len(item.Images) {
+			return "", fmt.Errorf("index out of range: %d", idx)
+		}
+		if _, ok := seen[idx]; ok {
+			continue
+		}
+		seen[idx] = struct{}{}
+		unique = append(unique, idx)
+	}
+	if len(unique) == 0 {
+		return "", fmt.Errorf("empty indices")
+	}
+
+	id := fmt.Sprintf("douyin_%s_partial_%d", item.ID, time.Now().Unix())
+
+	douyinDownloadFunc := a.createDouyinAlbumPartialDownloader(item, unique)
+	task, err := a.downloadManager.AddTaskWithDownloader(id, shareText, item.Title, item.Cover, "douyin", "partial", douyinDownloadFunc)
+	if err != nil {
+		return "", err
+	}
+
+	// Force ZIP output
+	if task.FileName != "" {
+		ext := filepath.Ext(task.FileName)
+		base := task.FileName
+		if ext != "" {
+			base = task.FileName[:len(task.FileName)-len(ext)]
+		}
+		task.FileName = base + ".zip"
+		task.FilePath = filepath.Join(a.downloadDir, task.FileName)
+	}
+
+	if err := a.downloadManager.StartTask(id); err != nil {
+		return "", err
+	}
+
+	runtime.EventsEmit(a.ctx, "download:start", task.TaskToJSON())
+	return id, nil
+}
+
+func (a *App) createDouyinAlbumPartialDownloader(item *douyin.DouyinItem, indices []int) downloader.DownloadFunc {
+	indicesCopy := append([]int(nil), indices...)
+	return func(ctx context.Context, task *downloader.DownloadTask, onProgress func(downloaded, total int64), onComplete func(outputPath string)) error {
+		if item == nil {
+			return fmt.Errorf("nil douyin item")
+		}
+
+		destPath := filepath.Join(a.downloadDir, fmt.Sprintf("%s.zip", item.ID))
+		if task != nil && task.FilePath != "" {
+			destPath = task.FilePath
+			ext := filepath.Ext(destPath)
+			if ext == "" {
+				destPath = destPath + ".zip"
+			} else if ext != ".zip" {
+				destPath = destPath[:len(destPath)-len(ext)] + ".zip"
+			}
+		}
+
+		total := int64(len(indicesCopy))
+		if onProgress != nil && total > 0 {
+			onProgress(0, total)
+		}
+
+		var lastDownloaded int64
+		progressCallback := func(p float64) {
+			if onProgress == nil || total <= 0 {
+				return
+			}
+			downloaded := int64(p/100*float64(total) + 0.5)
+			if downloaded < lastDownloaded {
+				downloaded = lastDownloaded
+			}
+			if downloaded > total {
+				downloaded = total
+			}
+			lastDownloaded = downloaded
+			onProgress(downloaded, total)
+		}
+
+		if err := a.douyinDownloader.DownloadAlbumPartialWithContext(ctx, item, indicesCopy, destPath, progressCallback); err != nil {
+			return err
+		}
+
+		if task != nil && destPath != "" {
+			task.FilePath = destPath
+			task.FileName = filepath.Base(destPath)
+		}
+		if onComplete != nil {
+			onComplete(destPath)
+		}
+		return nil
+	}
+}
+
 // IsFFmpegAvailable checks if ffmpeg is available and caches the path
 func (a *App) IsFFmpegAvailable() bool {
 	available := a.bilibiliDownloader.IsFFmpegAvailable()

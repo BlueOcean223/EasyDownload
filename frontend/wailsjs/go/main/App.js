@@ -22,6 +22,10 @@ export function DownloadBilibiliVideo(arg1, arg2) {
   return window['go']['main']['App']['DownloadBilibiliVideo'](arg1, arg2);
 }
 
+export function DownloadDouyinAlbumPartial(arg1, arg2) {
+  return window['go']['main']['App']['DownloadDouyinAlbumPartial'](arg1, arg2);
+}
+
 export function DownloadDouyinVideo(arg1, arg2) {
   return window['go']['main']['App']['DownloadDouyinVideo'](arg1, arg2);
 }

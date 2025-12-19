@@ -14,6 +14,8 @@ export function DownloadBilibiliPart(arg1:string,arg2:number,arg3:number):Promis
 
 export function DownloadBilibiliVideo(arg1:string,arg2:number):Promise<string>;
 
+export function DownloadDouyinAlbumPartial(arg1:string,arg2:Array<number>):Promise<string>;
+
 export function DownloadDouyinVideo(arg1:string,arg2:string):Promise<string>;
 
 export function DownloadVideo(arg1:string,arg2:string,arg3:string,arg4:string,arg5:string,arg6:string):Promise<Record<string, any>>;
