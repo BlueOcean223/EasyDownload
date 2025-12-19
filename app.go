@@ -1160,3 +1160,10 @@ func (a *App) SetProxyDebug(enabled bool) {
 		_ = a.configManager.Set("proxyDebug", enabled)
 	}
 }
+
+// ==================== Frontend Logging ====================
+
+// LogFrontend logs a message from the frontend to the persistent log file
+func (a *App) LogFrontend(message string) {
+	logger.Info("[Frontend] %s", message)
+}

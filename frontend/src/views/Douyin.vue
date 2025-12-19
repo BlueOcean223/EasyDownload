@@ -16,6 +16,8 @@ import type { DouyinItem } from '@/types'
 import { GetDouyinVideoInfo, DownloadDouyinVideo, DownloadDouyinAlbumPartial } from '../../wailsjs/go/main/App'
 import ProxiedImage from '@/components/ProxiedImage.vue'
 import ImageSelector from '@/components/ImageSelector.vue'
+import ImagePreviewModal from '@/components/ImagePreviewModal.vue'
+import LazyImageGrid from '@/components/LazyImageGrid.vue'
 
 const message = useMessage()
 
@@ -24,6 +26,8 @@ const loading = ref(false)
 const downloading = ref(false)
 const downloadingPartial = ref(false)
 const showImageSelector = ref(false)
+const showPreview = ref(false)
+const previewStartIndex = ref(0)
 const douyinItem = ref<DouyinItem | null>(null)
 const selectedQuality = ref<string | null>(null)
 const error = ref('')
@@ -124,6 +128,11 @@ async function downloadPartialAlbum(indices: number[]) {
   } finally {
     downloadingPartial.value = false
   }
+}
+
+function openPreview(index: number) {
+  previewStartIndex.value = index
+  showPreview.value = true
 }
 
 function handleKeydown(e: KeyboardEvent) {
@@ -288,18 +297,10 @@ function handleKeydown(e: KeyboardEvent) {
 
         <div v-if="isAlbum && douyinItem.Images.length > 0" class="mt-6">
           <h4 class="text-lg font-semibold mb-3">图片预览 ({{ douyinItem.Images.length }})</h4>
-          <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-4">
-            <div
-              v-for="(img, index) in douyinItem.Images"
-              :key="index"
-              class="aspect-[3/4] bg-secondary rounded-lg overflow-hidden"
-            >
-              <ProxiedImage
-                :src="img.URL"
-                class="w-full h-full object-cover hover:opacity-90 transition-opacity cursor-pointer"
-              />
-            </div>
-          </div>
+          <LazyImageGrid
+            :images="douyinItem.Images"
+            @click="openPreview"
+          />
         </div>
 
         <ImageSelector
@@ -307,6 +308,12 @@ function handleKeydown(e: KeyboardEvent) {
           :images="douyinItem?.Images || []"
           :title="douyinItem?.Title || '选择图片'"
           @select="downloadPartialAlbum"
+        />
+
+        <ImagePreviewModal
+          v-model:show="showPreview"
+          :images="douyinItem?.Images || []"
+          :start-index="previewStartIndex"
         />
       </div>
     </div>

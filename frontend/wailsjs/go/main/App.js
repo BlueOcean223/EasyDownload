@@ -138,6 +138,10 @@ export function IsUseUpstreamProxy() {
   return window['go']['main']['App']['IsUseUpstreamProxy']();
 }
 
+export function LogFrontend(arg1) {
+  return window['go']['main']['App']['LogFrontend'](arg1);
+}
+
 export function MinimizeToTray() {
   return window['go']['main']['App']['MinimizeToTray']();
 }

@@ -72,6 +72,8 @@ export function IsShowNotificationEnabled():Promise<boolean>;
 
 export function IsUseUpstreamProxy():Promise<boolean>;
 
+export function LogFrontend(arg1:string):Promise<void>;
+
 export function MinimizeToTray():Promise<void>;
 
 export function OpenDownloadDir():Promise<void>;
