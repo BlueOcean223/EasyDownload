@@ -150,7 +150,7 @@ func (md *MultipartDownloader) CheckRangeSupport(ctx context.Context, url string
 	if probeErr != nil {
 		// If range probe fails, fall back to what we learned from HEAD.
 		if headStatus == http.StatusOK && headContentLength > 0 {
-			logger.Info("Range check fallback to HEAD: status=%d acceptRanges=%q len=%d err=%v", headStatus, headAcceptRanges, headContentLength, probeErr)
+			logger.Debug("Range check fallback to HEAD: status=%d acceptRanges=%q len=%d err=%v", headStatus, headAcceptRanges, headContentLength, probeErr)
 			return RangeCheckResult{SupportsRange: headSupportsRange, ContentLength: headContentLength, Error: nil}
 		}
 		return RangeCheckResult{Error: probeErr}
@@ -163,8 +163,7 @@ func (md *MultipartDownloader) CheckRangeSupport(ctx context.Context, url string
 		finalLen = headContentLength
 	}
 
-	// Keep this as INFO: it explains 0MB/partial download issues in the field.
-	logger.Info("Range check: head(status=%d acceptRanges=%q len=%d) probe(supports=%v total=%d) -> supports=%v total=%d",
+	logger.Debug("Range check: head(status=%d acceptRanges=%q len=%d) probe(supports=%v total=%d) -> supports=%v total=%d",
 		headStatus, headAcceptRanges, headContentLength,
 		supportsRange, total,
 		finalSupports, finalLen,

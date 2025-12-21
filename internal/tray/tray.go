@@ -1,7 +1,7 @@
 package tray
 
 import (
-	"log"
+	"EasyDownload/internal/logger"
 	"sync"
 
 	"github.com/getlantern/systray"
@@ -95,7 +95,7 @@ func (tm *TrayManager) Start() {
 	tm.running = true
 	tm.mu.Unlock()
 
-	log.Println("Starting system tray...")
+	logger.Debug("Starting system tray...")
 	systray.Run(tm.onReady, tm.onQuit)
 }
 
@@ -118,7 +118,7 @@ func (tm *TrayManager) Stop() {
 
 // onReady is called when the systray is ready
 func (tm *TrayManager) onReady() {
-	log.Println("System tray ready, initializing menu...")
+	logger.Debug("System tray ready, initializing menu...")
 
 	tm.mu.Lock()
 	icon := tm.icon
@@ -129,9 +129,9 @@ func (tm *TrayManager) onReady() {
 	// Set initial icon and tooltip
 	if len(icon) > 0 {
 		systray.SetIcon(icon)
-		log.Printf("Tray icon set, size: %d bytes", len(icon))
+		logger.Debug("Tray icon set, size: %d bytes", len(icon))
 	} else {
-		log.Println("Warning: No tray icon provided")
+		logger.Warn("No tray icon provided")
 	}
 	systray.SetTitle("")
 	systray.SetTooltip(tooltip)
@@ -142,7 +142,7 @@ func (tm *TrayManager) onReady() {
 	systray.AddSeparator()
 	tm.mQuit = systray.AddMenuItem("❌ 退出", "退出应用程序")
 
-	log.Println("Tray menu created successfully")
+	logger.Debug("Tray menu created successfully")
 
 	// Handle menu clicks
 	go tm.handleMenuClicks()
@@ -154,7 +154,7 @@ func (tm *TrayManager) onQuit() {
 	tm.running = false
 	tm.ready = false
 	tm.mu.Unlock()
-	log.Println("System tray stopped")
+	logger.Debug("System tray stopped")
 }
 
 // handleMenuClicks handles menu item clicks
@@ -162,13 +162,13 @@ func (tm *TrayManager) handleMenuClicks() {
 	for {
 		select {
 		case <-tm.mShow.ClickedCh:
-			log.Println("Tray menu: Show window clicked")
+			logger.Debug("Tray menu: Show window clicked")
 			tm.showWindow()
 		case <-tm.mSetting.ClickedCh:
-			log.Println("Tray menu: Settings clicked")
+			logger.Debug("Tray menu: Settings clicked")
 			tm.openSetting()
 		case <-tm.mQuit.ClickedCh:
-			log.Println("Tray menu: Quit clicked")
+			logger.Debug("Tray menu: Quit clicked")
 			tm.quit()
 			return
 		}

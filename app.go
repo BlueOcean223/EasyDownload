@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
 	"path/filepath"
 	"time"
 
@@ -86,7 +85,7 @@ func (a *App) startup(ctx context.Context) {
 	cfgPath := filepath.Join(utils.GetAppDataDir(), "config.json")
 	a.configManager = config.NewConfigManager(cfgPath)
 	if err := a.configManager.Load(); err != nil {
-		log.Printf("Failed to load config: %v", err)
+		logger.Error("Failed to load config: %v", err)
 	}
 	if a.configManager != nil {
 		cfg := a.configManager.Get()
@@ -114,6 +113,10 @@ func (a *App) startup(ctx context.Context) {
 			a.useUpstreamProxy = cfg.UseUpstreamProxy
 			a.proxyDebug = cfg.ProxyDebug
 		}
+	}
+
+	if a.proxyDebug {
+		logger.GetGlobalLogger().SetLevel(logger.LevelDebug)
 	}
 
 	// Initialize certificate manager
@@ -161,9 +164,7 @@ func (a *App) startup(ctx context.Context) {
 	if a.configManager != nil {
 		a.bilibiliDownloader.SetConfigManager(a.configManager)
 		// Load persisted SESSDATA
-		if _, err := a.bilibiliDownloader.LoadSessData(); err != nil {
-			log.Printf("Failed to load Bilibili SESSDATA: %v", err)
-		}
+		_, _ = a.bilibiliDownloader.LoadSessData()
 	}
 
 	// Initialize Douyin downloader
@@ -183,9 +184,9 @@ func (a *App) startup(ctx context.Context) {
 	if assets.HasEmbeddedFFmpeg() {
 		ffmpeg.SetEmbeddedFS(assets.FFmpegFS)
 		if err := a.ffmpegManager.ExtractEmbedded(); err != nil {
-			log.Printf("Failed to extract embedded FFmpeg: %v", err)
+			logger.Error("Failed to extract embedded FFmpeg: %v", err)
 		} else {
-			log.Printf("FFmpeg ready at: %s", a.ffmpegManager.GetPath())
+			logger.Debug("FFmpeg ready at: %s", a.ffmpegManager.GetPath())
 			runtime.EventsEmit(a.ctx, "ffmpeg:ready", true)
 		}
 	}
@@ -193,7 +194,7 @@ func (a *App) startup(ctx context.Context) {
 	// Even if embedded FFmpeg is not available, check if FFmpeg already exists
 	// This ensures detection works when FFmpeg was previously extracted
 	if ffmpegPath := a.ffmpegManager.GetPath(); ffmpegPath != "" {
-		log.Printf("FFmpeg detected at: %s", ffmpegPath)
+		logger.Debug("FFmpeg detected at: %s", ffmpegPath)
 		// Cache to config for faster startup next time
 		if a.configManager != nil {
 			_ = a.configManager.Set("ffmpegPath", ffmpegPath)
@@ -285,13 +286,13 @@ func (a *App) startup(ctx context.Context) {
 
 	// Start internal API server
 	if err := a.internalAPI.Start(); err != nil {
-		log.Printf("Failed to start internal API: %v", err)
+		logger.Error("Failed to start internal API: %v", err)
 	}
 
 	// Initialize and start system tray
 	a.initTray()
 
-	log.Println("App started successfully")
+	logger.Debug("App started successfully")
 }
 
 // initTray initializes the system tray
@@ -342,7 +343,7 @@ func (a *App) shutdown(ctx context.Context) {
 		a.internalAPI.Stop()
 	}
 
-	log.Println("App shutdown complete")
+	logger.Debug("App shutdown complete")
 }
 
 // ==================== Proxy Methods ====================
@@ -372,7 +373,7 @@ func (a *App) StartProxy() error {
 func (a *App) StopProxy() error {
 	// Disable system proxy first
 	if err := a.systemProxy.Disable(); err != nil {
-		log.Printf("Failed to disable system proxy: %v", err)
+		logger.Warn("Failed to disable system proxy: %v", err)
 	}
 
 	err := a.proxyServer.Stop()
@@ -406,7 +407,7 @@ func (a *App) IsCertInstalled() bool {
 func (a *App) InstallCert() error {
 	// Generate CA certificate if not exists
 	if !a.certManager.CertExists() {
-		log.Println("Generating CA certificate...")
+		logger.Info("Generating CA certificate...")
 		if err := a.certManager.GenerateCACert(); err != nil {
 			return fmt.Errorf("failed to generate CA certificate: %w", err)
 		}
@@ -560,7 +561,7 @@ func (a *App) GetBilibiliVideoInfoWithAllParts(url string) (*downloader.Bilibili
 
 	// Get stream info for all parts
 	if err := a.bilibiliDownloader.GetAllPartsStreams(video); err != nil {
-		log.Printf("Warning: failed to get all parts streams: %v", err)
+		logger.Debug("Failed to get all parts streams: %v", err)
 		// Continue anyway, streams will be empty for failed parts
 	}
 

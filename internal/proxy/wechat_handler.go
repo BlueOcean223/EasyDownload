@@ -193,7 +193,7 @@ func (wh *WeChatHandler) HandleWeChatRequestWithType(body []byte, reqType string
 	// FileSize from worker messages is often chunk-sized. Probe total size via HTTP Range if needed.
 	wh.maybeProbeAndUpdateFileSize(videoInfo)
 
-	logger.Info("WeChat video detected: id=%q title=%q author=%q stable=%q url=%q pageKey=%q source=%q href=%q ts=%d",
+	logger.Debug("WeChat video detected: id=%q title=%q author=%q stable=%q url=%q pageKey=%q source=%q href=%q ts=%d",
 		shortenForLog(videoInfo.ID, 120),
 		shortenForLog(videoInfo.Title, 160),
 		shortenForLog(videoInfo.Author, 80),
@@ -244,7 +244,7 @@ func (wh *WeChatHandler) maybeProbeAndUpdateFileSize(videoInfo *WeChatVideoInfo)
 			base.FileSize = float64(size)
 			base.IsCurrentVideo = true
 			if old <= 0 || float64(size) > old*1.2 {
-				logger.Info("[WeChat Probe] FileSize updated: old=%.0f new=%d stable=%q url=%q",
+				logger.Debug("[WeChat Probe] FileSize updated: old=%.0f new=%d stable=%q url=%q",
 					old,
 					size,
 					shortenForLog(extractStableURLParams(urlToProbe), 220),
@@ -334,7 +334,7 @@ func (wh *WeChatHandler) handleDownloadRequest(body []byte) error {
 	sanitizeWeChatVideo(videoInfo)
 
 	key := extractStableURLParams(videoInfo.URL)
-	logger.Info("[WeChat Download] Requested id=%q title=%q author=%q stable=%q url=%q pageKey=%q source=%q href=%q ts=%d",
+	logger.Debug("[WeChat Download] Requested id=%q title=%q author=%q stable=%q url=%q pageKey=%q source=%q href=%q ts=%d",
 		shortenForLog(videoInfo.ID, 120),
 		shortenForLog(videoInfo.Title, 160),
 		shortenForLog(videoInfo.Author, 80),
@@ -480,7 +480,7 @@ func (wh *WeChatHandler) ParseVideoPayload(data []byte) (*WeChatVideoInfo, error
 	}
 
 	if title != "" && titleFrom != "description" {
-		logger.Info("[WeChat Meta] Title fallback used: from=%s title=%q id=%q source=%q",
+		logger.Debug("[WeChat Meta] Title fallback used: from=%s title=%q id=%q source=%q",
 			titleFrom,
 			shortenForLog(title, 120),
 			shortenForLog(payload.ID, 120),

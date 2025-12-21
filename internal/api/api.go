@@ -1,9 +1,9 @@
 package api
 
 import (
+	"EasyDownload/internal/logger"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"sync"
 )
@@ -104,9 +104,9 @@ func (api *InternalAPI) Start() error {
 	}
 
 	go func() {
-		log.Printf("Internal API server started on port %d", api.port)
+		logger.Debug("Internal API server started on port %d", api.port)
 		if err := api.server.ListenAndServe(); err != http.ErrServerClosed {
-			log.Printf("Internal API server error: %v", err)
+			logger.Error("Internal API server error: %v", err)
 		}
 	}()
 
@@ -185,7 +185,7 @@ func (api *InternalAPI) handleDetect(w http.ResponseWriter, r *http.Request) {
 		}
 	} else if !isDuplicate {
 		api.detectedVideos = append(api.detectedVideos, video)
-		log.Printf("Detected new video: %s", video.Title)
+		logger.Debug("Detected new video: %s", video.Title)
 
 		// Trigger callback
 		if api.onVideoDetected != nil {
@@ -249,7 +249,7 @@ func (api *InternalAPI) handleProxyImage(w http.ResponseWriter, r *http.Request)
 
 	data, contentType, err := api.imageProxy.ProxyImage(imageURL)
 	if err != nil {
-		log.Printf("Image proxy error: %v", err)
+		logger.Debug("Image proxy error: %v", err)
 		http.Error(w, "Failed to fetch image", http.StatusBadGateway)
 		return
 	}

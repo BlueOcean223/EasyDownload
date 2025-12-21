@@ -10,7 +10,6 @@ import {
   UninstallCert,
   GetDetectedVideos,
   ClearDetectedVideos,
-  DownloadVideo,
   DownloadVideoWithKey,
   GetDownloads,
   PauseDownload,
@@ -23,13 +22,10 @@ import {
   OpenDownloadDir,
   GetAppInfo,
   IsFFmpegAvailable,
-  IsFirstRunComplete,
   SetFirstRunComplete,
   SetMinimizeToTray,
   SetShowNotification,
-  GetTheme,
   SetTheme,
-  GetLanguage,
   SetLanguage
 } from '../../wailsjs/go/main/App'
 import { EventsOn } from '../../wailsjs/runtime/runtime'
