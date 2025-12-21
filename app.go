@@ -585,7 +585,7 @@ func (a *App) DownloadBilibiliVideo(url string, quality int) (string, error) {
 	}
 
 	// Create unique ID
-	id := fmt.Sprintf("bilibili_%s_%d", video.BV, time.Now().Unix())
+	id := fmt.Sprintf("bilibili_%s_%d", video.BV, time.Now().UnixNano())
 
 	// Create custom downloader function for Bilibili DASH format
 	bilibiliDownloader := a.createBilibiliDownloader(video, quality, -1) // -1 means first part
@@ -621,7 +621,7 @@ func (a *App) DownloadBilibiliPart(url string, partIndex int, quality int) (stri
 	part := video.Parts[partIndex]
 
 	// Create unique ID with part info
-	id := fmt.Sprintf("bilibili_%s_p%d_%d", video.BV, part.Page, time.Now().Unix())
+	id := fmt.Sprintf("bilibili_%s_p%d_%d", video.BV, part.Page, time.Now().UnixNano())
 
 	// Create title with part info
 	title := video.Title
@@ -671,12 +671,13 @@ func (a *App) createBilibiliDownloader(video *downloader.BilibiliVideo, quality 
 			onProgress(0, size)
 		}
 
+		// 使用 task.FilePath 作为输出路径，确保临时文件名与最终文件名一致
 		if partIndex < 0 {
 			// Download first/single part
-			outputPath, downloadErr = a.bilibiliDownloader.DownloadWithContext(ctx, video, quality, a.downloadDir, progressCallback, sizeCallback)
+			outputPath, downloadErr = a.bilibiliDownloader.DownloadWithContext(ctx, video, quality, task.FilePath, progressCallback, sizeCallback)
 		} else {
 			// Download specific part
-			outputPath, downloadErr = a.bilibiliDownloader.DownloadPartWithContext(ctx, video, partIndex, quality, a.downloadDir, progressCallback, sizeCallback)
+			outputPath, downloadErr = a.bilibiliDownloader.DownloadPartWithContext(ctx, video, partIndex, quality, task.FilePath, progressCallback, sizeCallback)
 		}
 
 		if downloadErr != nil {
@@ -759,7 +760,7 @@ func (a *App) DownloadDouyinVideo(shareText string, qualityKey string) (string, 
 		return "", err
 	}
 
-	id := fmt.Sprintf("douyin_%s_%d", item.ID, time.Now().Unix())
+	id := fmt.Sprintf("douyin_%s_%d", item.ID, time.Now().UnixNano())
 
 	douyinDownloadFunc := a.createDouyinDownloader(item, qualityKey)
 	task, err := a.downloadManager.AddTaskWithDownloader(id, shareText, item.Title, item.Cover, "douyin", qualityKey, douyinDownloadFunc)
@@ -767,8 +768,11 @@ func (a *App) DownloadDouyinVideo(shareText string, qualityKey string) (string, 
 		return "", err
 	}
 
-	// Update file extension for album type
+	// Update file extension and album fields for album type
 	if item.Type == "album" || len(item.Images) > 0 {
+		task.IsAlbum = true
+		task.AlbumTotal = len(item.Images)
+		task.AlbumCompleted = 0
 		if task.FileName != "" {
 			ext := filepath.Ext(task.FileName)
 			base := task.FileName
@@ -835,7 +839,7 @@ func (a *App) DownloadDouyinAlbumPartial(shareText string, indices []int) (strin
 		return "", fmt.Errorf("empty indices")
 	}
 
-	id := fmt.Sprintf("douyin_%s_partial_%d", item.ID, time.Now().Unix())
+	id := fmt.Sprintf("douyin_%s_partial_%d", item.ID, time.Now().UnixNano())
 
 	douyinDownloadFunc := a.createDouyinAlbumPartialDownloader(item, unique)
 	task, err := a.downloadManager.AddTaskWithDownloader(id, shareText, item.Title, item.Cover, "douyin", "partial", douyinDownloadFunc)
@@ -843,7 +847,10 @@ func (a *App) DownloadDouyinAlbumPartial(shareText string, indices []int) (strin
 		return "", err
 	}
 
-	// Force ZIP output
+	// Set album fields and force ZIP output
+	task.IsAlbum = true
+	task.AlbumTotal = len(unique)
+	task.AlbumCompleted = 0
 	if task.FileName != "" {
 		ext := filepath.Ext(task.FileName)
 		base := task.FileName
@@ -881,31 +888,24 @@ func (a *App) createDouyinAlbumPartialDownloader(item *douyin.DouyinItem, indice
 		}
 
 		total := int64(len(indicesCopy))
-		if onProgress != nil && total > 0 {
-			onProgress(0, total)
-		}
-
-		var lastDownloaded int64
 		progressCallback := func(p float64) {
-			if onProgress == nil || total <= 0 {
-				return
+			completedCount := int(p/100*float64(total) + 0.5)
+			if completedCount > int(total) {
+				completedCount = int(total)
 			}
-			downloaded := int64(p/100*float64(total) + 0.5)
-			if downloaded < lastDownloaded {
-				downloaded = lastDownloaded
+			if task != nil {
+				task.AlbumCompleted = completedCount
+				task.Progress = p // Update progress percentage
 			}
-			if downloaded > total {
-				downloaded = total
-			}
-			lastDownloaded = downloaded
-			onProgress(downloaded, total)
 		}
 
-		if err := a.douyinDownloader.DownloadAlbumPartialWithContext(ctx, item, indicesCopy, destPath, progressCallback); err != nil {
+		if err := a.douyinDownloader.DownloadAlbumPartialWithBytes(ctx, item, indicesCopy, destPath, progressCallback, onProgress); err != nil {
 			return err
 		}
 
-		if task != nil && destPath != "" {
+		if task != nil {
+			task.AlbumCompleted = int(total)
+			task.Progress = 100
 			task.FilePath = destPath
 			task.FileName = filepath.Base(destPath)
 		}

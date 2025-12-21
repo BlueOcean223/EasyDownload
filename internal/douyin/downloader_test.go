@@ -17,6 +17,7 @@ import (
 	"testing"
 
 	"EasyDownload/internal/downloader"
+	"EasyDownload/internal/utils"
 )
 
 func TestDownloadVideoSuccess(t *testing.T) {
@@ -315,29 +316,29 @@ func TestDouyinFileBaseEmpty(t *testing.T) {
 }
 
 func TestSanitizeFileComponent(t *testing.T) {
-	result := sanitizeFileComponent("test:file?name")
+	result := utils.SanitizeFileName("test:file?name", 80)
 	if strings.ContainsAny(result, ":?") {
 		t.Fatalf("expected sanitized name, got %s", result)
 	}
 }
 
 func TestSanitizeFileComponentEmpty(t *testing.T) {
-	result := sanitizeFileComponent("")
-	if result != "douyin" {
-		t.Fatalf("expected 'douyin' for empty, got %s", result)
+	result := utils.SanitizeFileName("", 80)
+	if result != "" {
+		t.Fatalf("expected empty for empty, got %s", result)
 	}
 }
 
 func TestSanitizeFileComponentLong(t *testing.T) {
 	long := strings.Repeat("a", 100)
-	result := sanitizeFileComponent(long)
+	result := utils.SanitizeFileName(long, 80)
 	if len(result) > 80 {
 		t.Fatalf("expected truncated to 80, got %d", len(result))
 	}
 }
 
 func TestFilterNonEmpty(t *testing.T) {
-	result := filterNonEmpty([]string{"", "a", "  ", "b"})
+	result := utils.FilterNonEmpty([]string{"", "a", "  ", "b"})
 	if len(result) != 2 || result[0] != "a" || result[1] != "b" {
 		t.Fatalf("unexpected result: %v", result)
 	}

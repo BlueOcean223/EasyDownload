@@ -1,7 +1,6 @@
 package downloader
 
 import (
-	"EasyDownload/internal/logger"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -15,8 +14,9 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode"
-	"unicode/utf8"
+
+	"EasyDownload/internal/logger"
+	"EasyDownload/internal/utils"
 )
 
 func isLiveOrStreamURL(u string) bool {
@@ -111,6 +111,11 @@ type DownloadTask struct {
 
 	// Decryption fields (for WeChat videos)
 	DecodeKey string `json:"decodeKey"` // Base64-encoded decryption key
+
+	// Album fields (for Douyin albums)
+	IsAlbum        bool  `json:"isAlbum"`        // Whether this is an album download
+	AlbumTotal     int   `json:"albumTotal"`     // Total number of images in album
+	AlbumCompleted int   `json:"albumCompleted"` // Number of completed images
 
 	// Custom downloader for sources that need special handling (e.g., Bilibili DASH format)
 	customDownloader DownloadFunc
@@ -276,7 +281,7 @@ func (dm *DownloadManager) AddTaskWithDecodeKey(id, rawURL, title, cover, source
 				downloadURL = parsedURL.String()
 			}
 		}
-		
+
 		// Add the selected quality parameter if specified
 		if quality != "" {
 			// quality contains the fileFormat value (e.g., "xWT...")
@@ -293,11 +298,11 @@ func (dm *DownloadManager) AddTaskWithDecodeKey(id, rawURL, title, cover, source
 	}
 
 	// Generate filename
-	baseName := sanitizeFileName(title)
+	baseName := utils.SanitizeFileName(title, 100)
 	usedFallbackName := false
 	if baseName == "" {
 		usedFallbackName = true
-		safeSource := sanitizeFileName(source)
+		safeSource := utils.SanitizeFileName(source, 100)
 		if safeSource == "" {
 			safeSource = "video"
 		}
@@ -306,7 +311,7 @@ func (dm *DownloadManager) AddTaskWithDecodeKey(id, rawURL, title, cover, source
 		hash := fmt.Sprintf("%08x", h.Sum32())
 		baseName = fmt.Sprintf("video_%s_%d_%s", safeSource, time.Now().Unix(), hash)
 	}
-	baseName = sanitizeFileName(baseName)
+	baseName = utils.SanitizeFileName(baseName, 100)
 	if baseName == "" {
 		baseName = fmt.Sprintf("video_%d", time.Now().UnixNano())
 	}
@@ -424,6 +429,42 @@ func (dm *DownloadManager) PauseTask(id string) error {
 	return nil
 }
 
+// cleanupTempFilesByPrefix removes temp files in dir that match prefix + any suffix from suffixes.
+// Uses os.ReadDir + exact string matching to avoid glob metacharacter injection.
+func cleanupTempFilesByPrefix(dir, prefix string, suffixes []string) {
+	if strings.TrimSpace(dir) == "" || strings.TrimSpace(prefix) == "" || len(suffixes) == 0 {
+		return
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		logger.Warn("[CancelTask] Failed to read dir for cleanup: dir=%s, err=%v", dir, err)
+		return
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if !strings.HasPrefix(name, prefix) {
+			continue
+		}
+		for _, suffix := range suffixes {
+			if strings.HasSuffix(name, suffix) {
+				fullPath := filepath.Join(dir, name)
+				logger.Debug("[CancelTask] Removing temp file: %s", fullPath)
+				if err := os.Remove(fullPath); err != nil && !os.IsNotExist(err) {
+					logger.Warn("[CancelTask] Failed to remove %s: %v", fullPath, err)
+				} else if err == nil {
+					logger.Debug("[CancelTask] Successfully removed: %s", fullPath)
+				}
+				break
+			}
+		}
+	}
+}
+
 // CancelTask cancels a task
 func (dm *DownloadManager) CancelTask(id string) error {
 	dm.tasksMu.RLock()
@@ -434,17 +475,115 @@ func (dm *DownloadManager) CancelTask(id string) error {
 		return fmt.Errorf("task %s not found", id)
 	}
 
+	// Capture fields under lock, then release before file operations
 	task.mu.Lock()
-	defer task.mu.Unlock()
-
+	logger.Info("[CancelTask] Cancelling task: id=%s, status=%s, filePath=%s", id, task.Status, task.FilePath)
 	if task.cancel != nil {
 		task.cancel()
 	}
 	task.Status = StatusCancelled
+	filePath := task.FilePath
+	title := task.Title
+	task.mu.Unlock()
 
-	// Remove partial file
-	os.Remove(task.FilePath)
+	// All file operations below are done outside the lock to avoid blocking
 
+	// Remove partial file and related temp files
+	logger.Debug("[CancelTask] Removing main file: %s", filePath)
+	if err := os.Remove(filePath); err != nil && !os.IsNotExist(err) {
+		logger.Warn("[CancelTask] Failed to remove main file: %v", err)
+	}
+
+	// Remove Bilibili DASH temp files (_video.m4s and _audio.m4s)
+	// For multi-part Bilibili downloads, files are named: {title}_P{n}_{partName}_video.m4s
+	// We use prefix matching to find all related temp files
+	if strings.HasSuffix(filePath, ".mp4") {
+		basePath := strings.TrimSuffix(filePath, ".mp4")
+		dir := filepath.Dir(filePath)
+		baseName := filepath.Base(basePath)
+
+		logger.Debug("[CancelTask] basePath=%s, dir=%s, baseName=%s", basePath, dir, baseName)
+
+		// Remove single file temp files (always safe to try)
+		tempFiles := []string{
+			basePath + "_video.m4s",
+			basePath + "_audio.m4s",
+			basePath + "_video.m4s.edstate.json",
+			basePath + "_audio.m4s.edstate.json",
+		}
+		for _, tf := range tempFiles {
+			logger.Debug("[CancelTask] Attempting to remove: %s", tf)
+			if err := os.Remove(tf); err != nil && !os.IsNotExist(err) {
+				logger.Warn("[CancelTask] Failed to remove %s: %v", tf, err)
+			} else if err == nil {
+				logger.Debug("[CancelTask] Successfully removed: %s", tf)
+			}
+		}
+
+		// For Bilibili multi-part downloads:
+		// - task.Title format: "视频标题 - P2 分P名" (with " - Px " separator)
+		// - temp file format: "视频标题_P2_分P名_video.m4s" (with "_Px_" separator)
+		// We need to match ONLY the specific part being cancelled, not all parts
+
+		cleanupPrefix := baseName
+
+		// Check if this is a multi-part download by looking for " - P" in title
+		if idx := strings.Index(title, " - P"); idx > 0 {
+			// This is a multi-part download - only clean THIS specific part
+			// Extract base video title and part info
+			videoBaseTitle := title[:idx]
+			partInfo := title[idx+3:] // Skip " - P", get "x 分P名"
+
+			// Extract part number (e.g., "9" from "9 代码")
+			partNum := ""
+			for i, c := range partInfo {
+				if c >= '0' && c <= '9' {
+					partNum += string(c)
+				} else {
+					// After digits, the rest is part name with leading space
+					if i > 0 && len(partInfo) > i {
+						break
+					}
+				}
+			}
+
+			if partNum != "" {
+				sanitizedBaseTitle := utils.SanitizeFileName(videoBaseTitle, 100)
+				// Build prefix for this specific part: "视频标题_P9_"
+				cleanupPrefix = sanitizedBaseTitle + "_P" + partNum + "_"
+			}
+		}
+
+		cleanupSuffixes := []string{
+			"_video.m4s",
+			"_audio.m4s",
+			"_video.m4s.edstate.json",
+			"_audio.m4s.edstate.json",
+			".edstate.json",
+		}
+		logger.Debug("[CancelTask] Cleaning temp files by prefix: dir=%s, prefix=%s", dir, cleanupPrefix)
+		cleanupTempFilesByPrefix(dir, cleanupPrefix, cleanupSuffixes)
+	}
+
+	// Remove multipart download state file (.edstate.json)
+	// This is created by multipart downloader to track chunk progress
+	stateFile := filePath + ".edstate.json"
+	logger.Debug("[CancelTask] Removing state file: %s", stateFile)
+	if err := os.Remove(stateFile); err != nil && !os.IsNotExist(err) {
+		logger.Warn("[CancelTask] Failed to remove state file: %v", err)
+	}
+
+	// Remove Douyin album temp directory (.albumtmp)
+	// This contains downloaded images and state.json for album downloads
+	if strings.HasSuffix(filePath, ".zip") {
+		albumTmp := filePath + ".albumtmp"
+		logger.Debug("[CancelTask] Removing album temp dir: %s", albumTmp)
+		if err := os.RemoveAll(albumTmp); err != nil {
+			logger.Warn("[CancelTask] Failed to remove album temp dir: %v", err)
+		}
+	}
+
+	logger.Info("[CancelTask] Task cancelled successfully: id=%s", id)
 	return nil
 }
 
@@ -930,7 +1069,7 @@ func (dm *DownloadManager) handlePostDownloadDecryption(task *DownloadTask) erro
 }
 
 func ensureUniqueFileName(dir, base, ext string) string {
-	base = sanitizeFileName(base)
+	base = utils.SanitizeFileName(base, 100)
 	if base == "" {
 		base = fmt.Sprintf("video_%d", time.Now().UnixNano())
 	}
@@ -944,13 +1083,13 @@ func ensureUniqueFileName(dir, base, ext string) string {
 		return err == nil
 	}
 
-	name := sanitizeFileName(base) + ext
+	name := utils.SanitizeFileName(base, 100) + ext
 	if !exists(name) {
 		return name
 	}
 
 	for i := 2; i <= 99; i++ {
-		candidateBase := sanitizeFileName(fmt.Sprintf("%s_%d", base, i))
+		candidateBase := utils.SanitizeFileName(fmt.Sprintf("%s_%d", base, i), 100)
 		if candidateBase == "" {
 			candidateBase = fmt.Sprintf("video_%d", time.Now().UnixNano())
 		}
@@ -960,7 +1099,7 @@ func ensureUniqueFileName(dir, base, ext string) string {
 		}
 	}
 
-	return fmt.Sprintf("%s_%d%s", sanitizeFileName(base), time.Now().UnixNano(), ext)
+	return fmt.Sprintf("%s_%d%s", utils.SanitizeFileName(base, 100), time.Now().UnixNano(), ext)
 }
 
 // handleError handles download errors
@@ -980,105 +1119,6 @@ func (dm *DownloadManager) handleError(task *DownloadTask, err error) {
 	if dm.onError != nil {
 		dm.onError(task, err)
 	}
-}
-
-// sanitizeFileName removes invalid characters from filename
-func sanitizeFileName(name string) string {
-	// Normalize whitespace and remove control characters. Windows file names cannot contain
-	// many characters, and also cannot contain CR/LF which can break paths/logs.
-	result := strings.TrimSpace(name)
-	if result == "" {
-		return ""
-	}
-
-	// Replace common line separators with spaces first.
-	result = strings.NewReplacer(
-		"\r", " ",
-		"\n", " ",
-		"\t", " ",
-		"\u2028", " ",
-		"\u2029", " ",
-	).Replace(result)
-
-	var b strings.Builder
-	b.Grow(len(result))
-	prevUnderscore := false
-	for _, r := range result {
-		// Drop replacement rune and ASCII control chars
-		if r == utf8.RuneError || r == 0xFFFD {
-			continue
-		}
-		if r < 32 || r == 127 {
-			continue
-		}
-
-		// Convert any whitespace run to a single underscore
-		if unicode.IsSpace(r) {
-			if !prevUnderscore {
-				b.WriteByte('_')
-				prevUnderscore = true
-			}
-			continue
-		}
-
-		// Replace invalid Windows filename chars
-		switch r {
-		case '/', '\\', ':', '*', '?', '"', '<', '>', '|':
-			if !prevUnderscore {
-				b.WriteByte('_')
-				prevUnderscore = true
-			}
-			continue
-		}
-
-		b.WriteRune(r)
-		prevUnderscore = false
-	}
-
-	out := b.String()
-	out = strings.Trim(out, " ._")
-	if out == "" {
-		return ""
-	}
-
-	// Avoid Windows reserved device names.
-	upper := strings.ToUpper(out)
-	switch upper {
-	case "CON", "PRN", "AUX", "NUL",
-		"COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
-		"LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9":
-		out = "_" + out
-	}
-
-	// Limit length to 100 bytes, but keep UTF-8 rune boundaries.
-	if len(out) > 100 {
-		var cut strings.Builder
-		cut.Grow(100)
-		n := 0
-		for _, r := range out {
-			rl := utf8.RuneLen(r)
-			if rl <= 0 || n+rl > 100 {
-				break
-			}
-			cut.WriteRune(r)
-			n += rl
-		}
-		out = strings.Trim(cut.String(), " ._")
-	}
-
-	return out
-}
-
-func replaceAll(s, old, new string) string {
-	result := ""
-	for _, c := range s {
-		if string(c) == old {
-			result += new
-		} else {
-			result += string(c)
-		}
-	}
-	return result
 }
 
 // RetryTask manually retries a failed task
@@ -1130,26 +1170,29 @@ func (t *DownloadTask) TaskToJSON() map[string]interface{} {
 	defer t.mu.RUnlock()
 
 	return map[string]interface{}{
-		"id":          t.ID,
-		"url":         t.URL,
-		"title":       t.Title,
-		"cover":       t.Cover,
-		"source":      t.Source,
-		"quality":     t.Quality,
-		"filePath":    t.FilePath,
-		"fileName":    t.FileName,
-		"fileSize":    t.FileSize,
-		"downloaded":  t.Downloaded,
-		"progress":    t.Progress,
-		"speed":       t.Speed,
-		"status":      t.Status,
-		"error":       t.Error,
-		"createdAt":   t.CreatedAt,
-		"completedAt": t.CompletedAt,
-		"retryCount":  t.RetryCount,
-		"maxRetry":    t.MaxRetry,
-		"lastError":   t.LastError,
-		"decodeKey":   t.DecodeKey,
+		"id":             t.ID,
+		"url":            t.URL,
+		"title":          t.Title,
+		"cover":          t.Cover,
+		"source":         t.Source,
+		"quality":        t.Quality,
+		"filePath":       t.FilePath,
+		"fileName":       t.FileName,
+		"fileSize":       t.FileSize,
+		"downloaded":     t.Downloaded,
+		"progress":       t.Progress,
+		"speed":          t.Speed,
+		"status":         t.Status,
+		"error":          t.Error,
+		"createdAt":      t.CreatedAt,
+		"completedAt":    t.CompletedAt,
+		"retryCount":     t.RetryCount,
+		"maxRetry":       t.MaxRetry,
+		"lastError":      t.LastError,
+		"decodeKey":      t.DecodeKey,
+		"isAlbum":        t.IsAlbum,
+		"albumTotal":     t.AlbumTotal,
+		"albumCompleted": t.AlbumCompleted,
 	}
 }
 
@@ -1260,25 +1303,28 @@ type DownloadState struct {
 
 // TaskState represents a single task's persisted state
 type TaskState struct {
-	ID          string         `json:"id"`
-	URL         string         `json:"url"`
-	Title       string         `json:"title"`
-	Cover       string         `json:"cover"`
-	Source      string         `json:"source"`
-	Quality     string         `json:"quality"`
-	FilePath    string         `json:"filePath"`
-	FileName    string         `json:"fileName"`
-	FileSize    int64          `json:"fileSize"`
-	Downloaded  int64          `json:"downloaded"`
-	Progress    float64        `json:"progress"`
-	Status      DownloadStatus `json:"status"`
-	Error       string         `json:"error"`
-	CreatedAt   int64          `json:"createdAt"`
-	CompletedAt int64          `json:"completedAt"`
-	RetryCount  int            `json:"retryCount"`
-	MaxRetry    int            `json:"maxRetry"`
-	LastError   string         `json:"lastError"`
-	DecodeKey   string         `json:"decodeKey"`
+	ID             string         `json:"id"`
+	URL            string         `json:"url"`
+	Title          string         `json:"title"`
+	Cover          string         `json:"cover"`
+	Source         string         `json:"source"`
+	Quality        string         `json:"quality"`
+	FilePath       string         `json:"filePath"`
+	FileName       string         `json:"fileName"`
+	FileSize       int64          `json:"fileSize"`
+	Downloaded     int64          `json:"downloaded"`
+	Progress       float64        `json:"progress"`
+	Status         DownloadStatus `json:"status"`
+	Error          string         `json:"error"`
+	CreatedAt      int64          `json:"createdAt"`
+	CompletedAt    int64          `json:"completedAt"`
+	RetryCount     int            `json:"retryCount"`
+	MaxRetry       int            `json:"maxRetry"`
+	LastError      string         `json:"lastError"`
+	DecodeKey      string         `json:"decodeKey"`
+	IsAlbum        bool           `json:"isAlbum"`
+	AlbumTotal     int            `json:"albumTotal"`
+	AlbumCompleted int            `json:"albumCompleted"`
 }
 
 // SaveState saves the current download state to disk
@@ -1297,25 +1343,28 @@ func (dm *DownloadManager) SaveState() error {
 	for _, task := range dm.tasks {
 		task.mu.RLock()
 		taskState := TaskState{
-			ID:          task.ID,
-			URL:         task.URL,
-			Title:       task.Title,
-			Cover:       task.Cover,
-			Source:      task.Source,
-			Quality:     task.Quality,
-			FilePath:    task.FilePath,
-			FileName:    task.FileName,
-			FileSize:    task.FileSize,
-			Downloaded:  task.Downloaded,
-			Progress:    task.Progress,
-			Status:      task.Status,
-			Error:       task.Error,
-			CreatedAt:   task.CreatedAt,
-			CompletedAt: task.CompletedAt,
-			RetryCount:  task.RetryCount,
-			MaxRetry:    task.MaxRetry,
-			LastError:   task.LastError,
-			DecodeKey:   task.DecodeKey,
+			ID:             task.ID,
+			URL:            task.URL,
+			Title:          task.Title,
+			Cover:          task.Cover,
+			Source:         task.Source,
+			Quality:        task.Quality,
+			FilePath:       task.FilePath,
+			FileName:       task.FileName,
+			FileSize:       task.FileSize,
+			Downloaded:     task.Downloaded,
+			Progress:       task.Progress,
+			Status:         task.Status,
+			Error:          task.Error,
+			CreatedAt:      task.CreatedAt,
+			CompletedAt:    task.CompletedAt,
+			RetryCount:     task.RetryCount,
+			MaxRetry:       task.MaxRetry,
+			LastError:      task.LastError,
+			DecodeKey:      task.DecodeKey,
+			IsAlbum:        task.IsAlbum,
+			AlbumTotal:     task.AlbumTotal,
+			AlbumCompleted: task.AlbumCompleted,
 		}
 		task.mu.RUnlock()
 
@@ -1379,25 +1428,28 @@ func (dm *DownloadManager) LoadState() error {
 		}
 
 		task := &DownloadTask{
-			ID:          taskState.ID,
-			URL:         taskState.URL,
-			Title:       taskState.Title,
-			Cover:       taskState.Cover,
-			Source:      taskState.Source,
-			Quality:     taskState.Quality,
-			FilePath:    taskState.FilePath,
-			FileName:    taskState.FileName,
-			FileSize:    taskState.FileSize,
-			Downloaded:  taskState.Downloaded,
-			Progress:    taskState.Progress,
-			Status:      taskState.Status,
-			Error:       taskState.Error,
-			CreatedAt:   taskState.CreatedAt,
-			CompletedAt: taskState.CompletedAt,
-			RetryCount:  taskState.RetryCount,
-			MaxRetry:    taskState.MaxRetry,
-			LastError:   taskState.LastError,
-			DecodeKey:   taskState.DecodeKey,
+			ID:             taskState.ID,
+			URL:            taskState.URL,
+			Title:          taskState.Title,
+			Cover:          taskState.Cover,
+			Source:         taskState.Source,
+			Quality:        taskState.Quality,
+			FilePath:       taskState.FilePath,
+			FileName:       taskState.FileName,
+			FileSize:       taskState.FileSize,
+			Downloaded:     taskState.Downloaded,
+			Progress:       taskState.Progress,
+			Status:         taskState.Status,
+			Error:          taskState.Error,
+			CreatedAt:      taskState.CreatedAt,
+			CompletedAt:    taskState.CompletedAt,
+			RetryCount:     taskState.RetryCount,
+			MaxRetry:       taskState.MaxRetry,
+			LastError:      taskState.LastError,
+			DecodeKey:      taskState.DecodeKey,
+			IsAlbum:        taskState.IsAlbum,
+			AlbumTotal:     taskState.AlbumTotal,
+			AlbumCompleted: taskState.AlbumCompleted,
 		}
 
 		// Reset downloading/retrying tasks to paused state

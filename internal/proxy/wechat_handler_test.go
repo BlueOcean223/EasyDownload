@@ -320,7 +320,7 @@ func TestDefaultValueFillingProperty(t *testing.T) {
 	handler := NewWeChatHandler()
 
 	// Property 7a: Empty description results in default title
-	properties.Property("empty description results in default title", prop.ForAll(
+	properties.Property("empty description keeps empty title", prop.ForAll(
 		func(urlPath string) bool {
 			// Create objectDesc with empty description
 			objDesc := map[string]interface{}{
@@ -343,7 +343,7 @@ func TestDefaultValueFillingProperty(t *testing.T) {
 				return true // URL validation might fail
 			}
 
-			return result.Title == "未知标题"
+			return result.Title == ""
 		},
 		gen.AlphaString().SuchThat(func(s string) bool { return len(s) > 0 }),
 	))
@@ -656,7 +656,7 @@ func TestAuthorDefaultValueProperty(t *testing.T) {
 	handler := NewWeChatHandler()
 
 	// Property 7a: Missing contact results in default author
-	properties.Property("missing contact results in default author", prop.ForAll(
+	properties.Property("missing contact keeps empty author", prop.ForAll(
 		func(urlPath string) bool {
 			// Create objectDesc without contact
 			objDesc := map[string]interface{}{
@@ -679,13 +679,13 @@ func TestAuthorDefaultValueProperty(t *testing.T) {
 				return true // URL validation might fail
 			}
 
-			return result.Author == "未知作者"
+			return result.Author == ""
 		},
 		gen.AlphaString().SuchThat(func(s string) bool { return len(s) > 0 }),
 	))
 
 	// Property 7b: Empty nickname results in default author
-	properties.Property("empty nickname results in default author", prop.ForAll(
+	properties.Property("empty nickname keeps empty author", prop.ForAll(
 		func(urlPath, headURL string) bool {
 			// Create objectDesc with contact but empty nickname
 			objDesc := map[string]interface{}{
@@ -713,7 +713,7 @@ func TestAuthorDefaultValueProperty(t *testing.T) {
 				return true // URL validation might fail
 			}
 
-			return result.Author == "未知作者"
+			return result.Author == ""
 		},
 		gen.AlphaString().SuchThat(func(s string) bool { return len(s) > 0 }),
 		gen.AlphaString(),

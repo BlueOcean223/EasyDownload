@@ -2,6 +2,7 @@ package downloader
 
 import (
 	"bytes"
+	"encoding/binary"
 	"os"
 	"path/filepath"
 	"testing"
@@ -120,23 +121,40 @@ func TestDecryptFileWithValidKey(t *testing.T) {
 	tempDir := t.TempDir()
 	testFile := filepath.Join(tempDir, "test_video.mp4")
 
-	// Create test data (simulating encrypted video header)
-	testData := make([]byte, 1024)
-	for i := range testData {
-		testData[i] = byte(i % 256)
-	}
+	// Create a small valid MP4 container (ftyp + moov boxes) as plaintext.
+	ftypBox := make([]byte, 24)
+	binary.BigEndian.PutUint32(ftypBox[0:4], uint32(len(ftypBox)))
+	copy(ftypBox[4:8], []byte("ftyp"))
+	copy(ftypBox[8:12], []byte("isom"))
+	binary.BigEndian.PutUint32(ftypBox[12:16], 0)
+	copy(ftypBox[16:20], []byte("isom"))
+	copy(ftypBox[20:24], []byte("iso2"))
+
+	moovBox := make([]byte, 16)
+	binary.BigEndian.PutUint32(moovBox[0:4], uint32(len(moovBox)))
+	copy(moovBox[4:8], []byte("moov"))
+
+	testData := append(ftypBox, moovBox...)
 
 	// Save original for comparison
 	original := make([]byte, len(testData))
 	copy(original, testData)
 
-	// Write test data to file
-	if err := os.WriteFile(testFile, testData, 0644); err != nil {
-		t.Fatalf("Failed to write test file: %v", err)
+	// Use a known key (WeChat decodeKey is a numeric string / uint64 seed)
+	decodeKey := "1"
+	encKey, err := ParseDecodeKey(decodeKey)
+	if err != nil {
+		t.Fatalf("Failed to parse decodeKey: %v", err)
 	}
 
-	// Use a known key (WeChat decodeKey is a numeric string / uint64 seed)
-	decodeKey := "0"
+	encrypted := make([]byte, len(testData))
+	copy(encrypted, testData)
+	DecryptData(encrypted, uint32(len(encrypted)), encKey)
+
+	// Write encrypted test data to file
+	if err := os.WriteFile(testFile, encrypted, 0644); err != nil {
+		t.Fatalf("Failed to write test file: %v", err)
+	}
 
 	// Decrypt the file
 	if err := vd.DecryptFile(testFile, decodeKey); err != nil {
@@ -149,24 +167,9 @@ func TestDecryptFileWithValidKey(t *testing.T) {
 		t.Fatalf("Failed to read decrypted file: %v", err)
 	}
 
-	// Decrypt again to verify round-trip
-	if err := os.WriteFile(testFile, decrypted, 0644); err != nil {
-		t.Fatalf("Failed to write for second decrypt: %v", err)
-	}
-
-	if err := vd.DecryptFile(testFile, decodeKey); err != nil {
-		t.Fatalf("Second DecryptFile failed: %v", err)
-	}
-
-	// Read the result
-	result, err := os.ReadFile(testFile)
-	if err != nil {
-		t.Fatalf("Failed to read result file: %v", err)
-	}
-
 	// Should match original
-	if !bytes.Equal(result, original) {
-		t.Error("Round-trip decryption did not restore original data")
+	if !bytes.Equal(decrypted, original) {
+		t.Error("Decryption did not restore original data")
 	}
 }
 

@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"EasyDownload/internal/utils"
+
 	"github.com/leanovate/gopter"
 	"github.com/leanovate/gopter/gen"
 	"github.com/leanovate/gopter/prop"
@@ -32,7 +34,7 @@ func TestSanitizeFileName(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		result := sanitizeFileName(tt.input)
+		result := utils.SanitizeFileName(tt.input, 100)
 		if result != tt.expected {
 			t.Errorf("sanitizeFileName(%q) = %q, want %q", tt.input, result, tt.expected)
 		}
@@ -46,7 +48,7 @@ func TestSanitizeFileNameLengthLimit(t *testing.T) {
 		longName += "a"
 	}
 
-	result := sanitizeFileName(longName)
+	result := utils.SanitizeFileName(longName, 100)
 	if len(result) > 100 {
 		t.Errorf("sanitizeFileName should limit length to 100, got %d", len(result))
 	}
@@ -61,7 +63,7 @@ func TestSanitizeFileNameProperty(t *testing.T) {
 
 	properties.Property("sanitized filename contains no invalid characters", prop.ForAll(
 		func(input string) bool {
-			result := sanitizeFileName(input)
+			result := utils.SanitizeFileName(input, 100)
 			invalidChars := []string{"/", "\\", ":", "*", "?", "\"", "<", ">", "|"}
 			for _, char := range invalidChars {
 				for _, c := range result {
@@ -77,7 +79,7 @@ func TestSanitizeFileNameProperty(t *testing.T) {
 
 	properties.Property("sanitized filename length is at most 100", prop.ForAll(
 		func(input string) bool {
-			result := sanitizeFileName(input)
+			result := utils.SanitizeFileName(input, 100)
 			return len(result) <= 100
 		},
 		gen.AnyString(),

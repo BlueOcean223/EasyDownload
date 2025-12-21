@@ -17,6 +17,7 @@ import {
 import {
   HasBilibiliSessData,
   SetBilibiliSessData,
+  BilibiliLogout,
   OpenLogDir,
   GetLogDir,
   GetUpstreamProxy,
@@ -34,6 +35,7 @@ const uninstalling = ref(false)
 const sessData = ref('')  // Only for new input, not loaded from storage
 const hasSessData = ref(false)  // Whether SESSDATA is already set
 const savingSessData = ref(false)
+const resettingSessData = ref(false)
 const logDir = ref('')
 const upstreamProxyInput = ref('')
 const proxyDebug = ref(false)
@@ -118,6 +120,20 @@ async function saveSessData() {
     message.error(e.message || '保存失败')
   } finally {
     savingSessData.value = false
+  }
+}
+
+async function resetSessData() {
+  resettingSessData.value = true
+  try {
+    await BilibiliLogout()
+    hasSessData.value = false
+    sessData.value = ''
+    message.success('SESSDATA 已清除')
+  } catch (e: any) {
+    message.error(e.message || '清除失败')
+  } finally {
+    resettingSessData.value = false
   }
 }
 
@@ -410,6 +426,15 @@ async function saveUpstreamProxy() {
                   <SaveOutline class="w-4 h-4" />
                 </template>
                 保存
+              </NButton>
+              <NButton
+                v-if="hasSessData"
+                type="error"
+                size="small"
+                :loading="resettingSessData"
+                @click="resetSessData"
+              >
+                重置
               </NButton>
             </div>
             <p class="text-xs text-text-tertiary mt-2">

@@ -48,6 +48,10 @@ export interface DownloadTask {
   error: string
   createdAt: number
   completedAt: number
+  // Album fields (for Douyin albums)
+  isAlbum?: boolean
+  albumTotal?: number
+  albumCompleted?: number
 }
 
 // Bilibili video stream

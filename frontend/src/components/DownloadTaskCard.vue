@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { NCard, NButton, NProgress, NTag, NTooltip } from 'naive-ui'
-import { 
-  PlayOutline, 
-  PauseOutline, 
+import {
+  PlayOutline,
+  PauseOutline,
   CloseOutline,
   FolderOpenOutline,
   TrashOutline,
@@ -31,6 +31,7 @@ const isCompleted = computed(() => props.mode === 'completed' || props.task.stat
 
 function formatBytes(bytes: number) {
   if (bytes === 0) return '0 B'
+  if (bytes < 0) return '--'
   const k = 1024
   const sizes = ['B', 'KB', 'MB', 'GB']
   const i = Math.floor(Math.log(bytes) / Math.log(k))
@@ -40,6 +41,29 @@ function formatBytes(bytes: number) {
 function formatSpeed(bytesPerSecond: number) {
   return formatBytes(bytesPerSecond) + '/s'
 }
+
+// Format progress text for album or regular download
+const progressText = computed(() => {
+  const task = props.task
+  if (task.isAlbum) {
+    const completed = task.albumCompleted ?? 0
+    const total = task.albumTotal ?? 0
+    const sizeText = task.downloaded > 0 ? formatBytes(task.downloaded) : '--'
+    return `${completed}/${total}张 (${sizeText})`
+  }
+  return `${formatBytes(task.downloaded)} / ${formatBytes(task.fileSize)}`
+})
+
+// Format completed size text for album
+const completedSizeText = computed(() => {
+  const task = props.task
+  if (task.isAlbum) {
+    const total = task.albumTotal ?? 0
+    const sizeText = task.downloaded > 0 ? formatBytes(task.downloaded) : formatBytes(task.fileSize)
+    return `${total}张 · ${sizeText}`
+  }
+  return formatBytes(task.fileSize)
+})
 
 function getStatusType(status: string) {
   switch (status) {
@@ -107,26 +131,26 @@ function getStatusText(status: string) {
         
         <!-- Progress bar for downloading -->
         <template v-if="isDownloading">
-          <NProgress 
-            type="line" 
+          <NProgress
+            type="line"
             :percentage="task.progress"
             :show-indicator="false"
             :height="4"
             :border-radius="2"
             class="mb-1"
           />
-          
+
           <div class="flex items-center gap-4 text-xs text-text-secondary">
-            <span>{{ formatBytes(task.downloaded) }} / {{ formatBytes(task.fileSize) }}</span>
+            <span>{{ progressText }}</span>
             <span v-if="task.status === 'downloading' && task.speed > 0">{{ formatSpeed(task.speed) }}</span>
             <span>{{ task.progress.toFixed(1) }}%</span>
           </div>
         </template>
-        
+
         <!-- Info for completed -->
         <template v-else>
           <div class="text-xs text-text-secondary">
-            <span>{{ formatBytes(task.fileSize) }}</span>
+            <span>{{ completedSizeText }}</span>
             <span class="mx-2">·</span>
             <span>{{ task.fileName }}</span>
           </div>
