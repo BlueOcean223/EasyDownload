@@ -33,18 +33,26 @@ func main() {
 		OnStartup:        app.startup,
 		OnShutdown:       app.shutdown,
 		OnBeforeClose: func(ctx context.Context) (prevent bool) {
-			// Check if minimize to tray is enabled
-			if app.IsMinimizeToTrayEnabled() {
-				// Hide window instead of closing
-				runtime.WindowHide(ctx)
-				if app.trayManager != nil {
-					app.trayManager.SetWindowVisible(false)
-				}
-				return true // Prevent the window from closing
+			// Allow programmatic quits (tray/menu/confirmed exit) without re-triggering the close dialog
+			if app.IsQuitRequested() {
+				return false
 			}
-			return false // Allow the window to close normally
+
+			// If user chose "don't ask again" with a specific action, perform it directly
+			if app.IsDontAskOnClose() && app.GetCloseAction() != "" {
+				if app.GetCloseAction() == "minimize" {
+					app.applyMinimizeToTray(ctx)
+					return true // Prevent close
+				}
+				// action == "exit", allow close
+				return false
+			}
+
+			// Otherwise, show the close confirmation dialog in the frontend
+			runtime.EventsEmit(ctx, "app:beforeClose")
+			return true // Prevent close, let frontend handle it
 		},
-		Bind: []interface{}{
+		Bind: []any{
 			app,
 		},
 		Windows: &windows.Options{

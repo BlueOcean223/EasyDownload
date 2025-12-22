@@ -62,6 +62,10 @@ export function GetCertPath() {
   return window['go']['main']['App']['GetCertPath']();
 }
 
+export function GetCloseAction() {
+  return window['go']['main']['App']['GetCloseAction']();
+}
+
 export function GetDetectedVideos() {
   return window['go']['main']['App']['GetDetectedVideos']();
 }
@@ -114,24 +118,20 @@ export function IsCertInstalled() {
   return window['go']['main']['App']['IsCertInstalled']();
 }
 
+export function IsDontAskOnClose() {
+  return window['go']['main']['App']['IsDontAskOnClose']();
+}
+
 export function IsFFmpegAvailable() {
   return window['go']['main']['App']['IsFFmpegAvailable']();
-}
-
-export function IsFirstRunComplete() {
-  return window['go']['main']['App']['IsFirstRunComplete']();
-}
-
-export function IsMinimizeToTrayEnabled() {
-  return window['go']['main']['App']['IsMinimizeToTrayEnabled']();
 }
 
 export function IsProxyRunning() {
   return window['go']['main']['App']['IsProxyRunning']();
 }
 
-export function IsShowNotificationEnabled() {
-  return window['go']['main']['App']['IsShowNotificationEnabled']();
+export function IsQuitRequested() {
+  return window['go']['main']['App']['IsQuitRequested']();
 }
 
 export function IsUseUpstreamProxy() {
@@ -174,6 +174,14 @@ export function RemoveDownload(arg1) {
   return window['go']['main']['App']['RemoveDownload'](arg1);
 }
 
+export function RequestClose(arg1) {
+  return window['go']['main']['App']['RequestClose'](arg1);
+}
+
+export function RequestQuit() {
+  return window['go']['main']['App']['RequestQuit']();
+}
+
 export function RestoreFromTray() {
   return window['go']['main']['App']['RestoreFromTray']();
 }
@@ -188,6 +196,14 @@ export function SelectDownloadDir() {
 
 export function SetBilibiliSessData(arg1) {
   return window['go']['main']['App']['SetBilibiliSessData'](arg1);
+}
+
+export function SetCloseAction(arg1) {
+  return window['go']['main']['App']['SetCloseAction'](arg1);
+}
+
+export function SetDontAskOnClose(arg1) {
+  return window['go']['main']['App']['SetDontAskOnClose'](arg1);
 }
 
 export function SetDownloadDir(arg1) {
@@ -224,10 +240,6 @@ export function SetUpstreamProxy(arg1) {
 
 export function SetUseUpstreamProxy(arg1) {
   return window['go']['main']['App']['SetUseUpstreamProxy'](arg1);
-}
-
-export function ShowNotification(arg1, arg2) {
-  return window['go']['main']['App']['ShowNotification'](arg1, arg2);
 }
 
 export function StartProxy() {

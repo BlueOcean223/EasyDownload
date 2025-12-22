@@ -27,15 +27,12 @@ type TrayManager struct {
 	onExit    func()
 
 	// State
-	proxyRunning  bool
-	windowVisible bool
 }
 
 // NewTrayManager creates a new TrayManager instance
 func NewTrayManager() *TrayManager {
 	return &TrayManager{
-		tooltip:       "EasyDownload",
-		windowVisible: true,
+		tooltip: "EasyDownload",
 	}
 }
 
@@ -60,11 +57,6 @@ func (tm *TrayManager) SetOnShow(callback func()) {
 	tm.onShow = callback
 }
 
-// SetOnHide is deprecated, kept for compatibility
-func (tm *TrayManager) SetOnHide(callback func()) {
-	// No longer used
-}
-
 // SetOnSetting sets the callback for opening settings
 func (tm *TrayManager) SetOnSetting(callback func()) {
 	tm.mu.Lock()
@@ -77,11 +69,6 @@ func (tm *TrayManager) SetOnExit(callback func()) {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 	tm.onExit = callback
-}
-
-// SetOnToggleProxy is deprecated, kept for compatibility
-func (tm *TrayManager) SetOnToggleProxy(callback func()) {
-	// No longer used
 }
 
 // Start starts the system tray
@@ -179,7 +166,6 @@ func (tm *TrayManager) handleMenuClicks() {
 func (tm *TrayManager) showWindow() {
 	tm.mu.Lock()
 	callback := tm.onShow
-	tm.windowVisible = true
 	tm.mu.Unlock()
 
 	if callback != nil {
@@ -208,17 +194,18 @@ func (tm *TrayManager) quit() {
 	callback := tm.onExit
 	tm.mu.RUnlock()
 
+	// First quit systray to release resources
+	systray.Quit()
+
+	// Then call the exit callback to perform cleanup and quit the app
 	if callback != nil {
 		callback()
 	}
-
-	systray.Quit()
 }
 
 // SetProxyStatus updates the tray icon based on proxy status
 func (tm *TrayManager) SetProxyStatus(running bool) {
 	tm.mu.Lock()
-	tm.proxyRunning = running
 	icon := tm.icon
 	activeIcon := tm.activeIcon
 	ready := tm.ready
@@ -240,27 +227,6 @@ func (tm *TrayManager) SetProxyStatus(running bool) {
 		}
 		systray.SetTooltip("EasyDownload")
 	}
-}
-
-// IsProxyRunning returns whether the proxy is running
-func (tm *TrayManager) IsProxyRunning() bool {
-	tm.mu.RLock()
-	defer tm.mu.RUnlock()
-	return tm.proxyRunning
-}
-
-// IsWindowVisible returns whether the window is visible
-func (tm *TrayManager) IsWindowVisible() bool {
-	tm.mu.RLock()
-	defer tm.mu.RUnlock()
-	return tm.windowVisible
-}
-
-// SetWindowVisible sets the window visibility state
-func (tm *TrayManager) SetWindowVisible(visible bool) {
-	tm.mu.Lock()
-	tm.windowVisible = visible
-	tm.mu.Unlock()
 }
 
 // ShowNotification displays a system notification

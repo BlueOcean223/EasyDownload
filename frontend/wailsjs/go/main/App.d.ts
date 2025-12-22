@@ -34,6 +34,8 @@ export function GetBilibiliVideoInfoWithAllParts(arg1:string):Promise<downloader
 
 export function GetCertPath():Promise<string>;
 
+export function GetCloseAction():Promise<string>;
+
 export function GetDetectedVideos():Promise<Array<api.DetectedVideo>>;
 
 export function GetDouyinVideoInfo(arg1:string):Promise<douyin.DouyinItem>;
@@ -60,15 +62,13 @@ export function InstallCert():Promise<void>;
 
 export function IsCertInstalled():Promise<boolean>;
 
+export function IsDontAskOnClose():Promise<boolean>;
+
 export function IsFFmpegAvailable():Promise<boolean>;
-
-export function IsFirstRunComplete():Promise<boolean>;
-
-export function IsMinimizeToTrayEnabled():Promise<boolean>;
 
 export function IsProxyRunning():Promise<boolean>;
 
-export function IsShowNotificationEnabled():Promise<boolean>;
+export function IsQuitRequested():Promise<boolean>;
 
 export function IsUseUpstreamProxy():Promise<boolean>;
 
@@ -90,6 +90,10 @@ export function RemoveDetectedVideo(arg1:string):Promise<void>;
 
 export function RemoveDownload(arg1:string):Promise<void>;
 
+export function RequestClose(arg1:string):Promise<void>;
+
+export function RequestQuit():Promise<void>;
+
 export function RestoreFromTray():Promise<void>;
 
 export function ResumeDownload(arg1:string):Promise<void>;
@@ -97,6 +101,10 @@ export function ResumeDownload(arg1:string):Promise<void>;
 export function SelectDownloadDir():Promise<string>;
 
 export function SetBilibiliSessData(arg1:string):Promise<void>;
+
+export function SetCloseAction(arg1:string):Promise<void>;
+
+export function SetDontAskOnClose(arg1:boolean):Promise<void>;
 
 export function SetDownloadDir(arg1:string):Promise<void>;
 
@@ -115,8 +123,6 @@ export function SetTheme(arg1:string):Promise<void>;
 export function SetUpstreamProxy(arg1:string):Promise<void>;
 
 export function SetUseUpstreamProxy(arg1:boolean):Promise<void>;
-
-export function ShowNotification(arg1:string,arg2:string):Promise<void>;
 
 export function StartProxy():Promise<void>;
 

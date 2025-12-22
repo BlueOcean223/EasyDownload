@@ -26,7 +26,10 @@ import {
   SetMinimizeToTray,
   SetShowNotification,
   SetTheme,
-  SetLanguage
+  SetLanguage,
+  SetCloseAction,
+  SetDontAskOnClose,
+  RequestClose
 } from '../../wailsjs/go/main/App'
 import { EventsOn } from '../../wailsjs/runtime/runtime'
 
@@ -52,6 +55,10 @@ export const useAppStore = defineStore('app', () => {
 
   // Proxy chain state
   const useUpstreamProxy = ref(false)
+
+  // Close behavior state
+  const closeAction = ref<'' | 'exit' | 'minimize'>('')
+  const dontAskOnClose = ref(false)
 
   // Computed
   const pendingDownloads = computed(() =>
@@ -83,6 +90,8 @@ export const useAppStore = defineStore('app', () => {
         theme.value = (appInfo.value as any).theme ?? 'dark'
         language.value = (appInfo.value as any).language ?? 'zh-CN'
         useUpstreamProxy.value = (appInfo.value as any).useUpstreamProxy ?? false
+        closeAction.value = (appInfo.value as any).closeAction ?? ''
+        dontAskOnClose.value = (appInfo.value as any).dontAskOnClose ?? false
 
         // Apply theme to DOM
         document.documentElement.setAttribute('data-theme', theme.value)
@@ -455,6 +464,20 @@ export const useAppStore = defineStore('app', () => {
     language.value = newLang
   }
 
+  async function setCloseAction(action: '' | 'exit' | 'minimize') {
+    await SetCloseAction(action)
+    closeAction.value = action
+  }
+
+  async function setDontAskOnClose(dontAsk: boolean) {
+    await SetDontAskOnClose(dontAsk)
+    dontAskOnClose.value = dontAsk
+  }
+
+  async function requestAppClose(action: 'exit' | 'minimize') {
+    await RequestClose(action)
+  }
+
   return {
     // State
     proxyRunning,
@@ -471,6 +494,8 @@ export const useAppStore = defineStore('app', () => {
     theme,
     language,
     useUpstreamProxy,
+    closeAction,
+    dontAskOnClose,
 
     // Computed
     pendingDownloads,
@@ -494,6 +519,9 @@ export const useAppStore = defineStore('app', () => {
     setMinimizeToTray,
     setShowNotification,
     setAppTheme,
-    setAppLanguage
+    setAppLanguage,
+    setCloseAction,
+    setDontAskOnClose,
+    requestAppClose
   }
 })

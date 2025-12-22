@@ -25,9 +25,11 @@ type Config struct {
 	// BilibiliSessData is no longer stored in config file for security
 
 	// System settings
-	MinimizeToTray   bool `json:"minimizeToTray"`
-	ShowNotification bool `json:"showNotification"`
-	FirstRunComplete bool `json:"firstRunComplete"`
+	MinimizeToTray   bool   `json:"minimizeToTray"`
+	ShowNotification bool   `json:"showNotification"`
+	FirstRunComplete bool   `json:"firstRunComplete"`
+	CloseAction      string `json:"closeAction"`    // "exit", "minimize", or "" (ask)
+	DontAskOnClose   bool   `json:"dontAskOnClose"` // Whether to skip the close confirmation dialog
 
 	// Appearance settings
 	Theme    string `json:"theme"`    // "dark" or "light"
@@ -63,6 +65,8 @@ func DefaultConfig() *Config {
 		MinimizeToTray:   true,
 		ShowNotification: true,
 		FirstRunComplete: false,
+		CloseAction:      "",    // Empty means ask user
+		DontAskOnClose:   false, // Show dialog by default
 		Theme:            "dark",
 		Language:         "zh-CN",
 		UpstreamProxy:    "",
@@ -262,6 +266,21 @@ func (cm *ConfigManager) Set(key string, value any) error {
 			cm.config.FirstRunComplete = v
 		} else {
 			return fmt.Errorf("invalid type for firstRunComplete")
+		}
+	case "closeAction":
+		if v, ok := value.(string); ok {
+			if v != "" && v != "exit" && v != "minimize" {
+				return fmt.Errorf("invalid closeAction value: must be '', 'exit', or 'minimize'")
+			}
+			cm.config.CloseAction = v
+		} else {
+			return fmt.Errorf("invalid type for closeAction")
+		}
+	case "dontAskOnClose":
+		if v, ok := value.(bool); ok {
+			cm.config.DontAskOnClose = v
+		} else {
+			return fmt.Errorf("invalid type for dontAskOnClose")
 		}
 	case "version":
 		if v, ok := value.(string); ok {

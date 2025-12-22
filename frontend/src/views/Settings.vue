@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
 import { useAppStore } from '@/stores/app'
-import { 
-  NCard, NButton, NInput, NSpace, NTag, 
-  NDivider, NSwitch, useMessage, NAlert 
+import {
+  NCard, NButton, NInput, NSpace, NTag,
+  NDivider, NSwitch, useMessage, NAlert, NSelect
 } from 'naive-ui'
 import { 
   FolderOpenOutline, 
@@ -24,7 +24,8 @@ import {
   SetUpstreamProxy,
   SetUseUpstreamProxy,
   GetProxyDebug,
-  SetProxyDebug
+  SetProxyDebug,
+  GetCloseAction
 } from '../../wailsjs/go/main/App'
 
 const store = useAppStore()
@@ -39,6 +40,13 @@ const resettingSessData = ref(false)
 const logDir = ref('')
 const upstreamProxyInput = ref('')
 const proxyDebug = ref(false)
+const closeAction = ref<'' | 'exit' | 'minimize'>('')
+
+const closeActionOptions = [
+  { label: '每次询问', value: '' },
+  { label: '最小化到托盘', value: 'minimize' },
+  { label: '退出应用', value: 'exit' }
+]
 
 onMounted(async () => {
   // Check if SESSDATA is set (without exposing the actual value for security)
@@ -67,6 +75,13 @@ onMounted(async () => {
     proxyDebug.value = await GetProxyDebug()
   } catch (e) {
     console.error('Failed to get proxy debug:', e)
+  }
+  
+  // Load close action
+  try {
+    closeAction.value = await GetCloseAction() as '' | 'exit' | 'minimize'
+  } catch (e) {
+    console.error('Failed to get close action:', e)
   }
 })
 
@@ -145,17 +160,21 @@ async function openLogDirectory() {
   }
 }
 
-async function toggleMinimizeToTray(value: boolean) {
+async function toggleShowNotification(value: boolean) {
   try {
-    await store.setMinimizeToTray(value)
+    await store.setShowNotification(value)
   } catch (e: any) {
     message.error(e.message || '设置失败')
   }
 }
 
-async function toggleShowNotification(value: boolean) {
+async function handleCloseActionChange(action: '' | 'exit' | 'minimize') {
   try {
-    await store.setShowNotification(value)
+    await store.setCloseAction(action)
+    closeAction.value = action
+    // If user selects a specific action, also set dontAskOnClose
+    await store.setDontAskOnClose(action !== '')
+    message.success('关闭行为已更新')
   } catch (e: any) {
     message.error(e.message || '设置失败')
   }
@@ -465,12 +484,14 @@ async function saveUpstreamProxy() {
         <div class="space-y-4">
           <div class="flex items-center justify-between">
             <div>
-              <p class="text-sm font-medium">最小化到托盘</p>
-              <p class="text-xs text-text-secondary">关闭窗口时最小化到系统托盘而不是退出</p>
+              <p class="text-sm font-medium">关闭窗口时的行为</p>
+              <p class="text-xs text-text-secondary">选择关闭窗口时的默认操作</p>
             </div>
-            <NSwitch 
-              :value="store.minimizeToTray"
-              @update:value="toggleMinimizeToTray"
+            <NSelect
+              :value="closeAction"
+              :options="closeActionOptions"
+              style="width: 160px"
+              @update:value="handleCloseActionChange"
             />
           </div>
           

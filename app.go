@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"sync/atomic"
 	"time"
 
 	"EasyDownload/assets"
@@ -51,6 +52,11 @@ type App struct {
 
 	// Diagnostics
 	proxyDebug bool
+
+	// Close behavior
+	closeAction    string // "exit", "minimize", or "" (ask)
+	dontAskOnClose bool   // Whether to skip the close confirmation dialog
+	quitRequested  atomic.Bool
 }
 
 // NewApp creates a new App application struct
@@ -74,6 +80,8 @@ func NewApp() *App {
 		upstreamProxy:    "",
 		useUpstreamProxy: false,
 		proxyDebug:       false,
+		closeAction:      "",    // Empty means ask user
+		dontAskOnClose:   false, // Show dialog by default
 	}
 }
 
@@ -112,6 +120,8 @@ func (a *App) startup(ctx context.Context) {
 			a.upstreamProxy = cfg.UpstreamProxy
 			a.useUpstreamProxy = cfg.UseUpstreamProxy
 			a.proxyDebug = cfg.ProxyDebug
+			a.closeAction = cfg.CloseAction
+			a.dontAskOnClose = cfg.DontAskOnClose
 		}
 	}
 
@@ -305,8 +315,7 @@ func (a *App) initTray() {
 
 	// Set callbacks
 	a.trayManager.SetOnShow(func() {
-		runtime.WindowShow(a.ctx)
-		a.trayManager.SetWindowVisible(true)
+		a.RestoreFromTray()
 	})
 
 	a.trayManager.SetOnSetting(func() {
@@ -315,8 +324,7 @@ func (a *App) initTray() {
 	})
 
 	a.trayManager.SetOnExit(func() {
-		a.shutdown(a.ctx)
-		runtime.Quit(a.ctx)
+		a.RequestQuit()
 	})
 
 	// Start tray in background
@@ -992,6 +1000,8 @@ func (a *App) GetAppInfo() map[string]interface{} {
 		"upstreamProxy":    a.upstreamProxy,
 		"useUpstreamProxy": a.useUpstreamProxy,
 		"proxyDebug":       a.proxyDebug,
+		"closeAction":      a.closeAction,
+		"dontAskOnClose":   a.dontAskOnClose,
 	}
 }
 
@@ -999,23 +1009,26 @@ func (a *App) GetAppInfo() map[string]interface{} {
 
 // MinimizeToTray minimizes the window to system tray
 func (a *App) MinimizeToTray() {
-	runtime.WindowHide(a.ctx)
-	if a.trayManager != nil {
-		a.trayManager.SetWindowVisible(false)
+	if a.ctx == nil {
+		return
 	}
+	a.applyMinimizeToTray(a.ctx)
+}
+
+func (a *App) applyMinimizeToTray(ctx context.Context) {
+	runtime.WindowHide(ctx)
 }
 
 // RestoreFromTray restores the window from system tray
 func (a *App) RestoreFromTray() {
-	runtime.WindowShow(a.ctx)
-	if a.trayManager != nil {
-		a.trayManager.SetWindowVisible(true)
+	if a.ctx == nil {
+		return
 	}
+	a.applyRestoreFromTray(a.ctx)
 }
 
-// IsMinimizeToTrayEnabled returns whether minimize to tray is enabled
-func (a *App) IsMinimizeToTrayEnabled() bool {
-	return a.minimizeToTray
+func (a *App) applyRestoreFromTray(ctx context.Context) {
+	runtime.WindowShow(ctx)
 }
 
 // SetMinimizeToTray sets whether to minimize to tray on close
@@ -1026,11 +1039,6 @@ func (a *App) SetMinimizeToTray(enabled bool) {
 	}
 }
 
-// IsShowNotificationEnabled returns whether notifications are enabled
-func (a *App) IsShowNotificationEnabled() bool {
-	return a.showNotification
-}
-
 // SetShowNotification sets whether to show notifications
 func (a *App) SetShowNotification(enabled bool) {
 	a.showNotification = enabled
@@ -1039,23 +1047,11 @@ func (a *App) SetShowNotification(enabled bool) {
 	}
 }
 
-// IsFirstRunComplete returns whether first run setup is complete
-func (a *App) IsFirstRunComplete() bool {
-	return a.firstRunComplete
-}
-
 // SetFirstRunComplete marks first run setup as complete
 func (a *App) SetFirstRunComplete(complete bool) {
 	a.firstRunComplete = complete
 	if a.configManager != nil {
 		_ = a.configManager.Set("firstRunComplete", complete)
-	}
-}
-
-// ShowNotification shows a system notification
-func (a *App) ShowNotification(title, message string) {
-	if a.trayManager != nil {
-		a.trayManager.ShowNotification(title, message)
 	}
 }
 
@@ -1167,4 +1163,60 @@ func (a *App) SetProxyDebug(enabled bool) {
 // LogFrontend logs a message from the frontend to the persistent log file
 func (a *App) LogFrontend(message string) {
 	logger.Info("[Frontend] %s", message)
+}
+
+// ==================== Close Behavior Methods ====================
+
+// GetCloseAction returns the current close action setting
+func (a *App) GetCloseAction() string {
+	return a.closeAction
+}
+
+// SetCloseAction sets the close action ("exit", "minimize", or "" for ask)
+func (a *App) SetCloseAction(action string) error {
+	if action != "" && action != "exit" && action != "minimize" {
+		return fmt.Errorf("invalid close action: must be '', 'exit', or 'minimize'")
+	}
+	a.closeAction = action
+	if a.configManager != nil {
+		_ = a.configManager.Set("closeAction", action)
+	}
+	return nil
+}
+
+// IsDontAskOnClose returns whether to skip the close confirmation dialog
+func (a *App) IsDontAskOnClose() bool {
+	return a.dontAskOnClose
+}
+
+// SetDontAskOnClose sets whether to skip the close confirmation dialog
+func (a *App) SetDontAskOnClose(dontAsk bool) {
+	a.dontAskOnClose = dontAsk
+	if a.configManager != nil {
+		_ = a.configManager.Set("dontAskOnClose", dontAsk)
+	}
+}
+
+// RequestClose is called from frontend when user confirms close action
+// action: "exit" to quit, "minimize" to minimize to tray
+func (a *App) RequestClose(action string) {
+	switch action {
+	case "exit":
+		a.RequestQuit()
+	case "minimize":
+		a.MinimizeToTray()
+	}
+}
+
+// RequestQuit requests the app to quit immediately without showing the close dialog.
+func (a *App) RequestQuit() {
+	a.quitRequested.Store(true)
+	if a.ctx == nil {
+		return
+	}
+	runtime.Quit(a.ctx)
+}
+
+func (a *App) IsQuitRequested() bool {
+	return a.quitRequested.Load()
 }

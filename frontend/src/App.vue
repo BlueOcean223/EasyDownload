@@ -19,6 +19,7 @@ import {
 } from '@vicons/ionicons5'
 import { h } from 'vue'
 import WelcomeWizard from '@/components/WelcomeWizard.vue'
+import CloseConfirmDialog from '@/components/CloseConfirmDialog.vue'
 import BilibiliIcon from '@/components/BilibiliIcon.vue'
 import { EventsOn, EventsOff } from '../wailsjs/runtime/runtime'
 
@@ -29,6 +30,7 @@ const store = useAppStore()
 const collapsed = ref(false)
 const toggling = ref(false)
 const showWelcome = ref(false)
+const showCloseDialog = ref(false)
 
 const activeKey = computed(() => route.name as string)
 
@@ -93,10 +95,16 @@ onMounted(async () => {
   EventsOn('navigate:settings', () => {
     router.push({ name: 'Settings' })
   })
+  
+  // Listen for app:beforeClose event to show close confirmation dialog
+  EventsOn('app:beforeClose', () => {
+    showCloseDialog.value = true
+  })
 })
 
 onUnmounted(() => {
   EventsOff('navigate:settings')
+  EventsOff('app:beforeClose')
 })
 
 function handleWelcomeComplete() {
@@ -212,6 +220,9 @@ function handleWelcomeSkip() {
         @complete="handleWelcomeComplete"
         @skip="handleWelcomeSkip"
       />
+      
+      <!-- Close Confirmation Dialog -->
+      <CloseConfirmDialog v-model:show="showCloseDialog" />
     </div>
     </NMessageProvider>
   </NConfigProvider>
