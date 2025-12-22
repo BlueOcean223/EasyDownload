@@ -15,7 +15,9 @@ import {
   SettingsOutline,
   PlayOutline,
   StopOutline,
-  LogoTiktok
+  LogoTiktok,
+  SunnyOutline,
+  MoonOutline
 } from '@vicons/ionicons5'
 import { h } from 'vue'
 import WelcomeWizard from '@/components/WelcomeWizard.vue'
@@ -88,6 +90,48 @@ async function toggleProxy() {
   }
 }
 
+async function toggleTheme(event?: MouseEvent) {
+  const isDark = store.theme === 'dark'
+  const newTheme = isDark ? 'light' : 'dark'
+  const isSwitchingToDark = !isDark
+
+  // Use View Transitions API if supported
+  if (!(document as any).startViewTransition) {
+    store.setAppTheme(newTheme)
+    return
+  }
+
+  const transition = (document as any).startViewTransition(async () => {
+    await store.setAppTheme(newTheme)
+  })
+
+  transition.ready.then(() => {
+    // White -> Dark: Top-Left to Bottom-Right (Expand from 0,0)
+    // Dark -> White: Bottom-Right to Top-Left (Expand from W,H)
+    const x = isSwitchingToDark ? 0 : window.innerWidth
+    const y = isSwitchingToDark ? 0 : window.innerHeight
+    
+    const endRadius = Math.hypot(
+      Math.max(x, window.innerWidth - x),
+      Math.max(y, window.innerHeight - y)
+    )
+
+    document.documentElement.animate(
+      {
+        clipPath: [
+          `circle(0px at ${x}px ${y}px)`,
+          `circle(${endRadius}px at ${x}px ${y}px)`,
+        ],
+      },
+      {
+        duration: 500,
+        easing: 'ease-in-out',
+        pseudoElement: '::view-transition-new(root)',
+      }
+    )
+  })
+}
+
 onMounted(async () => {
   await store.initApp()
   
@@ -134,25 +178,30 @@ function handleWelcomeSkip() {
         :class="collapsed ? 'w-16' : 'w-56'"
       >
         <!-- Logo -->
-        <div class="logo-section h-14 flex items-center justify-center border-b border-border">
+        <div class="logo-section h-14 flex items-center justify-center border-b border-border relative overflow-hidden">
           <h1 
-            v-if="!collapsed" 
-            class="text-lg font-bold text-accent"
+            class="text-lg font-bold text-accent absolute transition-opacity duration-300 whitespace-nowrap"
+            :class="collapsed ? 'opacity-0 pointer-events-none' : 'opacity-100'"
           >
             EasyDownload
           </h1>
-          <span v-else class="text-xl font-bold text-accent">ED</span>
+          <span 
+            class="text-xl font-bold text-accent absolute transition-opacity duration-300"
+            :class="collapsed ? 'opacity-100' : 'opacity-0 pointer-events-none'"
+          >
+            ED
+          </span>
         </div>
         
         <!-- Proxy Control -->
         <div class="proxy-control p-3 border-b border-border">
           <div 
-            class="flex items-center gap-3 p-2 rounded-lg bg-tertiary cursor-pointer hover:bg-tertiary/80 transition-colors"
+            class="flex items-center gap-3 p-2 rounded-lg bg-tertiary cursor-pointer hover:bg-tertiary/80 transition-colors h-[48px]"
             :class="{ 'justify-center': collapsed }"
             @click="toggleProxy"
           >
             <div 
-              class="w-8 h-8 rounded-full flex items-center justify-center transition-colors"
+              class="w-8 h-8 flex-shrink-0 rounded-full flex items-center justify-center transition-colors"
               :class="store.proxyRunning ? 'bg-green-500/20 text-green-500' : 'bg-red-500/20 text-red-500'"
             >
               <NSpin v-if="toggling" :size="16" />
@@ -160,7 +209,10 @@ function handleWelcomeSkip() {
               <StopOutline v-else class="w-4 h-4" />
             </div>
             
-            <div v-if="!collapsed" class="flex-1">
+            <div 
+              class="flex-1 overflow-hidden whitespace-nowrap transition-all duration-300 transform"
+              :class="collapsed ? 'opacity-0 translate-x-[-10px] w-0' : 'opacity-100 translate-x-0 w-auto'"
+            >
               <p class="text-xs font-medium">
                 {{ store.proxyRunning ? '代理运行中' : '代理已停止' }}
               </p>
@@ -172,7 +224,7 @@ function handleWelcomeSkip() {
         </div>
         
         <!-- Navigation Menu -->
-        <div class="menu-section flex-1 py-2">
+        <div class="menu-section flex-1 py-2 overflow-y-auto overflow-x-hidden">
           <NMenu
             :collapsed="collapsed"
             :collapsed-width="64"
@@ -183,8 +235,31 @@ function handleWelcomeSkip() {
           />
         </div>
         
+        <!-- Theme Toggle -->
+        <div class="theme-toggle px-3 pt-3">
+          <div 
+            class="flex items-center gap-3 p-2 rounded-lg hover:bg-tertiary/50 cursor-pointer transition-colors h-[40px]"
+            :class="{ 'justify-center': collapsed }"
+            @click="toggleTheme"
+          >
+            <div class="w-8 h-8 flex-shrink-0 flex items-center justify-center text-text-secondary">
+              <MoonOutline v-if="store.theme === 'dark'" class="w-5 h-5" />
+              <SunnyOutline v-else class="w-5 h-5" />
+            </div>
+            
+            <div 
+              class="flex-1 overflow-hidden whitespace-nowrap transition-all duration-300 transform"
+              :class="collapsed ? 'opacity-0 translate-x-[-10px] w-0' : 'opacity-100 translate-x-0 w-auto'"
+            >
+              <span class="text-sm font-medium text-text-primary">
+                {{ store.theme === 'dark' ? '深色模式' : '浅色模式' }}
+              </span>
+            </div>
+          </div>
+        </div>
+
         <!-- Collapse Toggle -->
-        <div class="collapse-toggle p-3 border-t border-border">
+        <div class="collapse-toggle p-3">
           <NButton 
             quaternary 
             block 

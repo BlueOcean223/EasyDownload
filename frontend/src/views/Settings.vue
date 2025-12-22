@@ -199,45 +199,7 @@ async function toggleProxyDebug(value: boolean) {
   }
 }
 
-async function toggleTheme(value: boolean) {
-  const newTheme = value ? 'dark' : 'light'
-  
-  // Use View Transitions API if supported
-  if (!(document as any).startViewTransition) {
-    store.setAppTheme(newTheme)
-    return
-  }
 
-  const transition = (document as any).startViewTransition(async () => {
-    await store.setAppTheme(newTheme)
-  })
-
-  transition.ready.then(() => {
-    // White -> Dark: Top-Left to Bottom-Right (Expand from 0,0)
-    // Dark -> White: Bottom-Right to Top-Left (Expand from W,H)
-    const x = value ? 0 : window.innerWidth
-    const y = value ? 0 : window.innerHeight
-    
-    const endRadius = Math.hypot(
-      Math.max(x, window.innerWidth - x),
-      Math.max(y, window.innerHeight - y)
-    )
-
-    document.documentElement.animate(
-      {
-        clipPath: [
-          `circle(0px at ${x}px ${y}px)`,
-          `circle(${endRadius}px at ${x}px ${y}px)`,
-        ],
-      },
-      {
-        duration: 500,
-        easing: 'ease-in-out',
-        pseudoElement: '::view-transition-new(root)',
-      }
-    )
-  })
-}
 
 async function saveUpstreamProxy() {
   try {
@@ -463,22 +425,7 @@ async function saveUpstreamProxy() {
         </div>
       </NCard>
       
-      <!-- Appearance Settings -->
-      <NCard title="外观设置" :bordered="false" class="bg-secondary rounded-xl shadow-sm">
-        <div class="space-y-4">
-          <div class="flex items-center justify-between">
-            <div>
-              <p class="text-sm font-medium">深色模式</p>
-              <p class="text-xs text-text-secondary">使用深色界面主题</p>
-            </div>
-            <NSwitch 
-              :value="store.theme === 'dark'"
-              @update:value="toggleTheme"
-            />
-          </div>
-        </div>
-      </NCard>
-      
+
       <!-- System Tray Settings -->
       <NCard title="系统托盘" :bordered="false" class="bg-secondary rounded-xl shadow-sm">
         <div class="space-y-4">
