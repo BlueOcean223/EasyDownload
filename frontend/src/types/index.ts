@@ -143,8 +143,11 @@ export interface DouyinStream {
 }
 
 // Douyin image (field names match Go exported struct)
+// For mixed content (aweme_type 68), items can be images or videos.
+// If VideoURL is non-empty, the item is a video.
 export interface DouyinImage {
   URL: string
+  VideoURL?: string // Non-empty for video items in mixed content albums
   Width: number
   Height: number
 }

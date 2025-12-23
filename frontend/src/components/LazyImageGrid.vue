@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onBeforeUnmount, watch, nextTick } from 'vue'
-import { ImagesOutline } from '@vicons/ionicons5'
+import { ImagesOutline, PlayCircleOutline } from '@vicons/ionicons5'
 import ProxiedImage from './ProxiedImage.vue'
 import type { DouyinImage } from '@/types'
 import { useVirtualGrid } from '@/composables/useVirtualGrid'
@@ -121,6 +121,14 @@ onBeforeUnmount(() => {
               </div>
             </template>
           </ProxiedImage>
+          <!-- Video indicator badge -->
+          <div
+            v-if="item.data.VideoURL"
+            class="absolute bottom-2 right-2 bg-black/70 text-white px-2 py-1 rounded-md flex items-center gap-1 text-xs"
+          >
+            <PlayCircleOutline class="w-4 h-4" />
+            <span>视频</span>
+          </div>
         </div>
       </template>
     </div>

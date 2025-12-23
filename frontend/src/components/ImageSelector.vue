@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, watch, nextTick } from 'vue'
 import { NModal, NButton, NCheckbox, NTag, NEmpty } from 'naive-ui'
-import { ImagesOutline, CloudDownloadOutline, CheckmarkCircle } from '@vicons/ionicons5'
+import { ImagesOutline, CloudDownloadOutline, CheckmarkCircle, PlayCircleOutline } from '@vicons/ionicons5'
 import type { DouyinImage } from '@/types'
 import ProxiedImage from './ProxiedImage.vue'
 import { useVirtualGrid } from '@/composables/useVirtualGrid'
@@ -165,7 +165,8 @@ function cancel() {
                   </div>
                 </div>
 
-                <div class="absolute bottom-1 right-1 bg-black/60 text-white text-xs px-1.5 py-0.5 rounded backdrop-blur-sm">
+                <div class="absolute bottom-1 right-1 bg-black/60 text-white text-xs px-1.5 py-0.5 rounded backdrop-blur-sm flex items-center gap-1">
+                  <PlayCircleOutline v-if="item.data.VideoURL" class="w-3 h-3" />
                   {{ item.index + 1 }}
                 </div>
               </div>

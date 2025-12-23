@@ -41,6 +41,26 @@ const canDownload = computed(() => {
   return isVideo.value ? !!selectedQuality.value : true
 })
 
+const albumStats = computed(() => {
+  const items = douyinItem.value?.Images || []
+  const videoCount = items.filter(i => !!i.VideoURL).length
+  return {
+    total: items.length,
+    video: videoCount,
+    image: items.length - videoCount
+  }
+})
+
+const albumSummary = computed(() => {
+  const { total, video, image } = albumStats.value
+  if (total === 0) return ''
+  if (video > 0 && image === 0) return `${total} 个视频`
+  if (video > 0 && image > 0) return `${total} 个媒体 (${video} 视频/${image} 图片)`
+  return `${total} 张图片`
+})
+
+const albumPreviewTitle = computed(() => (albumStats.value.video > 0 ? '媒体预览' : '图片预览'))
+
 // Get estimated file size for selected quality
 const selectedStreamSize = computed(() => {
   if (!douyinItem.value || !selectedQuality.value) return null
@@ -226,7 +246,7 @@ function handleKeydown(e: KeyboardEvent) {
                   </NTag>
                   <NTag v-else type="warning" size="small">
                     <template #icon><ImagesOutline /></template>
-                    图集
+                    {{ albumStats.video > 0 && albumStats.image > 0 ? '视频·图集' : (albumStats.video > 0 ? '视频集' : '图集') }}
                   </NTag>
                 </div>
               </div>
@@ -247,7 +267,7 @@ function handleKeydown(e: KeyboardEvent) {
                 </span>
                 <span v-else class="flex items-center gap-1">
                   <ImagesOutline class="w-4 h-4" />
-                  {{ douyinItem.Images.length }} 张图片
+                  {{ albumSummary }}
                 </span>
               </div>
 
@@ -287,7 +307,7 @@ function handleKeydown(e: KeyboardEvent) {
                     <template #icon>
                       <CloudDownloadOutline class="w-4 h-4" />
                     </template>
-                    {{ isVideo ? '下载视频' : '下载图集' }}
+                    {{ isVideo ? '下载视频' : '下载全部' }}
                   </NButton>
                 </div>
               </div>
@@ -296,7 +316,7 @@ function handleKeydown(e: KeyboardEvent) {
         </NCard>
 
         <div v-if="isAlbum && douyinItem.Images.length > 0" class="mt-6">
-          <h4 class="text-lg font-semibold mb-3">图片预览 ({{ douyinItem.Images.length }})</h4>
+          <h4 class="text-lg font-semibold mb-3">{{ albumPreviewTitle }} ({{ douyinItem.Images.length }})</h4>
           <LazyImageGrid
             :images="douyinItem.Images"
             @click="openPreview"

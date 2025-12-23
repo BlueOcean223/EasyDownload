@@ -46,6 +46,7 @@ func TestParseLongLinks(t *testing.T) {
 	}{
 		{"video", "https://www.douyin.com/video/1234567890123456789", "1234567890123456789"},
 		{"note", "https://www.douyin.com/note/22334455/?previous_page=app_code_link", "22334455"},
+		{"slides", "https://www.iesdouyin.com/share/slides/33445566/?region=CN&is_slides=1", "33445566"},
 		{"modal", "https://www.douyin.com/user/abc?modal_id=99887766&something=else", "99887766"},
 	}
 
@@ -57,6 +58,23 @@ func TestParseLongLinks(t *testing.T) {
 		if got != tc.want {
 			t.Fatalf("%s: expected %s, got %s", tc.name, tc.want, got)
 		}
+	}
+}
+
+func TestParseShortLinkToSlidesShare(t *testing.T) {
+	const awemeID = "7581318093000712817"
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "https://www.iesdouyin.com/share/slides/"+awemeID+"/?is_slides=1&contains_video_type_clip=1", http.StatusFound)
+	}))
+	defer ts.Close()
+
+	parser := newShortParser(ts)
+	got, err := parser.Parse(ts.URL + "/short")
+	if err != nil {
+		t.Fatalf("Parse short link returned error: %v", err)
+	}
+	if got != awemeID {
+		t.Fatalf("expected %s, got %s", awemeID, got)
 	}
 }
 

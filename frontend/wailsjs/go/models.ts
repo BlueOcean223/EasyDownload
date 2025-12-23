@@ -87,6 +87,7 @@ export namespace douyin {
 	
 	export class Image {
 	    URL: string;
+	    VideoURL: string;
 	    Width: number;
 	    Height: number;
 	
@@ -97,6 +98,7 @@ export namespace douyin {
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.URL = source["URL"];
+	        this.VideoURL = source["VideoURL"];
 	        this.Width = source["Width"];
 	        this.Height = source["Height"];
 	    }

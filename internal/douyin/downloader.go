@@ -314,7 +314,7 @@ func (d *Downloader) downloadImagesCore(
 		mu.Unlock()
 	}
 
-	// Launch concurrent image downloads.
+	// Launch concurrent media downloads (images or videos).
 	for _, idx := range selected {
 		if _, ok := completed[idx]; ok {
 			continue // Already downloaded in previous session.
@@ -332,17 +332,43 @@ func (d *Downloader) downloadImagesCore(
 			}
 			defer func() { <-sem }()
 
-			data, err := d.downloadImageWithRetry(ctx, client, img.URL)
-			if err != nil {
-				setErr(err)
+			// Determine download URL: prefer VideoURL for video items, otherwise use image URL.
+			downloadURL := strings.TrimSpace(img.URL)
+			isVideo := false
+			if v := strings.TrimSpace(img.VideoURL); v != "" {
+				downloadURL = v
+				isVideo = true
+			}
+			if downloadURL == "" {
+				setErr(fmt.Errorf("empty album media url: index %d", idx))
 				return
 			}
 
-			dataSize := int64(len(data))
 			tempPath := utils.AlbumImageTempPath(tempDir, idx)
-			if err := os.WriteFile(tempPath, data, 0644); err != nil {
-				setErr(err)
-				return
+			var dataSize int64
+
+			if isVideo {
+				// Download video using sequential downloader (handles large files better).
+				headers := d.effectiveHeaders()
+				if err := d.downloadVideoSequential(ctx, client, downloadURL, tempPath, headers, 0, nil, nil); err != nil {
+					setErr(err)
+					return
+				}
+				if fi, err := os.Stat(tempPath); err == nil {
+					dataSize = fi.Size()
+				}
+			} else {
+				// Download image with retry.
+				data, err := d.downloadImageWithRetry(ctx, client, downloadURL)
+				if err != nil {
+					setErr(err)
+					return
+				}
+				dataSize = int64(len(data))
+				if err := os.WriteFile(tempPath, data, 0644); err != nil {
+					setErr(err)
+					return
+				}
 			}
 
 			// Update state under lock, but defer IO outside lock.
@@ -676,6 +702,49 @@ func imageFileName(idx int, rawURL string) string {
 	return fmt.Sprintf("%d_%s%s", seq, name, ext)
 }
 
+// videoFileName generates a filename for an album video.
+// Format: {sequence}_{original_name}.{ext}
+// Example: "1_abc123.mp4", "2_video_2.mp4"
+func videoFileName(idx int, rawURL string) string {
+	seq := idx + 1
+	base := ""
+
+	if u, err := url.Parse(rawURL); err == nil && u.Path != "" {
+		base = path.Base(u.Path)
+	}
+	if base == "" || base == "/" || base == "." {
+		base = fmt.Sprintf("video_%d", seq)
+	}
+
+	extRaw := path.Ext(base)
+	ext := strings.ToLower(extRaw)
+	name := strings.TrimSuffix(base, extRaw)
+	name = utils.SanitizeFileName(name, 50)
+	if name == "" || name == "." || name == ".." {
+		name = fmt.Sprintf("video_%d", seq)
+	}
+
+	if ext == "" {
+		ext = ".mp4"
+	}
+	switch ext {
+	case ".mp4", ".mov", ".m4v", ".webm":
+	default:
+		ext = ".mp4"
+	}
+
+	return fmt.Sprintf("%d_%s%s", seq, name, ext)
+}
+
+// albumEntryName generates a filename for an album entry (image or video).
+// Uses videoFileName if the item has VideoURL, otherwise uses imageFileName.
+func albumEntryName(idx int, img Image) string {
+	if strings.TrimSpace(img.VideoURL) != "" {
+		return videoFileName(idx, img.VideoURL)
+	}
+	return imageFileName(idx, img.URL)
+}
+
 // douyinFileBase generates a base filename from item metadata.
 // Combines author, title, and ID for a descriptive filename.
 func douyinFileBase(item *DouyinItem) string {
@@ -914,7 +983,7 @@ func writeAlbumZip(destPath, tempDir string, images []Image, indices []int) (err
 			return err
 		}
 
-		entryName := imageFileName(idx, images[idx].URL)
+		entryName := albumEntryName(idx, images[idx])
 		writer, createErr := zw.Create(entryName)
 		if createErr != nil {
 			_ = f.Close()

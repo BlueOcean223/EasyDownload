@@ -17,6 +17,12 @@ const videoDetailResponse = `{"status_code":0,"aweme_detail":{"aweme_id":"123456
 
 const albumResponse = `{"status_code":0,"item_list":[{"aweme_id":"9988","desc":"album","aweme_type":68,"author":{"nickname":"alice","uid":"u2"},"images":[{"url_list":["https://example.com/img1.jpg"],"width":1080,"height":1920},{"url_list":["https://example.com/img2.jpg"],"width":1080,"height":1920}]}]}`
 
+const multiVideoAlbumResponse = `{"status_code":0,"item_list":[{"aweme_id":"m1","desc":"mv","aweme_type":68,"author":{"nickname":"alice","uid":"u2"},"images":[{"url_list":[],"video":{"play_addr":{"url_list":["https://example.com/playwm/v1"],"width":720,"height":1280}},"width":720,"height":1280},{"url_list":[],"video":{"play_addr":{"uri":"vid123"}},"width":1080,"height":1920}]}]}`
+
+const multiVideoAlbumImgBitrateResponse = `{"status_code":0,"item_list":[{"aweme_id":"m2","desc":"mv2","aweme_type":2,"author":{"nickname":"alice","uid":"u2"},"images":[{"url_list":["https://example.com/cover1.jpg"],"width":720,"height":1280},{"url_list":["https://example.com/cover2.jpg"],"width":1080,"height":1920}],"img_bitrate":[{"play_addr":{"url_list":["https://example.com/playwm/v1"],"width":720,"height":1280}},{"play_addr":{"uri":"vid456","width":1080,"height":1920}}]}]}`
+
+const slidesInfoMultiVideoResponse = `{"status_code":0,"aweme_details":[{"aweme_id":"s1","desc":"slides","aweme_type":0,"author":{"nickname":"alice","uid":"u2"},"images":[{"url_list":["https://example.com/cover1.jpg"],"video":{"play_addr":{"url_list":["https://example.com/playwm/v1"],"width":720,"height":1280}},"width":720,"height":1280},{"url_list":["https://example.com/cover2.jpg"],"video":{"play_addr":{"uri":"vid789","width":1080,"height":1920}},"width":1080,"height":1920}]}]}`
+
 const fallbackResponse = `{"status_code":0,"item_list":[{"aweme_id":"77","desc":"fallback","aweme_type":0,"author":{"nickname":"c","uid":"u3"},"video":{"duration":8000,"cover":{"url_list":["https://example.com/cover.jpg"]},"play_addr":{"url_list":["https://example.com/playwm/base"],"width":640,"height":360}}}]}`
 const emptyListResponse = `{"status_code":0,"item_list":[]}`
 const apiErrorResponse = `{"status_code":1,"status_msg":"unexpected error"}`
@@ -138,6 +144,106 @@ func TestClientGetItemInfoAlbum(t *testing.T) {
 	}
 	if item.Cover != "https://example.com/img1.jpg" {
 		t.Fatalf("expected cover from first image, got %s", item.Cover)
+	}
+}
+
+func TestClientGetItemInfoAlbum_MultiVideoCollection(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, multiVideoAlbumResponse)
+	}))
+	defer ts.Close()
+
+	client := newTestClient(ts)
+
+	item, err := client.GetItemInfo("m1")
+	if err != nil {
+		t.Fatalf("GetItemInfo returned error: %v", err)
+	}
+
+	if item.Type != "album" {
+		t.Fatalf("expected album type, got %s", item.Type)
+	}
+	if len(item.Images) != 2 {
+		t.Fatalf("expected 2 media items, got %d", len(item.Images))
+	}
+	if item.Images[0].VideoURL != "https://example.com/play/v1" {
+		t.Fatalf("expected playwm to be replaced, got %s", item.Images[0].VideoURL)
+	}
+	if item.Images[1].VideoURL != "https://aweme.snssdk.com/aweme/v1/play/?video_id=vid123&ratio=1080p&line=0" {
+		t.Fatalf("expected constructed URL from uri, got %s", item.Images[1].VideoURL)
+	}
+	if item.Cover != "https://example.com/play/v1" {
+		t.Fatalf("expected cover fallback to first video URL, got %s", item.Cover)
+	}
+}
+
+func TestClientGetItemInfoAlbum_MultiVideoCollection_ImgBitrate(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, multiVideoAlbumImgBitrateResponse)
+	}))
+	defer ts.Close()
+
+	client := newTestClient(ts)
+
+	item, err := client.GetItemInfo("m2")
+	if err != nil {
+		t.Fatalf("GetItemInfo returned error: %v", err)
+	}
+
+	if item.Type != "album" {
+		t.Fatalf("expected album type, got %s", item.Type)
+	}
+	if len(item.Images) != 2 {
+		t.Fatalf("expected 2 media items, got %d", len(item.Images))
+	}
+	if item.Images[0].VideoURL != "https://example.com/play/v1" {
+		t.Fatalf("expected playwm to be replaced, got %s", item.Images[0].VideoURL)
+	}
+	if item.Images[1].VideoURL != "https://aweme.snssdk.com/aweme/v1/play/?video_id=vid456&ratio=1080p&line=0" {
+		t.Fatalf("expected constructed URL from uri, got %s", item.Images[1].VideoURL)
+	}
+}
+
+func TestClientFallbackToSlidesInfo(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Force the primary API to fail so the client tries slidesinfo.
+		if r.URL.Query().Get("aweme_id") != "" {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/web/api/v2/aweme/slidesinfo/") {
+			if r.URL.Query().Get("aweme_ids") != "[s1]" {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, slidesInfoMultiVideoResponse)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer ts.Close()
+
+	client := newTestClient(ts)
+
+	item, err := client.GetItemInfo("s1")
+	if err != nil {
+		t.Fatalf("GetItemInfo returned error: %v", err)
+	}
+
+	if item.Type != "album" {
+		t.Fatalf("expected album type, got %s", item.Type)
+	}
+	if len(item.Images) != 2 {
+		t.Fatalf("expected 2 media items, got %d", len(item.Images))
+	}
+	if item.Images[0].VideoURL != "https://example.com/play/v1" {
+		t.Fatalf("expected playwm to be replaced, got %s", item.Images[0].VideoURL)
+	}
+	if item.Images[1].VideoURL != "https://aweme.snssdk.com/aweme/v1/play/?video_id=vid789&ratio=1080p&line=0" {
+		t.Fatalf("expected constructed URL from uri, got %s", item.Images[1].VideoURL)
 	}
 }
 
@@ -403,7 +509,7 @@ func TestIsTimeout(t *testing.T) {
 }
 
 func TestBuildImagesEmpty(t *testing.T) {
-	images := buildImages([]imageInfo{{URLList: []string{""}}})
+	images := buildImages([]imageInfo{{URLList: []string{""}}}, nil)
 	if len(images) != 0 {
 		t.Fatal("expected empty images for blank URLs")
 	}

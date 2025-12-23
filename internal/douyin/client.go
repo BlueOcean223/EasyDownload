@@ -2,6 +2,7 @@ package douyin
 
 import (
 	"EasyDownload/internal/logger"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -131,6 +132,16 @@ func (c *Client) GetItemInfo(awemeID string) (*DouyinItem, error) {
 		return item, nil
 	}
 
+	// Try the slidesinfo endpoint next.
+	// Some swipeable multi-video posts (looks like an album) only expose per-page
+	// `images[].video.play_addr` via this endpoint; share page SSR may degrade to
+	// static covers and lose video URLs.
+	item, slidesErr := c.fetchItemInfoSlidesInfo(awemeID)
+	if slidesErr == nil {
+		c.fetchStreamSizes(item)
+		return item, nil
+	}
+
 	// Fallback to parsing the share page HTML.
 	// This is slower but works when the API is blocked or rate-limited.
 	item, shareErr := c.fetchItemInfoFromSharePage(awemeID)
@@ -143,7 +154,10 @@ func (c *Client) GetItemInfo(awemeID string) (*DouyinItem, error) {
 	if shouldReturnAPIError(apiErr) {
 		return nil, apiErr
 	}
-	return nil, fmt.Errorf("douyin api error: %w; share page error: %v", apiErr, shareErr)
+	if shouldReturnAPIError(slidesErr) {
+		return nil, slidesErr
+	}
+	return nil, fmt.Errorf("douyin api error: %w; slidesinfo error: %v; share page error: %v", apiErr, slidesErr, shareErr)
 }
 
 // fetchStreamSizes fetches file sizes for all video streams via HEAD requests.
@@ -292,6 +306,102 @@ func (c *Client) fetchItemInfoFromSharePage(awemeID string) (*DouyinItem, error)
 		}
 	}
 	return nil, ErrItemNotFound
+}
+
+type slidesInfoResponse struct {
+	StatusCode   int           `json:"status_code"`   // 0 indicates success
+	StatusMsg    string        `json:"status_msg"`    // Error message if status_code != 0 (may be absent)
+	AwemeDetails []itemInfoItem `json:"aweme_details"` // Array of item details
+}
+
+// fetchItemInfoSlidesInfo fetches item info from:
+//   - https://www.iesdouyin.com/web/api/v2/aweme/slidesinfo/
+//
+// This endpoint is used by the official share "slides" page and can include
+// per-image video sources in `images[].video.play_addr` even when share SSR does not.
+func (c *Client) fetchItemInfoSlidesInfo(awemeID string) (*DouyinItem, error) {
+	client := c.httpClient
+	if client == nil {
+		client = &http.Client{Timeout: 10 * time.Second}
+	}
+
+	origin, err := c.shareOrigin()
+	if err != nil {
+		return nil, err
+	}
+
+	u, err := url.Parse(origin + "/web/api/v2/aweme/slidesinfo/")
+	if err != nil {
+		return nil, err
+	}
+	q := u.Query()
+	q.Set("aweme_ids", fmt.Sprintf("[%s]", awemeID))
+	q.Set("aweme_type", "0")
+	q.Set("aid", "6383")
+	q.Set("request_source", "200")
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequest("GET", u.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	c.applyHeaders(req)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		if isTimeout(err) {
+			return nil, ErrRequestTimeout
+		}
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests {
+		return nil, ErrRateLimited
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return nil, fmt.Errorf("douyin slidesinfo unexpected status: %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var payload slidesInfoResponse
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, err
+	}
+	if payload.StatusCode != 0 {
+		if looksNotFound(payload.StatusMsg) {
+			return nil, ErrItemNotFound
+		}
+		msg := strings.TrimSpace(payload.StatusMsg)
+		if msg == "" {
+			msg = "unknown error"
+		}
+		return nil, fmt.Errorf("%w: %s", ErrAPIError, msg)
+	}
+	if len(payload.AwemeDetails) == 0 {
+		return nil, ErrItemNotFound
+	}
+
+	return buildDouyinItem(payload.AwemeDetails[0]), nil
+}
+
+func (c *Client) shareOrigin() (string, error) {
+	shareBase := strings.TrimSpace(c.shareBase)
+	if shareBase == "" {
+		shareBase = "https://www.iesdouyin.com/share"
+	}
+	u, err := url.Parse(shareBase)
+	if err != nil {
+		return "", err
+	}
+	if u.Scheme == "" || u.Host == "" {
+		return "", fmt.Errorf("invalid share base url: %s", shareBase)
+	}
+	return u.Scheme + "://" + u.Host, nil
 }
 
 // fetchSharePageItem fetches and parses a single share page.
@@ -448,6 +558,9 @@ type itemInfoItem struct {
 	Author    authorInfo  `json:"author"`     // Author information
 	Video     videoInfo   `json:"video"`      // Video playback information
 	Images    []imageInfo `json:"images"`     // Album images (for AwemeType 68)
+	// ImgBitrate may contain per-image video info for slide posts where each "image"
+	// is actually a short video clip (swipeable like an album).
+	ImgBitrate json.RawMessage `json:"img_bitrate"`
 }
 
 // authorInfo contains information about the content creator.
@@ -489,11 +602,23 @@ type bitRateInfo struct {
 	PlayAddr    playAddr `json:"play_addr"`    // Playback URL for this quality
 }
 
-// imageInfo represents a single image in an album.
+// imageVideoInfo represents video information embedded in an image/album item.
+// This is used for mixed content where images array contains video items.
+type imageVideoInfo struct {
+	PlayAddr playAddr `json:"play_addr"` // Video playback URL
+}
+
+// imageInfo represents a single media item in an album.
+// For mixed content (aweme_type 68), items can be images or videos.
+// If Video field is non-nil, the item contains a video.
 type imageInfo struct {
-	URLList []string `json:"url_list"` // List of image URLs (different sizes)
-	Width   int      `json:"width"`    // Image width
-	Height  int      `json:"height"`   // Image height
+	URLList         []string        `json:"url_list"`          // List of image URLs (different sizes)
+	DownloadURLList []string        `json:"download_url_list"` // Download URLs (may include watermark or alternate formats)
+	URI             string          `json:"uri"`               // Media URI
+	ClipType        int             `json:"clip_type"`         // Clip type (slides video uses this)
+	Video           *imageVideoInfo `json:"video"`             // Video info (non-nil for video items)
+	Width           int             `json:"width"`             // Media width
+	Height          int             `json:"height"`            // Media height
 }
 
 // buildDouyinItem converts an API response item to a DouyinItem.
@@ -503,7 +628,7 @@ type imageInfo struct {
 func buildDouyinItem(item itemInfoItem) *DouyinItem {
 	// Determine content type: AwemeType 68 indicates an album (image collection).
 	// Also treat items with images array as albums.
-	isAlbum := item.AwemeType == 68 || len(item.Images) > 0
+	isAlbum := item.AwemeType == 68 || len(item.Images) > 0 || hasImgBitrate(item.ImgBitrate)
 
 	result := &DouyinItem{
 		ID:       item.AwemeID,
@@ -528,7 +653,21 @@ func buildDouyinItem(item itemInfoItem) *DouyinItem {
 
 	if isAlbum {
 		result.Duration = 0
-		result.Images = buildImages(item.Images)
+		result.Images = buildImages(item.Images, item.ImgBitrate)
+		// Some album-like posts are actually multi-video collections where images entries
+		// contain only video.play_addr (no url_list). Ensure we still have a usable cover.
+		if strings.TrimSpace(result.Cover) == "" && len(result.Images) > 0 {
+			for _, media := range result.Images {
+				if u := strings.TrimSpace(media.URL); u != "" {
+					result.Cover = u
+					break
+				}
+			}
+			if strings.TrimSpace(result.Cover) == "" {
+				// Last resort: fall back to the first video URL so the UI isn't blank.
+				result.Cover = strings.TrimSpace(result.Images[0].VideoURL)
+			}
+		}
 		logger.Debug("[Douyin] Album detected with %d images", len(result.Images))
 		return result
 	}
@@ -673,21 +812,230 @@ func truncateURL(url string, maxLen int) string {
 }
 
 // buildImages converts API image info to the internal Image format.
-// Used for album content to extract image URLs and dimensions.
-func buildImages(images []imageInfo) []Image {
+// For mixed content (aweme_type 68), extracts both image URLs and video URLs.
+// If an item has a video field, its VideoURL will be populated.
+func buildImages(images []imageInfo, imgBitrate json.RawMessage) []Image {
+	imgBitrates := parseImgBitrateEntries(imgBitrate)
+
+	// Some slide/video-collection posts may not populate the `images` array but still
+	// provide per-item video sources in `img_bitrate`.
+	if len(images) == 0 && len(imgBitrates) > 0 {
+		return buildImagesFromBitrate(imgBitrates)
+	}
+
 	out := make([]Image, 0, len(images))
-	for _, img := range images {
-		url := firstURL(img.URLList)
-		if url == "" {
+	for idx, img := range images {
+		media := extractMediaFromImageInfo(img, imgBitrates, idx)
+		if media.URL == "" && media.VideoURL == "" {
+			continue
+		}
+		out = append(out, media)
+	}
+	return out
+}
+
+// buildImagesFromBitrate builds Image entries when only img_bitrate is available.
+func buildImagesFromBitrate(imgBitrates []imgBitrateEntry) []Image {
+	out := make([]Image, 0, len(imgBitrates))
+	for _, br := range imgBitrates {
+		width := firstNonZero(br.PlayAddr.Width, br.Width)
+		height := firstNonZero(br.PlayAddr.Height, br.Height)
+		videoURL := pickVideoURLFromImgBitrate(br, width, height)
+		if strings.TrimSpace(videoURL) == "" {
 			continue
 		}
 		out = append(out, Image{
-			URL:    url,
-			Width:  img.Width,
-			Height: img.Height,
+			VideoURL: videoURL,
+			Width:    width,
+			Height:   height,
 		})
 	}
 	return out
+}
+
+// extractMediaFromImageInfo extracts image/video URLs and dimensions from a single imageInfo.
+func extractMediaFromImageInfo(img imageInfo, imgBitrates []imgBitrateEntry, idx int) Image {
+	imageURL := firstURL(img.URLList)
+	if strings.TrimSpace(imageURL) == "" {
+		imageURL = firstURL(img.DownloadURLList)
+	}
+
+	videoURL := extractVideoURLFromImageInfo(img, imgBitrates, idx)
+
+	width := img.Width
+	height := img.Height
+	if width == 0 && height == 0 && idx < len(imgBitrates) {
+		width = firstNonZero(imgBitrates[idx].PlayAddr.Width, imgBitrates[idx].Width)
+		height = firstNonZero(imgBitrates[idx].PlayAddr.Height, imgBitrates[idx].Height)
+	}
+
+	return Image{
+		URL:      imageURL,
+		VideoURL: videoURL,
+		Width:    width,
+		Height:   height,
+	}
+}
+
+// extractVideoURLFromImageInfo extracts video URL from an imageInfo entry.
+// Tries multiple sources: embedded video field, download_url_list, and img_bitrate.
+func extractVideoURLFromImageInfo(img imageInfo, imgBitrates []imgBitrateEntry, idx int) string {
+	// Try embedded video field first
+	if img.Video != nil {
+		if url := pickNoWatermarkURL(img.Video.PlayAddr.URLList); url != "" {
+			return url
+		}
+		if url := firstURL(img.Video.PlayAddr.URLList); url != "" {
+			return url
+		}
+		if url := constructVideoURLFromURI(img.Video.PlayAddr.URI, img.Width, img.Height); url != "" {
+			return url
+		}
+	}
+
+	// Fallback: sometimes "download_url_list" contains a playable clip URL
+	if u := firstVideoLikeURL(img.DownloadURLList); u != "" {
+		if url := pickNoWatermarkURL([]string{u}); url != "" {
+			return url
+		}
+	}
+
+	// Fallback: some slide posts provide per-image video sources in img_bitrate
+	if idx < len(imgBitrates) {
+		return pickVideoURLFromImgBitrate(imgBitrates[idx], img.Width, img.Height)
+	}
+
+	return ""
+}
+
+func firstVideoLikeURL(urls []string) string {
+	for _, raw := range urls {
+		u := strings.TrimSpace(raw)
+		if u == "" {
+			continue
+		}
+		lu := strings.ToLower(u)
+		if strings.Contains(lu, "mime_type=video") ||
+			strings.Contains(lu, "video_mp4") ||
+			strings.HasSuffix(lu, ".mp4") ||
+			strings.HasSuffix(lu, ".mov") ||
+			strings.HasSuffix(lu, ".m4v") {
+			return u
+		}
+	}
+	return ""
+}
+
+// constructVideoURLFromURI builds a direct play URL from a Douyin play_addr URI.
+// Some album media items provide only `play_addr.uri` without `play_addr.url_list`.
+func constructVideoURLFromURI(uri string, width, height int) string {
+	uri = strings.TrimSpace(uri)
+	if uri == "" {
+		return ""
+	}
+	// Some responses may already provide a full URL in `uri`.
+	if strings.HasPrefix(uri, "http://") || strings.HasPrefix(uri, "https://") {
+		return pickNoWatermarkURL([]string{uri})
+	}
+	ratio := resolutionKey(width, height)
+	if ratio != "" {
+		return fmt.Sprintf("https://aweme.snssdk.com/aweme/v1/play/?video_id=%s&ratio=%s&line=0", uri, ratio)
+	}
+	return fmt.Sprintf("https://aweme.snssdk.com/aweme/v1/play/?video_id=%s&line=0", uri)
+}
+
+type imgBitrateEntry struct {
+	BitRate  []bitRateInfo `json:"bit_rate"`
+	PlayAddr playAddr      `json:"play_addr"`
+	Width    int           `json:"width"`
+	Height   int           `json:"height"`
+}
+
+func hasImgBitrate(raw json.RawMessage) bool {
+	raw = bytes.TrimSpace(raw)
+	return len(raw) > 0 && !bytes.Equal(raw, []byte("null")) && !bytes.Equal(raw, []byte("[]"))
+}
+
+func parseImgBitrateEntries(raw json.RawMessage) []imgBitrateEntry {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return nil
+	}
+
+	// Fast path: expected shape is an array aligned to images indices.
+	var out []imgBitrateEntry
+	if err := json.Unmarshal(raw, &out); err == nil && len(out) > 0 {
+		return out
+	}
+
+	// Fallback: try to decode loosely to tolerate shape changes.
+	var anyArr []any
+	if err := json.Unmarshal(raw, &anyArr); err != nil {
+		return nil
+	}
+
+	out = make([]imgBitrateEntry, 0, len(anyArr))
+	for _, v := range anyArr {
+		switch vv := v.(type) {
+		case map[string]any:
+			entry := imgBitrateEntry{}
+			if pa, ok := vv["play_addr"]; ok {
+				if buf, err := json.Marshal(pa); err == nil {
+					_ = json.Unmarshal(buf, &entry.PlayAddr)
+				}
+			}
+			if br, ok := vv["bit_rate"]; ok {
+				if buf, err := json.Marshal(br); err == nil {
+					_ = json.Unmarshal(buf, &entry.BitRate)
+				}
+			}
+			if w, ok := vv["width"].(float64); ok {
+				entry.Width = int(w)
+			}
+			if h, ok := vv["height"].(float64); ok {
+				entry.Height = int(h)
+			}
+			out = append(out, entry)
+		case []any:
+			entry := imgBitrateEntry{}
+			if buf, err := json.Marshal(vv); err == nil {
+				_ = json.Unmarshal(buf, &entry.BitRate)
+			}
+			out = append(out, entry)
+		default:
+			out = append(out, imgBitrateEntry{})
+		}
+	}
+	return out
+}
+
+func pickVideoURLFromImgBitrate(entry imgBitrateEntry, fallbackWidth, fallbackHeight int) string {
+	// Prefer explicit play_addr URLs.
+	if url := pickNoWatermarkURL(entry.PlayAddr.URLList); url != "" {
+		return url
+	}
+	if url := firstURL(entry.PlayAddr.URLList); url != "" {
+		return url
+	}
+
+	// Prefer highest-quality bit_rate URLs when present.
+	if len(entry.BitRate) > 0 {
+		vi := videoInfo{
+			PlayAddr: entry.PlayAddr,
+			BitRate:  entry.BitRate,
+			Width:    firstNonZero(entry.Width, fallbackWidth),
+			Height:   firstNonZero(entry.Height, fallbackHeight),
+		}
+		streams := buildStreams(vi)
+		if len(streams) > 0 {
+			return streams[0].URL
+		}
+	}
+
+	// Last resort: construct from URI.
+	width := firstNonZero(entry.PlayAddr.Width, entry.Width, fallbackWidth)
+	height := firstNonZero(entry.PlayAddr.Height, entry.Height, fallbackHeight)
+	return constructVideoURLFromURI(entry.PlayAddr.URI, width, height)
 }
 
 // gearResolutionPattern matches resolution numbers in gear names.
@@ -759,7 +1107,17 @@ func pickNoWatermarkURL(urls []string) string {
 			return strings.Replace(u, "playwm", "play", 1)
 		}
 	}
-	// Second pass: return any non-empty URL.
+	// Second pass: disable watermark query param when present.
+	for _, raw := range urls {
+		u := strings.TrimSpace(raw)
+		if u == "" {
+			continue
+		}
+		if strings.Contains(u, "watermark=1") {
+			return strings.Replace(u, "watermark=1", "watermark=0", 1)
+		}
+	}
+	// Final pass: return any non-empty URL.
 	for _, raw := range urls {
 		u := strings.TrimSpace(raw)
 		if u != "" {

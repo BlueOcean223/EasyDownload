@@ -440,6 +440,36 @@ func TestImageProxyNonBilibiliHeadersProperty(t *testing.T) {
 	properties.TestingRun(t)
 }
 
+// Test isAllowedMediaDomain function for SSRF prevention
+func TestIsAllowedMediaDomain(t *testing.T) {
+	tests := []struct {
+		name     string
+		url      string
+		expected bool
+	}{
+		{"allowed aweme domain", "https://aweme.snssdk.com/aweme/v1/play/?video_id=123", true},
+		{"allowed subdomain", "https://v1-cold.douyinvod.com/video.mp4", true},
+		{"allowed bytecdntp", "https://p1.bytecdntp.com/img.jpg", true},
+		{"blocked internal IP", "http://127.0.0.1:8080/secret", false},
+		{"blocked private IP", "http://192.168.1.1/admin", false},
+		{"blocked arbitrary domain", "https://evil.com/video.mp4", false},
+		{"blocked localhost", "http://localhost/secret", false},
+		{"invalid URL", "not-a-url", false},
+		{"empty URL", "", false},
+		{"allowed snssdk subdomain", "https://v.snssdk.com/path", true},
+		{"allowed douyincdn", "https://cdn.douyincdn.com/video.mp4", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := isAllowedMediaDomain(tt.url)
+			if result != tt.expected {
+				t.Errorf("isAllowedMediaDomain(%q) = %v, want %v", tt.url, result, tt.expected)
+			}
+		})
+	}
+}
+
 // Test IsBilibiliURL function
 func TestIsBilibiliURLProperty(t *testing.T) {
 	parameters := gopter.DefaultTestParameters()

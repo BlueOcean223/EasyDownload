@@ -26,10 +26,13 @@ type Stream struct {
 	Size        int64  // File size in bytes (estimated via HEAD request, may be 0)
 }
 
-// Image represents a single image in a Douyin album (photo collection).
-// Albums contain multiple images that are downloaded as a ZIP archive.
+// Image represents a single media item in a Douyin album.
+// For mixed content (aweme_type 68), items can be either images or videos.
+// If VideoURL is non-empty, the item is a video; otherwise it's an image.
+// Albums are downloaded as a ZIP archive containing both images and videos.
 type Image struct {
-	URL    string // Direct download URL for the image
-	Width  int    // Image width in pixels
-	Height int    // Image height in pixels
+	URL      string // Direct download URL for the image (empty for video-only items)
+	VideoURL string // Direct download URL for the video (empty for image items)
+	Width    int    // Media width in pixels
+	Height   int    // Media height in pixels
 }

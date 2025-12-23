@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 )
 
@@ -80,7 +82,7 @@ func (api *InternalAPI) Start() error {
 		return func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Access-Control-Allow-Origin", "*")
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Range")
 
 			if r.Method == "OPTIONS" {
 				w.WriteHeader(http.StatusOK)
@@ -97,6 +99,7 @@ func (api *InternalAPI) Start() error {
 	mux.HandleFunc("/api/clear", corsHandler(api.handleClear))
 	mux.HandleFunc("/api/health", corsHandler(api.handleHealth))
 	mux.HandleFunc("/api/proxy-image", corsHandler(api.handleProxyImage))
+	mux.HandleFunc("/api/proxy-media", corsHandler(api.handleProxyMedia))
 
 	api.server = &http.Server{
 		Addr:    fmt.Sprintf(":%d", api.port),
@@ -257,6 +260,112 @@ func (api *InternalAPI) handleProxyImage(w http.ResponseWriter, r *http.Request)
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Cache-Control", "public, max-age=86400") // Cache for 24 hours
 	w.Write(data)
+}
+
+// allowedMediaDomains contains domains allowed for media proxy.
+// This whitelist prevents SSRF attacks by restricting proxy to known Douyin CDN domains.
+var allowedMediaDomains = []string{
+	"aweme.snssdk.com",
+	"v.douyin.com",
+	"douyinvod.com",
+	"bytecdntp.com",
+	"bytecdn.cn",
+	"douyincdn.com",
+	"ixigua.com",
+	"pstatp.com",
+	"snssdk.com",
+	"toutiaovod.com",
+	"zjcdn.com",
+	"amemv.com",
+}
+
+// isAllowedMediaDomain checks if the given URL's host is in the allowed domains list.
+func isAllowedMediaDomain(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	host := strings.ToLower(u.Host)
+	for _, domain := range allowedMediaDomains {
+		if host == domain || strings.HasSuffix(host, "."+domain) {
+			return true
+		}
+	}
+	return false
+}
+
+// handleProxyMedia handles GET /api/proxy-media - proxies external media (videos)
+// Supports Range requests for video streaming
+func (api *InternalAPI) handleProxyMedia(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	mediaURL := r.URL.Query().Get("url")
+	if mediaURL == "" {
+		http.Error(w, "Missing url parameter", http.StatusBadRequest)
+		return
+	}
+
+	// Validate domain to prevent SSRF
+	if !isAllowedMediaDomain(mediaURL) {
+		logger.Debug("Media proxy blocked: domain not allowed: %s", mediaURL)
+		http.Error(w, "Domain not allowed", http.StatusForbidden)
+		return
+	}
+
+	// Create request to fetch media
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, mediaURL, nil)
+	if err != nil {
+		http.Error(w, "Bad request", http.StatusBadRequest)
+		return
+	}
+
+	// Forward Range header for video seeking support
+	if rng := r.Header.Get("Range"); rng != "" {
+		req.Header.Set("Range", rng)
+	}
+
+	// Set appropriate headers for Douyin
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Referer", "https://www.douyin.com/")
+	req.Header.Set("Origin", "https://www.douyin.com")
+
+	// Use a client with no timeout for streaming
+	client := &http.Client{Timeout: 0}
+	resp, err := client.Do(req)
+	if err != nil {
+		logger.Debug("Media proxy error: %v", err)
+		http.Error(w, "Failed to fetch media", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	// Forward response headers
+	for _, k := range []string{"Content-Type", "Content-Length", "Content-Range", "Accept-Ranges"} {
+		if v := resp.Header.Get(k); v != "" {
+			w.Header().Set(k, v)
+		}
+	}
+	w.Header().Set("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges")
+	w.WriteHeader(resp.StatusCode)
+
+	// Stream the response
+	buf := make([]byte, 32*1024) // 32KB buffer
+	for {
+		n, err := resp.Body.Read(buf)
+		if n > 0 {
+			w.Write(buf[:n])
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		}
+		if err != nil {
+			break
+		}
+	}
 }
 
 // GetDetectedVideos returns all detected videos

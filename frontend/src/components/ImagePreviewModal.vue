@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
-import { CloseOutline, ChevronBackOutline, ChevronForwardOutline } from '@vicons/ionicons5'
+import { CloseOutline, ChevronBackOutline, ChevronForwardOutline, PlayCircleOutline } from '@vicons/ionicons5'
 import type { DouyinImage } from '@/types'
 import { useAppStore } from '@/stores/app'
 
@@ -38,6 +38,12 @@ const apiPort = computed(() => {
 function getProxiedUrl(url: string) {
   if (!url) return ''
   return `http://127.0.0.1:${apiPort.value}/api/proxy-image?url=${encodeURIComponent(url)}`
+}
+
+// Get proxied media URL (for videos)
+function getProxiedMediaUrl(url: string) {
+  if (!url) return ''
+  return `http://127.0.0.1:${apiPort.value}/api/proxy-media?url=${encodeURIComponent(url)}`
 }
 
 watch(() => props.show, (newVal) => {
@@ -174,12 +180,22 @@ onUnmounted(() => {
           </div>
         </Transition>
 
-        <!-- Main Image -->
+        <!-- Main Content (Image or Video) -->
         <div class="w-full h-full p-4 md:p-12 flex items-center justify-center overflow-hidden" @click.self="close">
           <Transition :name="direction === 'right' ? 'slide-left' : 'slide-right'" mode="out-in">
             <div :key="currentIndex" class="w-full h-full flex items-center justify-center">
+              <!-- Video player for video items -->
+              <video
+                v-if="currentImage?.VideoURL"
+                :src="getProxiedMediaUrl(currentImage.VideoURL)"
+                class="max-w-full max-h-full object-contain shadow-2xl"
+                controls
+                autoplay
+                playsinline
+              />
+              <!-- Image viewer for image items -->
               <img
-                v-if="currentImage"
+                v-else-if="currentImage"
                 :src="getProxiedUrl(currentImage.URL)"
                 class="max-w-full max-h-full object-contain shadow-2xl"
                 draggable="false"
@@ -187,6 +203,15 @@ onUnmounted(() => {
               />
             </div>
           </Transition>
+        </div>
+
+        <!-- Media type indicator -->
+        <div
+          v-if="currentImage?.VideoURL"
+          class="absolute bottom-4 left-1/2 -translate-x-1/2 z-20 bg-black/60 text-white px-3 py-1.5 rounded-full flex items-center gap-2 text-sm"
+        >
+          <PlayCircleOutline class="w-4 h-4" />
+          <span>视频</span>
         </div>
       </div>
     </Transition>

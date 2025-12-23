@@ -35,6 +35,7 @@ var shareURLPattern = regexp.MustCompile(`https?://[^\s]+`)
 //   - Short links: https://v.douyin.com/xxxxx/
 //   - Direct video URLs: https://www.douyin.com/video/1234567890
 //   - Note URLs: https://www.douyin.com/note/1234567890
+//   - Slides share URLs: https://www.iesdouyin.com/share/slides/1234567890/
 //   - Modal URLs with query params: https://www.douyin.com/discover?modal_id=1234567890
 type Parser struct {
 	// client is configured to NOT follow redirects automatically,
@@ -295,10 +296,13 @@ func extractAwemeID(u *url.URL) string {
 	path := strings.TrimSuffix(u.Path, "/")
 	segments := strings.Split(path, "/")
 
-	// Look for "video" or "note" segment followed by the aweme_id.
-	// Example: /video/1234567890 -> segments = ["", "video", "1234567890"]
+	// Look for known content segments followed by the aweme_id.
+	// Examples:
+	//   - /video/1234567890 -> segments = ["", "video", "1234567890"]
+	//   - /note/1234567890 -> segments = ["", "note", "1234567890"]
+	//   - /share/slides/1234567890 -> segments = ["", "share", "slides", "1234567890"]
 	for i := 0; i < len(segments)-1; i++ {
-		if segments[i] == "video" || segments[i] == "note" {
+		if segments[i] == "video" || segments[i] == "note" || segments[i] == "slides" {
 			if id := keepDigits(segments[i+1]); id != "" {
 				return id
 			}
