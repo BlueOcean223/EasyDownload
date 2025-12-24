@@ -24,6 +24,12 @@ const routes: RouteRecordRaw[] = [
     meta: { title: '抖音下载' }
   },
   {
+    path: '/xiaohongshu',
+    name: 'Xiaohongshu',
+    component: () => import('@/views/Xiaohongshu.vue'),
+    meta: { title: '小红书下载' }
+  },
+  {
     path: '/downloads',
     name: 'Downloads',
     component: () => import('@/views/Downloads.vue'),

@@ -18,6 +18,7 @@ import (
 	"EasyDownload/internal/proxy"
 	"EasyDownload/internal/tray"
 	"EasyDownload/internal/utils"
+	"EasyDownload/internal/xiaohongshu"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
@@ -34,6 +35,9 @@ type App struct {
 	douyinParser       *douyin.Parser
 	douyinClient       *douyin.Client
 	douyinDownloader   *douyin.Downloader
+	xhsParser          *xiaohongshu.Parser
+	xhsClient          *xiaohongshu.Client
+	xhsDownloader      *xiaohongshu.Downloader
 	trayManager        *tray.TrayManager
 	ffmpegManager      *ffmpeg.FFmpegManager
 	configManager      *config.ConfigManager
@@ -181,6 +185,11 @@ func (a *App) startup(ctx context.Context) {
 	a.douyinParser = douyin.NewParser()
 	a.douyinClient = douyin.NewClient()
 	a.douyinDownloader = douyin.NewDownloader()
+
+	// Initialize Xiaohongshu components
+	a.xhsParser = xiaohongshu.NewParser()
+	a.xhsClient = xiaohongshu.NewClient()
+	a.xhsDownloader = xiaohongshu.NewDownloader()
 
 	// Initialize FFmpeg manager with embedded FFmpeg
 	a.ffmpegManager = ffmpeg.NewFFmpegManager()
@@ -923,6 +932,97 @@ func (a *App) createDouyinAlbumPartialDownloader(item *douyin.DouyinItem, indice
 		}
 		return nil
 	}
+}
+
+// ==================== Xiaohongshu Methods ====================
+
+// GetXHSNoteInfo parses input into noteID and fetches full note info.
+func (a *App) GetXHSNoteInfo(input string) (*xiaohongshu.XHSItem, error) {
+	logger.Info("API call: GetXHSNoteInfo")
+	if a.xhsParser == nil || a.xhsClient == nil {
+		return nil, fmt.Errorf("xiaohongshu components not initialized")
+	}
+
+	// Use ParseWithURL to get both noteID and xsec_token
+	result, err := a.xhsParser.ParseWithURL(input)
+	if err != nil {
+		logger.Warn("GetXHSNoteInfo parse failed: %v", err)
+		return nil, err
+	}
+
+	// Use GetNoteInfoWithToken to include xsec_token if available
+	item, err := a.xhsClient.GetNoteInfoWithToken(result.NoteID, result.XsecToken)
+	if err != nil {
+		logger.Warn("GetXHSNoteInfo fetch failed: %v", err)
+		return nil, err
+	}
+	return item, nil
+}
+
+// DownloadXHSNote creates a download task and starts downloading the note content.
+// selectedImages: 0-based indices; empty means all images.
+// quality: video stream quality key (used for video notes).
+func (a *App) DownloadXHSNote(item *xiaohongshu.XHSItem, selectedImages []int, quality string, saveDir string) error {
+	logger.Info("API call: DownloadXHSNote")
+	if a.downloadManager == nil || a.xhsDownloader == nil {
+		return fmt.Errorf("download manager not initialized")
+	}
+	if item == nil {
+		return fmt.Errorf("nil xiaohongshu item")
+	}
+	if item.ID == "" {
+		return fmt.Errorf("empty xiaohongshu note id")
+	}
+
+	if item.IsAlbum() {
+		if err := item.ValidateSelectedImages(selectedImages); err != nil {
+			logger.Warn("DownloadXHSNote invalid selection: %v", err)
+			return err
+		}
+	}
+
+	outputDir := a.downloadDir
+	if saveDir != "" {
+		utils.EnsureDir(saveDir)
+		outputDir = saveDir
+	}
+
+	id := fmt.Sprintf("xiaohongshu_%s_%d", item.ID, time.Now().UnixNano())
+	downloadFunc := a.xhsDownloader.BuildDownloadFunc(item, selectedImages, quality, outputDir)
+	task, err := a.downloadManager.AddTaskWithDownloader(id, item.ID, item.Title, item.Cover, "xiaohongshu", quality, downloadFunc)
+	if err != nil {
+		logger.Warn("DownloadXHSNote add task failed: %v", err)
+		return err
+	}
+
+	// Configure album fields and force ZIP output for image notes.
+	if item.IsAlbum() {
+		task.IsAlbum = true
+		task.AlbumTotal = item.SelectedCount(selectedImages)
+		task.AlbumCompleted = 0
+		if task.FileName != "" {
+			ext := filepath.Ext(task.FileName)
+			base := task.FileName
+			if ext != "" {
+				base = task.FileName[:len(task.FileName)-len(ext)]
+			}
+			task.FileName = base + ".zip"
+		}
+	}
+
+	if outputDir != "" && task.FileName != "" {
+		task.FilePath = filepath.Join(outputDir, task.FileName)
+	}
+
+	if err := a.downloadManager.StartTask(id); err != nil {
+		logger.Warn("DownloadXHSNote start task failed: %v", err)
+		return err
+	}
+
+	if a.ctx != nil {
+		runtime.EventsEmit(a.ctx, "download:start", task.TaskToJSON())
+	}
+	return nil
 }
 
 // IsFFmpegAvailable checks if ffmpeg is available and caches the path

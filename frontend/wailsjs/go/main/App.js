@@ -38,6 +38,10 @@ export function DownloadVideoWithKey(arg1, arg2, arg3, arg4, arg5, arg6, arg7) {
   return window['go']['main']['App']['DownloadVideoWithKey'](arg1, arg2, arg3, arg4, arg5, arg6, arg7);
 }
 
+export function DownloadXHSNote(arg1, arg2, arg3, arg4) {
+  return window['go']['main']['App']['DownloadXHSNote'](arg1, arg2, arg3, arg4);
+}
+
 export function GetAppInfo() {
   return window['go']['main']['App']['GetAppInfo']();
 }
@@ -104,6 +108,10 @@ export function GetTheme() {
 
 export function GetUpstreamProxy() {
   return window['go']['main']['App']['GetUpstreamProxy']();
+}
+
+export function GetXHSNoteInfo(arg1) {
+  return window['go']['main']['App']['GetXHSNoteInfo'](arg1);
 }
 
 export function HasBilibiliSessData() {

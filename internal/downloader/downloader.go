@@ -700,6 +700,7 @@ func (dm *DownloadManager) CancelTask(id string) error {
 	task.Status = StatusCancelled
 	filePath := task.FilePath
 	title := task.Title
+	source := strings.ToLower(strings.TrimSpace(task.Source))
 	task.mu.Unlock()
 
 	// All file cleanup operations are done outside the lock to avoid blocking
@@ -796,6 +797,18 @@ func (dm *DownloadManager) CancelTask(id string) error {
 		logger.Debug("[CancelTask] Removing album temp dir: %s", albumTmp)
 		if err := os.RemoveAll(albumTmp); err != nil {
 			logger.Warn("[CancelTask] Failed to remove album temp dir: %v", err)
+		}
+	}
+
+	// XiaoHongShu cleanup:
+	// - .albumtmp directory for resumable album downloads
+	// - partial video files (written directly, not .tmp)
+	if source == "xiaohongshu" {
+		// Clean up album temp directory
+		albumTmp := utils.AlbumTempDir(filePath)
+		logger.Debug("[CancelTask] Removing xiaohongshu album temp dir: %s", albumTmp)
+		if err := os.RemoveAll(albumTmp); err != nil {
+			logger.Warn("[CancelTask] Failed to remove xiaohongshu album temp dir: %v", err)
 		}
 	}
 

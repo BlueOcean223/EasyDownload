@@ -142,14 +142,19 @@ export interface DouyinStream {
   Size: number // File size in bytes (estimated via HEAD request)
 }
 
+// DisplayImage is a common interface for image display components.
+// Used by ImageSelector, ImagePreviewModal, and LazyImageGrid.
+export interface DisplayImage {
+  URL: string
+  Width: number
+  Height: number
+}
+
 // Douyin image (field names match Go exported struct)
 // For mixed content (aweme_type 68), items can be images or videos.
 // If VideoURL is non-empty, the item is a video.
-export interface DouyinImage {
-  URL: string
+export interface DouyinImage extends DisplayImage {
   VideoURL?: string // Non-empty for video items in mixed content albums
-  Width: number
-  Height: number
 }
 
 // Douyin item (video or album) (field names match Go exported struct)
@@ -163,5 +168,35 @@ export interface DouyinItem {
   Duration: number
   Streams: DouyinStream[]
   Images: DouyinImage[]
+}
+
+// XHS stream
+export interface XHSStream {
+  QualityKey: string
+  QualityName: string
+  Width: number
+  Height: number
+  URL: string
+  Size: number
+}
+
+// XHS image (extends DisplayImage for shared component compatibility)
+export interface XHSImage extends DisplayImage {
+  TraceId?: string
+}
+
+// XHS item (note)
+export interface XHSItem {
+  Type: string // 'video' | 'image'
+  ID: string
+  Title: string
+  Desc: string
+  Cover: string
+  Author: string
+  AuthorID: string
+  AuthorAvatar: string
+  Timestamp: number
+  Streams: XHSStream[]
+  Images: XHSImage[]
 }
 
