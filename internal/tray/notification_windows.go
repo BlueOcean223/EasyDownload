@@ -5,6 +5,7 @@ package tray
 import (
 	"os/exec"
 	"strings"
+	"syscall"
 )
 
 // showNotification displays a Windows notification using PowerShell
@@ -37,6 +38,9 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
 `
 
 	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", script)
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		HideWindow: true,
+	}
 	// Run in background, don't wait for completion
 	go cmd.Run()
 }

@@ -21,6 +21,7 @@ const emit = defineEmits<{
   (e: 'update:show', value: boolean): void
   (e: 'complete'): void
   (e: 'skip'): void
+  (e: 'dont-remind'): void
 }>()
 
 const store = useAppStore()
@@ -94,6 +95,11 @@ function skip() {
   emit('skip')
   emit('update:show', false)
 }
+
+function dontRemind() {
+  emit('dont-remind')
+  emit('update:show', false)
+}
 </script>
 
 <template>
@@ -108,7 +114,7 @@ function skip() {
     <div class="wizard-content">
       <!-- Steps indicator -->
       <NSteps :current="currentStep" class="mb-6">
-        <NStep title="安装证书" :status="stepStatus(1)" />
+        <NStep title="安装证书（可选）" :status="stepStatus(1)" />
         <NStep title="选择目录" :status="stepStatus(2)" />
         <NStep title="完成设置" :status="stepStatus(3)" />
       </NSteps>
@@ -117,14 +123,14 @@ function skip() {
       <div v-if="currentStep === 1" class="step-content">
         <div class="text-center mb-6">
           <ShieldCheckmarkOutline class="w-16 h-16 text-accent mx-auto mb-4" />
-          <h3 class="text-lg font-semibold mb-2">安装 CA 证书</h3>
+          <h3 class="text-lg font-semibold mb-2">（可选）安装 CA 证书</h3>
           <p class="text-text-secondary text-sm">
-            为了能够嗅探 HTTPS 加密流量，需要安装 CA 根证书到系统信任存储。
+            仅当你需要使用「视频号」下载/嗅探微信 HTTPS 流量时，才需要安装 CA 根证书到系统信任存储。应用不会自动安装证书，只有你点击“安装证书”才会执行安装。
           </p>
         </div>
 
         <NAlert v-if="!store.certInstalled" type="warning" class="mb-4">
-          此操作需要管理员权限。如果安装失败，请右键点击应用图标，选择"以管理员身份运行"。
+          此操作需要管理员权限。如果安装失败，请右键点击应用图标，选择“以管理员身份运行”。如果你只需要下载 B站/抖音/小红书，可以暂时跳过或选择不再提醒；之后也可以在「设置 → 证书管理」里手动安装。
         </NAlert>
 
         <NAlert v-if="certError" type="error" class="mb-4">
@@ -213,13 +219,10 @@ function skip() {
           </template>
           上一步
         </NButton>
-        <NButton 
-          v-else 
-          quaternary 
-          @click="skip"
-        >
-          跳过设置
-        </NButton>
+        <NSpace v-else>
+          <NButton quaternary @click="skip">暂时跳过</NButton>
+          <NButton quaternary type="warning" @click="dontRemind">不再提醒</NButton>
+        </NSpace>
 
         <NButton 
           v-if="currentStep < 3"

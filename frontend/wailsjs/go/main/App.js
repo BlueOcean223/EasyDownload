@@ -14,6 +14,10 @@ export function ClearDetectedVideos() {
   return window['go']['main']['App']['ClearDetectedVideos']();
 }
 
+export function ClearLogs() {
+  return window['go']['main']['App']['ClearLogs']();
+}
+
 export function DownloadBilibiliPart(arg1, arg2, arg3) {
   return window['go']['main']['App']['DownloadBilibiliPart'](arg1, arg2, arg3);
 }
@@ -94,6 +98,10 @@ export function GetLogDir() {
   return window['go']['main']['App']['GetLogDir']();
 }
 
+export function GetLogSize() {
+  return window['go']['main']['App']['GetLogSize']();
+}
+
 export function GetProxyDebug() {
   return window['go']['main']['App']['GetProxyDebug']();
 }
@@ -128,6 +136,10 @@ export function IsCertInstalled() {
 
 export function IsDontAskOnClose() {
   return window['go']['main']['App']['IsDontAskOnClose']();
+}
+
+export function IsDontRemindCertWizard() {
+  return window['go']['main']['App']['IsDontRemindCertWizard']();
 }
 
 export function IsFFmpegAvailable() {
@@ -212,6 +224,10 @@ export function SetCloseAction(arg1) {
 
 export function SetDontAskOnClose(arg1) {
   return window['go']['main']['App']['SetDontAskOnClose'](arg1);
+}
+
+export function SetDontRemindCertWizard(arg1) {
+  return window['go']['main']['App']['SetDontRemindCertWizard'](arg1);
 }
 
 export function SetDownloadDir(arg1) {

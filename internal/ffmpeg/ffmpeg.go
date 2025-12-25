@@ -163,6 +163,7 @@ func (fm *FFmpegManager) verifyFFmpeg(path string) bool {
 	// Try to run ffmpeg -version with full absolute path
 	// exec.Command handles absolute paths correctly regardless of working directory
 	cmd := exec.Command(path, "-version")
+	applyNoWindow(cmd)
 	// Set working directory to the directory containing ffmpeg
 	cmd.Dir = filepath.Dir(path)
 	err = cmd.Run()
@@ -259,6 +260,7 @@ func (fm *FFmpegManager) Merge(videoPath, audioPath, outputPath string) error {
 		"-y",
 		outputPath,
 	)
+	applyNoWindow(cmd)
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -309,6 +311,7 @@ func (fm *FFmpegManager) ExtractAudio(inputPath, outputPath string) error {
 		"-y",
 		outputPath,
 	)
+	applyNoWindow(cmd)
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -347,6 +350,7 @@ func (fm *FFmpegManager) ConvertToMP3(inputPath, outputPath string, bitrate stri
 		"-y",
 		outputPath,
 	)
+	applyNoWindow(cmd)
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -366,6 +370,7 @@ func (fm *FFmpegManager) GetVersion() (string, error) {
 	}
 
 	cmd := exec.Command(ffmpegPath, "-version")
+	applyNoWindow(cmd)
 	output, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("failed to get FFmpeg version: %w", err)

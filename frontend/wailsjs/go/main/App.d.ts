@@ -11,6 +11,8 @@ export function CancelDownload(arg1:string):Promise<void>;
 
 export function ClearDetectedVideos():Promise<void>;
 
+export function ClearLogs():Promise<void>;
+
 export function DownloadBilibiliPart(arg1:string,arg2:number,arg3:number):Promise<string>;
 
 export function DownloadBilibiliVideo(arg1:string,arg2:number):Promise<string>;
@@ -51,6 +53,8 @@ export function GetLanguage():Promise<string>;
 
 export function GetLogDir():Promise<string>;
 
+export function GetLogSize():Promise<number>;
+
 export function GetProxyDebug():Promise<boolean>;
 
 export function GetProxyPort():Promise<number>;
@@ -68,6 +72,8 @@ export function InstallCert():Promise<void>;
 export function IsCertInstalled():Promise<boolean>;
 
 export function IsDontAskOnClose():Promise<boolean>;
+
+export function IsDontRemindCertWizard():Promise<boolean>;
 
 export function IsFFmpegAvailable():Promise<boolean>;
 
@@ -110,6 +116,8 @@ export function SetBilibiliSessData(arg1:string):Promise<void>;
 export function SetCloseAction(arg1:string):Promise<void>;
 
 export function SetDontAskOnClose(arg1:boolean):Promise<void>;
+
+export function SetDontRemindCertWizard(arg1:boolean):Promise<void>;
 
 export function SetDownloadDir(arg1:string):Promise<void>;
 

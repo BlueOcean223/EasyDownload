@@ -29,6 +29,7 @@ import {
   SetLanguage,
   SetCloseAction,
   SetDontAskOnClose,
+  SetDontRemindCertWizard,
   RequestClose
 } from '../../wailsjs/go/main/App'
 import { EventsOn } from '../../wailsjs/runtime/runtime'
@@ -59,6 +60,9 @@ export const useAppStore = defineStore('app', () => {
   // Close behavior state
   const closeAction = ref<'' | 'exit' | 'minimize'>('')
   const dontAskOnClose = ref(false)
+
+  // Welcome wizard behavior
+  const dontRemindCertWizard = ref(false)
 
   // Computed
   const pendingDownloads = computed(() =>
@@ -92,6 +96,7 @@ export const useAppStore = defineStore('app', () => {
         useUpstreamProxy.value = (appInfo.value as any).useUpstreamProxy ?? false
         closeAction.value = (appInfo.value as any).closeAction ?? ''
         dontAskOnClose.value = (appInfo.value as any).dontAskOnClose ?? false
+        dontRemindCertWizard.value = (appInfo.value as any).dontRemindCertWizard ?? false
 
         // Apply theme to DOM
         document.documentElement.setAttribute('data-theme', theme.value)
@@ -474,6 +479,11 @@ export const useAppStore = defineStore('app', () => {
     dontAskOnClose.value = dontAsk
   }
 
+  async function setDontRemindCertWizard(dontRemind: boolean) {
+    await SetDontRemindCertWizard(dontRemind)
+    dontRemindCertWizard.value = dontRemind
+  }
+
   async function requestAppClose(action: 'exit' | 'minimize') {
     await RequestClose(action)
   }
@@ -496,6 +506,7 @@ export const useAppStore = defineStore('app', () => {
     useUpstreamProxy,
     closeAction,
     dontAskOnClose,
+    dontRemindCertWizard,
 
     // Computed
     pendingDownloads,
@@ -522,6 +533,7 @@ export const useAppStore = defineStore('app', () => {
     setAppLanguage,
     setCloseAction,
     setDontAskOnClose,
+    setDontRemindCertWizard,
     requestAppClose
   }
 })

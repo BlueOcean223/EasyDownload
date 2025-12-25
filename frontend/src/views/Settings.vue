@@ -3,7 +3,7 @@ import { ref, onMounted } from 'vue'
 import { useAppStore } from '@/stores/app'
 import {
   NCard, NButton, NInput, NSpace, NTag,
-  NDivider, NSwitch, useMessage, NAlert, NSelect
+  NDivider, NSwitch, useMessage, NAlert, NSelect, useDialog
 } from 'naive-ui'
 import { 
   FolderOpenOutline, 
@@ -20,6 +20,8 @@ import {
   BilibiliLogout,
   OpenLogDir,
   GetLogDir,
+  GetLogSize,
+  ClearLogs,
   GetUpstreamProxy,
   SetUpstreamProxy,
   SetUseUpstreamProxy,
@@ -30,6 +32,7 @@ import {
 
 const store = useAppStore()
 const message = useMessage()
+const dialog = useDialog()
 
 const installing = ref(false)
 const uninstalling = ref(false)
@@ -38,6 +41,8 @@ const hasSessData = ref(false)  // Whether SESSDATA is already set
 const savingSessData = ref(false)
 const resettingSessData = ref(false)
 const logDir = ref('')
+const logSize = ref(0)
+const clearingLogs = ref(false)
 const upstreamProxyInput = ref('')
 const proxyDebug = ref(false)
 const closeAction = ref<'' | 'exit' | 'minimize'>('')
@@ -61,6 +66,13 @@ onMounted(async () => {
     logDir.value = await GetLogDir()
   } catch (e) {
     console.error('Failed to get log dir:', e)
+  }
+
+  // Load log size
+  try {
+    logSize.value = await GetLogSize()
+  } catch (e) {
+    console.error('Failed to get log size:', e)
   }
   
   // Load upstream proxy
@@ -208,6 +220,35 @@ async function saveUpstreamProxy() {
   } catch (e: any) {
     message.error(e.message || '保存失败')
   }
+}
+
+function formatFileSize(bytes: number): string {
+  if (bytes === 0) return '0 B'
+  const k = 1024
+  const sizes = ['B', 'KB', 'MB', 'GB']
+  const i = Math.floor(Math.log(bytes) / Math.log(k))
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i]
+}
+
+async function clearLogs() {
+  dialog.warning({
+    title: '确认清空日志',
+    content: '此操作将删除所有日志文件，无法恢复。确定要继续吗？',
+    positiveText: '确定清空',
+    negativeText: '取消',
+    onPositiveClick: async () => {
+      clearingLogs.value = true
+      try {
+        await ClearLogs()
+        logSize.value = await GetLogSize()
+        message.success('日志已清空')
+      } catch (e: any) {
+        message.error(e.message || '清空日志失败')
+      } finally {
+        clearingLogs.value = false
+      }
+    }
+  })
 }
 </script>
 
@@ -472,6 +513,33 @@ async function saveUpstreamProxy() {
                 <DocumentTextOutline class="w-4 h-4" />
               </template>
               打开目录
+            </NButton>
+          </div>
+
+          <NDivider class="my-2" />
+
+          <div class="flex items-center justify-between">
+            <div>
+              <p class="text-sm font-medium">日志文件大小</p>
+              <p class="text-xs text-text-secondary">当前日志文件占用空间</p>
+            </div>
+            <span class="text-sm text-text-secondary">{{ formatFileSize(logSize) }}</span>
+          </div>
+
+          <NDivider class="my-2" />
+
+          <div class="flex items-center justify-between">
+            <div>
+              <p class="text-sm font-medium">清空日志</p>
+              <p class="text-xs text-text-secondary">删除所有日志文件以释放空间</p>
+            </div>
+            <NButton
+              type="error"
+              size="small"
+              :loading="clearingLogs"
+              @click="clearLogs"
+            >
+              清空日志
             </NButton>
           </div>
         </div>

@@ -2,10 +2,10 @@
 import { onMounted, onUnmounted, ref, computed, watch } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { useAppStore } from '@/stores/app'
-import { 
-  NConfigProvider, NLayout, NLayoutSider, NMenu, 
+import {
+  NConfigProvider, NLayout, NLayoutSider, NMenu,
   NButton, NSpace, NTooltip, NSwitch, NSpin,
-  NMessageProvider,
+  NMessageProvider, NDialogProvider,
   darkTheme, lightTheme, zhCN, dateZhCN
 } from 'naive-ui'
 import type { MenuOption } from 'naive-ui'
@@ -42,11 +42,14 @@ const currentTheme = computed(() => store.theme === 'light' ? lightTheme : darkT
 
 // Show welcome wizard after app init if certificate is not installed
 // Requirements 1.1, 1.2, 3.1: Use certInstalled instead of firstRunComplete
-watch(() => store.loading, (loading) => {
-  if (!loading && !store.certInstalled) {
-    showWelcome.value = true
+watch(
+  () => [store.loading, store.certInstalled, store.dontRemindCertWizard] as const,
+  ([loading, certInstalled, dontRemind]) => {
+    if (!loading && !certInstalled && !dontRemind) {
+      showWelcome.value = true
+    }
   }
-})
+)
 
 const menuOptions: MenuOption[] = [
   {
@@ -168,15 +171,26 @@ function handleWelcomeSkip() {
   // certInstalled remains false, wizard will show again on next startup
   showWelcome.value = false
 }
+
+async function handleWelcomeDontRemind() {
+  try {
+    await store.setDontRemindCertWizard(true)
+  } catch (e) {
+    console.error('Failed to set dontRemindCertWizard:', e)
+  } finally {
+    showWelcome.value = false
+  }
+}
 </script>
 
 <template>
-  <NConfigProvider 
-    :theme="currentTheme" 
+  <NConfigProvider
+    :theme="currentTheme"
     :locale="zhCN"
     :date-locale="dateZhCN"
   >
     <NMessageProvider>
+      <NDialogProvider>
       <div class="app-container h-screen flex bg-primary text-text-primary transition-colors duration-300">
       <!-- Sidebar -->
       <div 
@@ -300,11 +314,13 @@ function handleWelcomeSkip() {
         v-model:show="showWelcome"
         @complete="handleWelcomeComplete"
         @skip="handleWelcomeSkip"
+        @dont-remind="handleWelcomeDontRemind"
       />
       
       <!-- Close Confirmation Dialog -->
       <CloseConfirmDialog v-model:show="showCloseDialog" />
     </div>
+      </NDialogProvider>
     </NMessageProvider>
   </NConfigProvider>
 </template>

@@ -43,16 +43,17 @@ type App struct {
 	configManager      *config.ConfigManager
 
 	// Settings
-	proxyPort        int
-	apiPort          int
-	downloadDir      string
-	minimizeToTray   bool
-	showNotification bool
-	firstRunComplete bool
-	theme            string // "dark" or "light"
-	language         string // "zh-CN" or "en-US"
-	upstreamProxy    string // Upstream proxy URL
-	useUpstreamProxy bool   // Whether to use upstream proxy
+	proxyPort            int
+	apiPort              int
+	downloadDir          string
+	minimizeToTray       bool
+	showNotification     bool
+	firstRunComplete     bool
+	dontRemindCertWizard bool
+	theme                string // "dark" or "light"
+	language             string // "zh-CN" or "en-US"
+	upstreamProxy        string // Upstream proxy URL
+	useUpstreamProxy     bool   // Whether to use upstream proxy
 
 	// Diagnostics
 	proxyDebug bool
@@ -73,19 +74,20 @@ func NewApp() *App {
 	utils.EnsureDir(downloadDir)
 
 	return &App{
-		proxyPort:        8899,
-		apiPort:          18899,
-		downloadDir:      downloadDir,
-		minimizeToTray:   true,
-		showNotification: true,
-		firstRunComplete: false,
-		theme:            "dark",
-		language:         "zh-CN",
-		upstreamProxy:    "",
-		useUpstreamProxy: false,
-		proxyDebug:       false,
-		closeAction:      "",    // Empty means ask user
-		dontAskOnClose:   false, // Show dialog by default
+		proxyPort:            8899,
+		apiPort:              18899,
+		downloadDir:          downloadDir,
+		minimizeToTray:       true,
+		showNotification:     true,
+		firstRunComplete:     false,
+		dontRemindCertWizard: false,
+		theme:                "dark",
+		language:             "zh-CN",
+		upstreamProxy:        "",
+		useUpstreamProxy:     false,
+		proxyDebug:           false,
+		closeAction:          "",    // Empty means ask user
+		dontAskOnClose:       false, // Show dialog by default
 	}
 }
 
@@ -115,6 +117,7 @@ func (a *App) startup(ctx context.Context) {
 			a.minimizeToTray = cfg.MinimizeToTray
 			a.showNotification = cfg.ShowNotification
 			a.firstRunComplete = cfg.FirstRunComplete
+			a.dontRemindCertWizard = cfg.DontRemindCertWizard
 			if cfg.Theme != "" {
 				a.theme = cfg.Theme
 			}
@@ -1087,21 +1090,22 @@ func (a *App) OpenFile(path string) error {
 // GetAppInfo returns app information
 func (a *App) GetAppInfo() map[string]interface{} {
 	return map[string]interface{}{
-		"version":          "1.0.0",
-		"proxyPort":        a.proxyPort,
-		"apiPort":          a.apiPort,
-		"downloadDir":      a.downloadDir,
-		"certPath":         a.certManager.GetCertPath(),
-		"minimizeToTray":   a.minimizeToTray,
-		"showNotification": a.showNotification,
-		"firstRunComplete": a.firstRunComplete,
-		"theme":            a.theme,
-		"language":         a.language,
-		"upstreamProxy":    a.upstreamProxy,
-		"useUpstreamProxy": a.useUpstreamProxy,
-		"proxyDebug":       a.proxyDebug,
-		"closeAction":      a.closeAction,
-		"dontAskOnClose":   a.dontAskOnClose,
+		"version":              "1.0.0",
+		"proxyPort":            a.proxyPort,
+		"apiPort":              a.apiPort,
+		"downloadDir":          a.downloadDir,
+		"certPath":             a.certManager.GetCertPath(),
+		"minimizeToTray":       a.minimizeToTray,
+		"showNotification":     a.showNotification,
+		"firstRunComplete":     a.firstRunComplete,
+		"dontRemindCertWizard": a.dontRemindCertWizard,
+		"theme":                a.theme,
+		"language":             a.language,
+		"upstreamProxy":        a.upstreamProxy,
+		"useUpstreamProxy":     a.useUpstreamProxy,
+		"proxyDebug":           a.proxyDebug,
+		"closeAction":          a.closeAction,
+		"dontAskOnClose":       a.dontAskOnClose,
 	}
 }
 
@@ -1155,6 +1159,19 @@ func (a *App) SetFirstRunComplete(complete bool) {
 	}
 }
 
+// IsDontRemindCertWizard returns whether to suppress the certificate welcome wizard prompt
+func (a *App) IsDontRemindCertWizard() bool {
+	return a.dontRemindCertWizard
+}
+
+// SetDontRemindCertWizard sets whether to suppress the certificate welcome wizard prompt
+func (a *App) SetDontRemindCertWizard(dontRemind bool) {
+	a.dontRemindCertWizard = dontRemind
+	if a.configManager != nil {
+		_ = a.configManager.Set("dontRemindCertWizard", dontRemind)
+	}
+}
+
 // ==================== Log Methods ====================
 
 // OpenLogDir opens the log directory in file explorer
@@ -1166,6 +1183,27 @@ func (a *App) OpenLogDir() error {
 // GetLogDir returns the log directory path
 func (a *App) GetLogDir() string {
 	return logger.GetGlobalLogger().GetLogDir()
+}
+
+// GetLogSize returns the total size of all log files in bytes
+func (a *App) GetLogSize() int64 {
+	size, err := logger.GetGlobalLogger().GetTotalLogSize()
+	if err != nil {
+		logger.Warn("Failed to get log size: %v", err)
+		return 0
+	}
+	return size
+}
+
+// ClearLogs removes all log files and recreates the current log file
+func (a *App) ClearLogs() error {
+	err := logger.GetGlobalLogger().ClearAllLogs()
+	if err != nil {
+		logger.Error("Failed to clear logs: %v", err)
+		return err
+	}
+	logger.Info("Logs cleared by user")
+	return nil
 }
 
 // ==================== Appearance Methods ====================

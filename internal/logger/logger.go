@@ -293,6 +293,76 @@ func (l *Logger) CleanOldLogs(maxAge time.Duration) error {
 	return nil
 }
 
+// GetTotalLogSize returns the total size of all log files in bytes
+func (l *Logger) GetTotalLogSize() (int64, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	var totalSize int64
+
+	entries, err := os.ReadDir(l.logDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("failed to read log directory: %w", err)
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+
+		totalSize += info.Size()
+	}
+
+	return totalSize, nil
+}
+
+// ClearAllLogs removes all log files and recreates the current log file
+func (l *Logger) ClearAllLogs() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	// Close current log file
+	if l.logFile != nil {
+		l.logFile.Close()
+		l.logFile = nil
+		l.logger = nil
+	}
+
+	// Remove all files in log directory
+	entries, err := os.ReadDir(l.logDir)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to read log directory: %w", err)
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		logPath := filepath.Join(l.logDir, entry.Name())
+		os.Remove(logPath)
+	}
+
+	// Recreate log file
+	logPath := l.getLogPath()
+	file, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to create new log file: %w", err)
+	}
+
+	l.logFile = file
+	l.logger = log.New(io.MultiWriter(file, os.Stdout), "", log.LstdFlags)
+
+	return nil
+}
+
 // Global logger instance
 var globalLogger *Logger
 var globalLoggerOnce sync.Once

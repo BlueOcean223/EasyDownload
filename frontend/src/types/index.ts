@@ -120,6 +120,7 @@ export interface AppInfo {
   minimizeToTray: boolean
   showNotification: boolean
   firstRunComplete: boolean
+  dontRemindCertWizard?: boolean
   proxyDebug?: boolean
   wechatNoMITM?: boolean
 }

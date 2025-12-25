@@ -45,6 +45,8 @@ type Config struct {
 	// Cached detection results (for faster startup)
 	FFmpegPath    string `json:"ffmpegPath,omitempty"` // Cached FFmpeg executable path
 	CertInstalled bool   `json:"certInstalled"`        // Cached certificate installation status
+	// Welcome wizard behavior
+	DontRemindCertWizard bool `json:"dontRemindCertWizard"` // Whether to suppress the certificate welcome wizard prompt
 
 	// Version info
 	Version string `json:"version"`
@@ -56,25 +58,26 @@ func DefaultConfig() *Config {
 	defaultDownloadDir := filepath.Join(homeDir, "Downloads", "EasyDownload")
 
 	return &Config{
-		ProxyPort:        8899,
-		APIPort:          18899,
-		DownloadDir:      defaultDownloadDir,
-		MaxConcurrent:    3,
-		AutoRetry:        true,
-		MaxRetryCount:    3,
-		MinimizeToTray:   true,
-		ShowNotification: true,
-		FirstRunComplete: false,
-		CloseAction:      "",    // Empty means ask user
-		DontAskOnClose:   false, // Show dialog by default
-		Theme:            "dark",
-		Language:         "zh-CN",
-		UpstreamProxy:    "",
-		UseUpstreamProxy: false,
-		ProxyDebug:       false,
-		FFmpegPath:       "",
-		CertInstalled:    false,
-		Version:          "1.0.0",
+		ProxyPort:            8899,
+		APIPort:              18899,
+		DownloadDir:          defaultDownloadDir,
+		MaxConcurrent:        3,
+		AutoRetry:            true,
+		MaxRetryCount:        3,
+		MinimizeToTray:       true,
+		ShowNotification:     true,
+		FirstRunComplete:     false,
+		CloseAction:          "",    // Empty means ask user
+		DontAskOnClose:       false, // Show dialog by default
+		Theme:                "dark",
+		Language:             "zh-CN",
+		UpstreamProxy:        "",
+		UseUpstreamProxy:     false,
+		ProxyDebug:           false,
+		FFmpegPath:           "",
+		CertInstalled:        false,
+		DontRemindCertWizard: false,
+		Version:              "1.0.0",
 	}
 }
 
@@ -335,6 +338,12 @@ func (cm *ConfigManager) Set(key string, value any) error {
 			cm.config.CertInstalled = v
 		} else {
 			return fmt.Errorf("invalid type for certInstalled")
+		}
+	case "dontRemindCertWizard":
+		if v, ok := value.(bool); ok {
+			cm.config.DontRemindCertWizard = v
+		} else {
+			return fmt.Errorf("invalid type for dontRemindCertWizard")
 		}
 	default:
 		return fmt.Errorf("unknown config key: %s", key)
