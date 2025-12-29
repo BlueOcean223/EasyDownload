@@ -11,14 +11,16 @@ import (
 	"EasyDownload/assets/icons"
 	"EasyDownload/internal/api"
 	"EasyDownload/internal/config"
-	"EasyDownload/internal/douyin"
-	"EasyDownload/internal/downloader"
-	"EasyDownload/internal/ffmpeg"
-	"EasyDownload/internal/logger"
+	"EasyDownload/internal/download"
+	"EasyDownload/internal/download/bilibili"
+	"EasyDownload/internal/download/douyin"
+	"EasyDownload/internal/download/wechat"
+	"EasyDownload/internal/download/xiaohongshu"
+	"EasyDownload/internal/infra/ffmpeg"
+	"EasyDownload/internal/infra/logger"
 	"EasyDownload/internal/proxy"
 	"EasyDownload/internal/tray"
 	"EasyDownload/internal/utils"
-	"EasyDownload/internal/xiaohongshu"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
@@ -31,7 +33,7 @@ type App struct {
 	systemProxy        *proxy.SystemProxy
 	internalAPI        *api.InternalAPI
 	downloadManager    *downloader.DownloadManager
-	bilibiliDownloader *downloader.BilibiliDownloader
+	bilibiliDownloader *bilibili.BilibiliDownloader
 	douyinParser       *douyin.Parser
 	douyinClient       *douyin.Client
 	douyinDownloader   *douyin.Downloader
@@ -177,7 +179,7 @@ func (a *App) startup(ctx context.Context) {
 	})
 
 	// Initialize Bilibili downloader
-	a.bilibiliDownloader = downloader.NewBilibiliDownloader()
+	a.bilibiliDownloader = bilibili.NewBilibiliDownloader()
 	if a.configManager != nil {
 		a.bilibiliDownloader.SetConfigManager(a.configManager)
 		// Load persisted SESSDATA
@@ -261,7 +263,7 @@ func (a *App) startup(ctx context.Context) {
 	})
 
 	// Set download callback for one-click download from video page
-	a.proxyServer.GetWeChatHandler().SetDownloadCallback(func(video proxy.WeChatVideoInfo) {
+	a.proxyServer.GetWeChatHandler().SetDownloadCallback(func(video wechat.VideoInfo) {
 		logger.Info("Download requested from video page: title=%q id=%q pageKey=%q source=%q",
 			video.Title, video.ID, video.PageKey, video.Source,
 		)
@@ -557,7 +559,7 @@ func (a *App) GetDownloads() []map[string]interface{} {
 // ==================== Bilibili Methods ====================
 
 // GetBilibiliVideoInfo fetches video info from Bilibili
-func (a *App) GetBilibiliVideoInfo(url string) (*downloader.BilibiliVideo, error) {
+func (a *App) GetBilibiliVideoInfo(url string) (*bilibili.BilibiliVideo, error) {
 	bvid, err := a.bilibiliDownloader.ParseURL(url)
 	if err != nil {
 		return nil, err
@@ -568,7 +570,7 @@ func (a *App) GetBilibiliVideoInfo(url string) (*downloader.BilibiliVideo, error
 
 // GetBilibiliVideoInfoWithAllParts fetches video info with stream info for all parts
 // This is used for the multi-part selector UI to show size estimates for each part
-func (a *App) GetBilibiliVideoInfoWithAllParts(url string) (*downloader.BilibiliVideo, error) {
+func (a *App) GetBilibiliVideoInfoWithAllParts(url string) (*bilibili.BilibiliVideo, error) {
 	bvid, err := a.bilibiliDownloader.ParseURL(url)
 	if err != nil {
 		return nil, err
@@ -672,7 +674,7 @@ func (a *App) DownloadBilibiliPart(url string, partIndex int, quality int) (stri
 
 // createBilibiliDownloader creates a custom download function for Bilibili videos
 // partIndex: -1 for first part (single video), >= 0 for specific part
-func (a *App) createBilibiliDownloader(video *downloader.BilibiliVideo, quality int, partIndex int) downloader.DownloadFunc {
+func (a *App) createBilibiliDownloader(video *bilibili.BilibiliVideo, quality int, partIndex int) downloader.DownloadFunc {
 	return func(ctx context.Context, task *downloader.DownloadTask, onProgress func(downloaded, total int64), onComplete func(outputPath string)) error {
 		var outputPath string
 		var downloadErr error
@@ -722,7 +724,7 @@ func (a *App) HasBilibiliSessData() bool {
 }
 
 // GetBilibiliQRCode generates a QR code for Bilibili login
-func (a *App) GetBilibiliQRCode() (*downloader.BilibiliQRCode, error) {
+func (a *App) GetBilibiliQRCode() (*bilibili.BilibiliQRCode, error) {
 	logger.Info("API call: GetBilibiliQRCode")
 	qr, err := a.bilibiliDownloader.GetQRCode()
 	if err != nil {
@@ -732,7 +734,7 @@ func (a *App) GetBilibiliQRCode() (*downloader.BilibiliQRCode, error) {
 }
 
 // PollBilibiliQRCode checks the QR code scan status
-func (a *App) PollBilibiliQRCode(qrcodeKey string) (*downloader.BilibiliLoginStatus, error) {
+func (a *App) PollBilibiliQRCode(qrcodeKey string) (*bilibili.BilibiliLoginStatus, error) {
 	logger.Debug("API call: PollBilibiliQRCode")
 	status, err := a.bilibiliDownloader.PollQRCodeStatus(qrcodeKey)
 	if err != nil {
@@ -746,7 +748,7 @@ func (a *App) PollBilibiliQRCode(qrcodeKey string) (*downloader.BilibiliLoginSta
 }
 
 // GetBilibiliUserInfo gets the current logged in user info
-func (a *App) GetBilibiliUserInfo() (*downloader.BilibiliUserInfo, error) {
+func (a *App) GetBilibiliUserInfo() (*bilibili.BilibiliUserInfo, error) {
 	logger.Debug("API call: GetBilibiliUserInfo")
 	return a.bilibiliDownloader.GetUserInfo()
 }

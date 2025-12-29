@@ -1,13 +1,15 @@
 package proxy
 
 import (
-	"EasyDownload/internal/logger"
+	"EasyDownload/internal/download/wechat"
+	"EasyDownload/internal/infra/logger"
 	"bytes"
 	"compress/gzip"
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -25,23 +27,23 @@ import (
 
 // VideoInfo represents detected video information
 type VideoInfo struct {
-	ID           string            `json:"id"`
-	Title        string            `json:"title"`
-	Cover        string            `json:"cover"`
-	URL          string            `json:"url"`
-	Source       string            `json:"source"` // "wechat" or "bilibili"
-	Quality      string            `json:"quality"`
-	Duration     int               `json:"duration"`
-	Author       string            `json:"author"`
-	AuthorAvatar string            `json:"authorAvatar"`
-	Timestamp    int64             `json:"timestamp"`
-	DecodeKey    string            `json:"decodeKey"` // Decryption key for WeChat videos
-	FileSize     float64           `json:"fileSize"`  // File size in bytes
-	Width        int               `json:"width"`
-	Height       int               `json:"height"`
-	IsCurrent    bool              `json:"isCurrentVideo"`
-	FileFormats  []string          `json:"fileFormats"` // Available quality formats
-	Specs        []WeChatVideoSpec `json:"specs"`       // Detailed spec info for each quality
+	ID           string             `json:"id"`
+	Title        string             `json:"title"`
+	Cover        string             `json:"cover"`
+	URL          string             `json:"url"`
+	Source       string             `json:"source"` // "wechat" or "bilibili"
+	Quality      string             `json:"quality"`
+	Duration     int                `json:"duration"`
+	Author       string             `json:"author"`
+	AuthorAvatar string             `json:"authorAvatar"`
+	Timestamp    int64              `json:"timestamp"`
+	DecodeKey    string             `json:"decodeKey"` // Decryption key for WeChat videos
+	FileSize     float64            `json:"fileSize"`  // File size in bytes
+	Width        int                `json:"width"`
+	Height       int                `json:"height"`
+	IsCurrent    bool               `json:"isCurrentVideo"`
+	FileFormats  []string           `json:"fileFormats"` // Available quality formats
+	Specs        []wechat.VideoSpec `json:"specs"`       // Detailed spec info for each quality
 }
 
 // ProxyServer represents the MITM proxy server using goproxy
@@ -56,9 +58,6 @@ type ProxyServer struct {
 	// Callback for detected videos
 	onVideoDetected func(VideoInfo)
 
-	// Video URL deduplication
-	detectedURLs sync.Map
-
 	// Upstream proxy support
 	upstreamProxy string
 
@@ -67,7 +66,7 @@ type ProxyServer struct {
 
 	// WeChat video capture components
 	jsInjector    *JSInjector
-	wechatHandler *WeChatHandler
+	wechatHandler *wechat.Handler
 
 	// Limit how many res.wx.qq.com JS files we modify per session to reduce breakage risk.
 	wechatJSInjected int32
@@ -83,10 +82,10 @@ func NewProxyServer(certManager *CertManager, port int) *ProxyServer {
 
 	// Initialize WeChat video capture components
 	ps.jsInjector = NewJSInjector()
-	ps.wechatHandler = NewWeChatHandler()
+	ps.wechatHandler = wechat.NewHandler()
 
 	// Set up WeChat handler callback to convert to VideoInfo
-	ps.wechatHandler.SetVideoCallback(func(info WeChatVideoInfo) {
+	ps.wechatHandler.SetVideoCallback(func(info wechat.VideoInfo) {
 		if ps.onVideoDetected != nil {
 			videoInfo := VideoInfo{
 				ID:           info.ID,
@@ -217,7 +216,9 @@ func (ps *ProxyServer) Start() error {
 
 	// Start serving in a goroutine
 	go func() {
-		http.Serve(listener, ps.proxy)
+		if err := http.Serve(listener, ps.proxy); err != nil && !errors.Is(err, net.ErrClosed) {
+			logger.Error("Proxy server stopped with error: %v", err)
+		}
 	}()
 
 	logger.Info("Proxy server started on port %d", ps.port)
@@ -340,19 +341,6 @@ func (ps *ProxyServer) setupHandlers() {
 	ps.setupWeChatHandlers()
 }
 
-// shouldInterceptHost checks if we should intercept traffic for this host.
-// This only returns true for MITM domains where we need to inject scripts.
-// Video streaming domains are NOT intercepted to ensure smooth playback.
-func (ps *ProxyServer) shouldInterceptHost(host string) bool {
-	// Only intercept MITM domains (page content domains)
-	for _, h := range MITMDomains() {
-		if strings.Contains(host, h) || strings.HasSuffix(host, h) {
-			return true
-		}
-	}
-	return false
-}
-
 // readResponseBody reads and (if possible) decompresses the response body.
 // Returns:
 // - body: response bytes (decoded if supported encoding)
@@ -382,17 +370,6 @@ func readResponseBody(resp *http.Response) (body []byte, decoded bool, err error
 		body, err = io.ReadAll(resp.Body)
 		return body, false, err
 	}
-}
-
-// addVideoURL adds a video URL to the detected set, returns true if it's new
-func (ps *ProxyServer) addVideoURL(url string) bool {
-	_, loaded := ps.detectedURLs.LoadOrStore(url, true)
-	return !loaded
-}
-
-// ClearDetectedURLs clears the detected video URLs cache
-func (ps *ProxyServer) ClearDetectedURLs() {
-	ps.detectedURLs = sync.Map{}
 }
 
 // setupWeChatHandlers configures WeChat-specific request and response handlers
@@ -538,7 +515,7 @@ func (ps *ProxyServer) handleWeChatAPIRequest(r *http.Request, ctx *goproxy.Prox
 	}
 
 	// Process the request through WeChatHandler with type
-	if err := ps.wechatHandler.HandleWeChatRequestWithType(body, reqType); err != nil {
+	if err := ps.wechatHandler.HandleRequestWithType(body, reqType); err != nil {
 		logger.Debug("WeChat request processing (type=%s): %v", reqType, err)
 	}
 
@@ -772,7 +749,7 @@ func (ps *ProxyServer) injectDownloadButtonScript(htmlContent string) string {
 }
 
 // GetWeChatHandler returns the WeChat handler instance
-func (ps *ProxyServer) GetWeChatHandler() *WeChatHandler {
+func (ps *ProxyServer) GetWeChatHandler() *wechat.Handler {
 	return ps.wechatHandler
 }
 

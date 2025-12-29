@@ -1,7 +1,7 @@
 package api
 
 import (
-	"EasyDownload/internal/logger"
+	"EasyDownload/internal/infra/logger"
 	"encoding/json"
 	"fmt"
 	"net/http"

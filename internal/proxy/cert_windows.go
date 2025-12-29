@@ -12,11 +12,6 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-const (
-	// Certificate store name
-	certStoreName = "EasyDownload Root CA"
-)
-
 // IsCertInstalled checks if the CA certificate is installed in the system trust store
 // using Windows CryptoAPI. Checks both LocalMachine and CurrentUser stores.
 func (cm *CertManager) IsCertInstalled() bool {

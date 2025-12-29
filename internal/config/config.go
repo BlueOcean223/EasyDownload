@@ -1,7 +1,7 @@
 package config
 
 import (
-	"EasyDownload/internal/logger"
+	"EasyDownload/internal/infra/logger"
 	"encoding/json"
 	"fmt"
 	"os"

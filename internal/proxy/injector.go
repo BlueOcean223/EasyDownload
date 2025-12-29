@@ -2515,10 +2515,7 @@ var (
 
 	// Safer JS import rewriting patterns (modeled after wx_channels_download):
 	// Only rewrite common import/module patterns rather than replacing every `.js"` substring.
-	jsDepRegex        = regexp.MustCompile(`"js/([^"']+)\.js"`)
-	jsFromRegex       = regexp.MustCompile(`from\s*["']([^"']+)\.js["']`)
-	jsLazyImportRegex = regexp.MustCompile(`import\(\s*["']([^"']+)\.js["']\s*\)`)
-	jsImportRegex     = regexp.MustCompile(`\bimport\s*(?:[^\n;]*?\s+from\s+)?["']([^"']+)\.js["']`)
+	jsDepRegex = regexp.MustCompile(`"js/([^"']+)\.js"`)
 )
 
 // GetDownloadButtonScript returns the JavaScript code for download button injection

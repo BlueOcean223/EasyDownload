@@ -1,7 +1,7 @@
 package tray
 
 import (
-	"EasyDownload/internal/logger"
+	"EasyDownload/internal/infra/logger"
 	"sync"
 
 	"github.com/getlantern/systray"
