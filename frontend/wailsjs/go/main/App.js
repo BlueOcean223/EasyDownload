@@ -6,6 +6,10 @@ export function BilibiliLogout() {
   return window['go']['main']['App']['BilibiliLogout']();
 }
 
+export function CanRestartAsAdmin() {
+  return window['go']['main']['App']['CanRestartAsAdmin']();
+}
+
 export function CancelDownload(arg1) {
   return window['go']['main']['App']['CancelDownload'](arg1);
 }
@@ -130,6 +134,10 @@ export function InstallCert() {
   return window['go']['main']['App']['InstallCert']();
 }
 
+export function IsAdmin() {
+  return window['go']['main']['App']['IsAdmin']();
+}
+
 export function IsCertInstalled() {
   return window['go']['main']['App']['IsCertInstalled']();
 }
@@ -200,6 +208,10 @@ export function RequestClose(arg1) {
 
 export function RequestQuit() {
   return window['go']['main']['App']['RequestQuit']();
+}
+
+export function RestartAsAdmin() {
+  return window['go']['main']['App']['RestartAsAdmin']();
 }
 
 export function RestoreFromTray() {

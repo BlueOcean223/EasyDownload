@@ -7,6 +7,8 @@ import {douyin} from '../models';
 
 export function BilibiliLogout():Promise<void>;
 
+export function CanRestartAsAdmin():Promise<boolean>;
+
 export function CancelDownload(arg1:string):Promise<void>;
 
 export function ClearDetectedVideos():Promise<void>;
@@ -69,6 +71,8 @@ export function HasBilibiliSessData():Promise<boolean>;
 
 export function InstallCert():Promise<void>;
 
+export function IsAdmin():Promise<boolean>;
+
 export function IsCertInstalled():Promise<boolean>;
 
 export function IsDontAskOnClose():Promise<boolean>;
@@ -104,6 +108,8 @@ export function RemoveDownload(arg1:string):Promise<void>;
 export function RequestClose(arg1:string):Promise<void>;
 
 export function RequestQuit():Promise<void>;
+
+export function RestartAsAdmin():Promise<void>;
 
 export function RestoreFromTray():Promise<void>;
 

@@ -1360,3 +1360,28 @@ func (a *App) RequestQuit() {
 func (a *App) IsQuitRequested() bool {
 	return a.quitRequested.Load()
 }
+
+// ==================== Admin Methods ====================
+
+// IsAdmin checks if the current process has administrator privileges
+func (a *App) IsAdmin() bool {
+	return utils.IsAdmin()
+}
+
+// RestartAsAdmin restarts the application with administrator privileges.
+// Returns nil on success. The backend will call RequestQuit() automatically,
+// so the frontend does not need to close the app explicitly.
+func (a *App) RestartAsAdmin() error {
+	err := utils.RestartAsAdmin()
+	if err != nil {
+		return err
+	}
+	// Request quit after successfully launching elevated process
+	a.RequestQuit()
+	return nil
+}
+
+// CanRestartAsAdmin returns true if the platform supports restarting with admin privileges.
+func (a *App) CanRestartAsAdmin() bool {
+	return utils.CanRestartAsAdmin()
+}

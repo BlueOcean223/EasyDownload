@@ -3,10 +3,10 @@ import { ref, onMounted } from 'vue'
 import { useAppStore } from '@/stores/app'
 import {
   NCard, NButton, NInput, NSpace, NTag,
-  NDivider, NSwitch, useMessage, NAlert, NSelect, useDialog
+  NDivider, NSwitch, useMessage, NAlert, NSelect, useDialog, NModal
 } from 'naive-ui'
-import { 
-  FolderOpenOutline, 
+import {
+  FolderOpenOutline,
   ShieldCheckmarkOutline,
   ServerOutline,
   InformationCircleOutline,
@@ -27,8 +27,12 @@ import {
   SetUseUpstreamProxy,
   GetProxyDebug,
   SetProxyDebug,
-  GetCloseAction
+  GetCloseAction,
+  CanRestartAsAdmin,
+  IsAdmin,
+  RestartAsAdmin
 } from '../../wailsjs/go/main/App'
+import { getErrorMessage, isPermissionError } from '@/utils/errors'
 
 const store = useAppStore()
 const message = useMessage()
@@ -46,6 +50,9 @@ const clearingLogs = ref(false)
 const upstreamProxyInput = ref('')
 const proxyDebug = ref(false)
 const closeAction = ref<'' | 'exit' | 'minimize'>('')
+const showAdminDialog = ref(false)
+const restarting = ref(false)
+const adminDialogAction = ref<'install' | 'uninstall'>('install')
 
 const closeActionOptions = [
   { label: '每次询问', value: '' },
@@ -103,7 +110,32 @@ async function installCert() {
     await store.installCertificate()
     message.success('证书安装成功')
   } catch (e: any) {
-    message.error(e.message || '证书安装失败，请以管理员身份运行')
+    const errorMsg = getErrorMessage(e, '证书安装失败')
+    const permissionError = isPermissionError(errorMsg)
+    let isAdmin = false
+    try {
+      isAdmin = await IsAdmin()
+    } catch {
+      message.error(errorMsg)
+      return
+    }
+
+    if (permissionError && !isAdmin) {
+      let canRestart = false
+      try {
+        canRestart = await CanRestartAsAdmin()
+      } catch {
+        message.error(errorMsg)
+        return
+      }
+      if (canRestart) {
+        adminDialogAction.value = 'install'
+        showAdminDialog.value = true
+        return
+      }
+    }
+
+    message.error(errorMsg)
   } finally {
     installing.value = false
   }
@@ -115,10 +147,52 @@ async function uninstallCert() {
     await store.uninstallCertificate()
     message.success('证书卸载成功')
   } catch (e: any) {
-    message.error(e.message || '证书卸载失败，请以管理员身份运行')
+    const errorMsg = getErrorMessage(e, '证书卸载失败')
+    const permissionError = isPermissionError(errorMsg)
+    let isAdmin = false
+    try {
+      isAdmin = await IsAdmin()
+    } catch {
+      message.error(errorMsg)
+      return
+    }
+
+    if (permissionError && !isAdmin) {
+      let canRestart = false
+      try {
+        canRestart = await CanRestartAsAdmin()
+      } catch {
+        message.error(errorMsg)
+        return
+      }
+      if (canRestart) {
+        adminDialogAction.value = 'uninstall'
+        showAdminDialog.value = true
+        return
+      }
+    }
+
+    message.error(errorMsg)
   } finally {
     uninstalling.value = false
   }
+}
+
+async function restartAsAdmin() {
+  restarting.value = true
+  try {
+    await RestartAsAdmin()
+    // App will quit automatically after launching elevated process
+  } catch (e: any) {
+    message.error('无法以管理员身份重启: ' + getErrorMessage(e, '未知错误'))
+    showAdminDialog.value = false
+  } finally {
+    restarting.value = false
+  }
+}
+
+function cancelAdminRestart() {
+  showAdminDialog.value = false
 }
 
 async function selectFolder() {
@@ -559,5 +633,22 @@ async function clearLogs() {
         </div>
       </NCard>
     </div>
+
+    <!-- Admin Restart Dialog -->
+    <NModal
+      v-model:show="showAdminDialog"
+      preset="dialog"
+      title="需要管理员权限"
+      positive-text="以管理员身份重启"
+      negative-text="取消"
+      :positive-button-props="{ loading: restarting }"
+      @positive-click="restartAsAdmin"
+      @negative-click="cancelAdminRestart"
+    >
+      <p>{{ adminDialogAction === 'install' ? '安装' : '卸载' }}证书需要管理员权限，是否以管理员身份重启？</p>
+      <p class="text-text-secondary text-sm mt-2">
+        系统会弹出 UAC 提示。
+      </p>
+    </NModal>
   </div>
 </template>

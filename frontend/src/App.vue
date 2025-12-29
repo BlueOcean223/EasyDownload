@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref, computed, watch } from 'vue'
+import { onMounted, onUnmounted, ref, computed } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { useAppStore } from '@/stores/app'
 import {
@@ -39,17 +39,6 @@ const activeKey = computed(() => route.name as string)
 
 // Computed theme for Naive UI
 const currentTheme = computed(() => store.theme === 'light' ? lightTheme : darkTheme)
-
-// Show welcome wizard after app init if certificate is not installed
-// Requirements 1.1, 1.2, 3.1: Use certInstalled instead of firstRunComplete
-watch(
-  () => [store.loading, store.certInstalled, store.dontRemindCertWizard] as const,
-  ([loading, certInstalled, dontRemind]) => {
-    if (!loading && !certInstalled && !dontRemind) {
-      showWelcome.value = true
-    }
-  }
-)
 
 const menuOptions: MenuOption[] = [
   {
@@ -143,6 +132,12 @@ async function toggleTheme(event?: MouseEvent) {
 
 onMounted(async () => {
   await store.initApp()
+
+  // Only show the welcome wizard once at startup.
+  // Do not auto-pop it again if the user later uninstalls the certificate in Settings.
+  if (!store.certInstalled && !store.dontRemindCertWizard) {
+    showWelcome.value = true
+  }
   
   // Listen for navigate:settings event from tray menu
   EventsOn('navigate:settings', () => {

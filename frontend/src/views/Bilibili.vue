@@ -35,6 +35,7 @@ const error = ref('')
 const showPartSelector = ref(false)
 const showLoginModal = ref(false)
 const userInfo = ref<BilibiliUserInfo | null>(null)
+let fetchVideoInfoRequestId = 0
 
 // Check login status on mount
 onMounted(async () => {
@@ -52,9 +53,15 @@ onMounted(async () => {
   }
 })
 
-function handleLogin(info: BilibiliUserInfo) {
+async function handleLogin(info: BilibiliUserInfo) {
   userInfo.value = info
   showLoginModal.value = false
+
+  // 如果已有视频信息，自动重新解析以获取更高画质
+  if (videoInfo.value && url.value.trim()) {
+    message.info('正在重新解析以获取更高画质...')
+    await fetchVideoInfo()
+  }
 }
 
 function handleLogout() {
@@ -89,34 +96,43 @@ const hasMultipleParts = computed(() => {
 })
 
 async function fetchVideoInfo() {
-  if (!url.value.trim()) {
+  const urlSnapshot = url.value.trim()
+  if (!urlSnapshot) {
     message.warning('请输入B站视频链接')
     return
   }
 
+  const requestId = ++fetchVideoInfoRequestId
   loading.value = true
   error.value = ''
   videoInfo.value = null
 
   try {
-    const info = await GetBilibiliVideoInfo(url.value) as BilibiliVideo
+    const info = await GetBilibiliVideoInfo(urlSnapshot) as BilibiliVideo
+    // Check if URL changed during fetch - discard stale result
+    if (requestId !== fetchVideoInfoRequestId) return
+
     videoInfo.value = info
-    
+
     // Build quality options
     qualityOptions.value = info.streams.map(s => ({
       label: s.qualityName,
       value: s.quality
     }))
-    
+
     // Select highest quality by default
     if (info.streams.length > 0) {
       selectedQuality.value = info.streams[0].quality
     }
   } catch (e: any) {
+    // Check if URL changed during fetch - discard stale error
+    if (requestId !== fetchVideoInfoRequestId) return
     error.value = e.message || '获取视频信息失败'
     message.error(error.value)
   } finally {
-    loading.value = false
+    if (requestId === fetchVideoInfoRequestId) {
+      loading.value = false
+    }
   }
 }
 

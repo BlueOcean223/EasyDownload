@@ -1,17 +1,19 @@
 <script setup lang="ts">
-import { ref, computed } from 'vue'
+import { ref, computed, watch } from 'vue'
 import { useAppStore } from '@/stores/app'
-import { 
-  NModal, NCard, NButton, NSteps, NStep, NSpace, 
-  NAlert, NResult, useMessage 
+import {
+  NModal, NCard, NButton, NSteps, NStep, NSpace,
+  NAlert, NResult, useMessage
 } from 'naive-ui'
-import { 
-  ShieldCheckmarkOutline, 
+import {
+  ShieldCheckmarkOutline,
   FolderOpenOutline,
   CheckmarkCircleOutline,
   ChevronForwardOutline,
   ChevronBackOutline
 } from '@vicons/ionicons5'
+import { CanRestartAsAdmin, IsAdmin, RestartAsAdmin } from '../../wailsjs/go/main/App'
+import { getErrorMessage, isPermissionError } from '@/utils/errors'
 
 const props = defineProps<{
   show: boolean
@@ -30,6 +32,17 @@ const message = useMessage()
 const currentStep = ref(1)
 const installing = ref(false)
 const certError = ref('')
+const showAdminDialog = ref(false)
+const restarting = ref(false)
+const closing = ref(false)
+
+// Reset closing flag when modal is shown
+watch(
+  () => props.show,
+  (value) => {
+    if (value) closing.value = false
+  }
+)
 
 const canGoNext = computed(() => {
   if (currentStep.value === 1) {
@@ -56,11 +69,55 @@ async function installCertificate() {
     await store.installCertificate()
     message.success('证书安装成功')
   } catch (e: any) {
-    certError.value = e.message || '证书安装失败，请以管理员身份运行应用'
+    const errorMsg = getErrorMessage(e, '证书安装失败')
+    const permissionError = isPermissionError(errorMsg)
+    let isAdmin = false
+    try {
+      isAdmin = await IsAdmin()
+    } catch {
+      certError.value = errorMsg
+      message.error(certError.value)
+      return
+    }
+
+    if (permissionError && !isAdmin) {
+      let canRestart = false
+      try {
+        canRestart = await CanRestartAsAdmin()
+      } catch {
+        certError.value = errorMsg
+        message.error(certError.value)
+        return
+      }
+      if (canRestart) {
+        showAdminDialog.value = true
+        return
+      }
+    }
+
+    certError.value = errorMsg
     message.error(certError.value)
   } finally {
     installing.value = false
   }
+}
+
+async function restartAsAdmin() {
+  restarting.value = true
+  try {
+    await RestartAsAdmin()
+    // App will quit automatically after launching elevated process
+  } catch (e: any) {
+    message.error('无法以管理员身份重启: ' + getErrorMessage(e, '未知错误'))
+    showAdminDialog.value = false
+  } finally {
+    restarting.value = false
+  }
+}
+
+function cancelAdminRestart() {
+  showAdminDialog.value = false
+  certError.value = '证书安装需要管理员权限，请手动以管理员身份运行应用'
 }
 
 async function selectFolder() {
@@ -70,7 +127,7 @@ async function selectFolder() {
       message.success('下载目录已设置')
     }
   } catch (e: any) {
-    message.error(e.message || '选择目录失败')
+    message.error(getErrorMessage(e, '选择目录失败'))
   }
 }
 
@@ -86,19 +143,36 @@ function prevStep() {
   }
 }
 
-function complete() {
-  emit('complete')
+function closeWizard(action: 'complete' | 'skip' | 'dont-remind') {
+  if (closing.value) return
+  closing.value = true
+  if (action === 'complete') {
+    emit('complete')
+  } else if (action === 'skip') {
+    emit('skip')
+  } else {
+    emit('dont-remind')
+  }
   emit('update:show', false)
+}
+
+function complete() {
+  closeWizard('complete')
 }
 
 function skip() {
-  emit('skip')
-  emit('update:show', false)
+  closeWizard('skip')
 }
 
 function dontRemind() {
-  emit('dont-remind')
-  emit('update:show', false)
+  closeWizard('dont-remind')
+}
+
+function handleModalUpdateShow(value: boolean) {
+  if (!value && !closing.value) {
+    // Treat clicking the top-right close button as "skip"
+    skip()
+  }
 }
 </script>
 
@@ -110,6 +184,7 @@ function dontRemind() {
     preset="card"
     style="width: 600px"
     title="欢迎使用 EasyDownload"
+    @update:show="handleModalUpdateShow"
   >
     <div class="wizard-content">
       <!-- Steps indicator -->
@@ -125,12 +200,12 @@ function dontRemind() {
           <ShieldCheckmarkOutline class="w-16 h-16 text-accent mx-auto mb-4" />
           <h3 class="text-lg font-semibold mb-2">（可选）安装 CA 证书</h3>
           <p class="text-text-secondary text-sm">
-            仅当你需要使用「视频号」下载/嗅探微信 HTTPS 流量时，才需要安装 CA 根证书到系统信任存储。应用不会自动安装证书，只有你点击“安装证书”才会执行安装。
+            仅用于「视频号」嗅探微信 HTTPS 流量。点击“安装证书”后才会写入系统信任存储。
           </p>
         </div>
 
         <NAlert v-if="!store.certInstalled" type="warning" class="mb-4">
-          此操作需要管理员权限。如果安装失败，请右键点击应用图标，选择“以管理员身份运行”。如果你只需要下载 B站/抖音/小红书，可以暂时跳过或选择不再提醒；之后也可以在「设置 → 证书管理」里手动安装。
+          需要管理员权限。失败可“以管理员身份运行”，或在「设置 → 证书管理」手动安装。
         </NAlert>
 
         <NAlert v-if="certError" type="error" class="mb-4">
@@ -237,6 +312,23 @@ function dontRemind() {
         </NButton>
       </div>
     </template>
+  </NModal>
+
+  <!-- Admin Restart Dialog -->
+  <NModal
+    v-model:show="showAdminDialog"
+    preset="dialog"
+    title="需要管理员权限"
+    positive-text="以管理员身份重启"
+    negative-text="取消"
+    :positive-button-props="{ loading: restarting }"
+    @positive-click="restartAsAdmin"
+    @negative-click="cancelAdminRestart"
+  >
+    <p>安装证书需要管理员权限，是否以管理员身份重启？</p>
+    <p class="text-text-secondary text-sm mt-2">
+      系统会弹出 UAC 提示。
+    </p>
   </NModal>
 </template>
 

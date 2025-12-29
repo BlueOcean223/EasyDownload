@@ -7,7 +7,6 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"syscall"
 )
 
 // GetAppDataDir returns the application data directory
@@ -70,40 +69,6 @@ func OpenFile(path string) error {
 	}
 
 	return cmd.Start()
-}
-
-// IsAdmin checks if the current process has admin privileges (Windows)
-func IsAdmin() bool {
-	if runtime.GOOS != "windows" {
-		return os.Geteuid() == 0
-	}
-
-	// Try to open a privileged registry key
-	_, err := os.Open("\\\\.\\PHYSICALDRIVE0")
-	return err == nil
-}
-
-// RunAsAdmin runs a command as administrator (Windows)
-func RunAsAdmin(executable string, args ...string) error {
-	if runtime.GOOS != "windows" {
-		cmd := exec.Command(executable, args...)
-		return cmd.Run()
-	}
-
-	// Use ShellExecute with "runas" verb
-	verb := "runas"
-	cwd, _ := os.Getwd()
-
-	argStr := ""
-	for _, arg := range args {
-		argStr += " " + arg
-	}
-
-	cmd := exec.Command("cmd", "/c", "start", verb, executable, argStr)
-	cmd.Dir = cwd
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-
-	return cmd.Run()
 }
 
 // FormatBytes formats bytes to human readable string
