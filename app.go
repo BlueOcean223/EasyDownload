@@ -1122,6 +1122,10 @@ func (a *App) MinimizeToTray() {
 }
 
 func (a *App) applyMinimizeToTray(ctx context.Context) {
+	if a.trayManager == nil || !a.trayManager.IsSupported() {
+		runtime.WindowMinimise(ctx)
+		return
+	}
 	runtime.WindowHide(ctx)
 }
 

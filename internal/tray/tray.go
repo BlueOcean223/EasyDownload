@@ -1,3 +1,5 @@
+//go:build !darwin
+
 package tray
 
 import (
@@ -34,6 +36,11 @@ func NewTrayManager() *TrayManager {
 	return &TrayManager{
 		tooltip: "EasyDownload",
 	}
+}
+
+// IsSupported reports whether this platform has a working tray implementation.
+func (tm *TrayManager) IsSupported() bool {
+	return true
 }
 
 // SetIcon sets the default tray icon
