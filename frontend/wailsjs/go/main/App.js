@@ -134,6 +134,10 @@ export function InstallCert() {
   return window['go']['main']['App']['InstallCert']();
 }
 
+export function InstallFFmpeg() {
+  return window['go']['main']['App']['InstallFFmpeg']();
+}
+
 export function IsAdmin() {
   return window['go']['main']['App']['IsAdmin']();
 }

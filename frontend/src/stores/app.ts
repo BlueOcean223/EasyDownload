@@ -22,6 +22,7 @@ import {
   OpenDownloadDir,
   GetAppInfo,
   IsFFmpegAvailable,
+  InstallFFmpeg,
   SetFirstRunComplete,
   SetMinimizeToTray,
   SetShowNotification,
@@ -366,6 +367,17 @@ export const useAppStore = defineStore('app', () => {
     }
   }
 
+  async function installFFmpeg() {
+    try {
+      const path = await InstallFFmpeg()
+      ffmpegAvailable.value = true
+      return path
+    } catch (error) {
+      console.error('Failed to install FFmpeg:', error)
+      throw error
+    }
+  }
+
   async function clearVideos() {
     await ClearDetectedVideos()
     detectedVideos.value = []
@@ -517,6 +529,7 @@ export const useAppStore = defineStore('app', () => {
     toggleProxy,
     installCertificate,
     uninstallCertificate,
+    installFFmpeg,
     clearVideos,
     downloadDetectedVideo,
     pauseDownloadTask,

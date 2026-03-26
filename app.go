@@ -1043,6 +1043,26 @@ func (a *App) IsFFmpegAvailable() bool {
 	return available
 }
 
+// InstallFFmpeg installs or discovers a usable FFmpeg binary and returns its path.
+func (a *App) InstallFFmpeg() (string, error) {
+	if a.ffmpegManager == nil {
+		return "", fmt.Errorf("ffmpeg manager not initialized")
+	}
+
+	path, err := a.ffmpegManager.EnsureAvailable()
+	if err != nil {
+		return "", err
+	}
+
+	if a.configManager != nil {
+		_ = a.configManager.Set("ffmpegPath", path)
+	}
+	if a.ctx != nil {
+		runtime.EventsEmit(a.ctx, "ffmpeg:ready", true)
+	}
+	return path, nil
+}
+
 // ==================== Settings Methods ====================
 
 // GetDownloadDir returns the download directory
@@ -1091,11 +1111,17 @@ func (a *App) OpenFile(path string) error {
 
 // GetAppInfo returns app information
 func (a *App) GetAppInfo() map[string]interface{} {
+	ffmpegPath := ""
+	if a.ffmpegManager != nil {
+		ffmpegPath = a.ffmpegManager.GetPath()
+	}
+
 	return map[string]interface{}{
 		"version":              "1.0.0",
 		"proxyPort":            a.proxyPort,
 		"apiPort":              a.apiPort,
 		"downloadDir":          a.downloadDir,
+		"ffmpegPath":           ffmpegPath,
 		"certPath":             a.certManager.GetCertPath(),
 		"minimizeToTray":       a.minimizeToTray,
 		"showNotification":     a.showNotification,

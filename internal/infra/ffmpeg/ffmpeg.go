@@ -58,11 +58,19 @@ func (fm *FFmpegManager) SetExtractDir(dir string) {
 // GetPath returns the path to the FFmpeg executable
 func (fm *FFmpegManager) GetPath() string {
 	fm.mu.RLock()
-	if fm.ffmpegPath != "" {
-		defer fm.mu.RUnlock()
-		return fm.ffmpegPath
-	}
+	cachedPath := fm.ffmpegPath
 	fm.mu.RUnlock()
+	if cachedPath != "" {
+		if fm.verifyFFmpeg(cachedPath) {
+			return cachedPath
+		}
+		fm.mu.Lock()
+		if fm.ffmpegPath == cachedPath {
+			fm.ffmpegPath = ""
+			fm.embedded = false
+		}
+		fm.mu.Unlock()
+	}
 
 	// Try to find FFmpeg
 	path := fm.findFFmpeg()
@@ -131,7 +139,9 @@ func (fm *FFmpegManager) findFFmpeg() string {
 
 	for _, p := range paths {
 		if absPath, err := exec.LookPath(p); err == nil {
-			return absPath
+			if fm.verifyFFmpeg(absPath) {
+				return absPath
+			}
 		}
 	}
 

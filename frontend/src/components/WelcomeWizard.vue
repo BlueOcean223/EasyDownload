@@ -205,7 +205,7 @@ function handleModalUpdateShow(value: boolean) {
         </div>
 
         <NAlert v-if="!store.certInstalled" type="warning" class="mb-4">
-          需要管理员权限。失败可“以管理员身份运行”，或在「设置 → 证书管理」手动安装。
+          需要系统授权。Windows 下可使用管理员权限运行；macOS 下会弹出系统密码授权框，也可在「设置 → 证书管理」手动安装。
         </NAlert>
 
         <NAlert v-if="certError" type="error" class="mb-4">

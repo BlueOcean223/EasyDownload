@@ -71,6 +71,8 @@ export function HasBilibiliSessData():Promise<boolean>;
 
 export function InstallCert():Promise<void>;
 
+export function InstallFFmpeg():Promise<string>;
+
 export function IsAdmin():Promise<boolean>;
 
 export function IsCertInstalled():Promise<boolean>;

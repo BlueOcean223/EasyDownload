@@ -116,6 +116,7 @@ export interface AppInfo {
   proxyPort: number
   apiPort: number
   downloadDir: string
+  ffmpegPath?: string
   certPath: string
   minimizeToTray: boolean
   showNotification: boolean
@@ -200,4 +201,3 @@ export interface XHSItem {
   Streams: XHSStream[]
   Images: XHSImage[]
 }
-

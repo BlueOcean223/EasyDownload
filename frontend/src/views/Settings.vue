@@ -40,6 +40,7 @@ const dialog = useDialog()
 
 const installing = ref(false)
 const uninstalling = ref(false)
+const installingFFmpeg = ref(false)
 const sessData = ref('')  // Only for new input, not loaded from storage
 const hasSessData = ref(false)  // Whether SESSDATA is already set
 const savingSessData = ref(false)
@@ -175,6 +176,19 @@ async function uninstallCert() {
     message.error(errorMsg)
   } finally {
     uninstalling.value = false
+  }
+}
+
+async function installFFmpeg() {
+  installingFFmpeg.value = true
+  try {
+    const path = await store.installFFmpeg()
+    await store.initApp()
+    message.success(path ? `FFmpeg 已就绪: ${path}` : 'FFmpeg 已就绪')
+  } catch (e: any) {
+    message.error(getErrorMessage(e, 'FFmpeg 安装失败'))
+  } finally {
+    installingFFmpeg.value = false
   }
 }
 
@@ -414,7 +428,7 @@ async function clearLogs() {
             <template #icon>
               <ShieldCheckmarkOutline class="w-5 h-5" />
             </template>
-            为了能够嗅探 HTTPS 流量，需要安装 CA 根证书到系统信任存储。此操作需要管理员权限。
+            为了能够嗅探 HTTPS 流量，需要安装 CA 根证书到系统信任存储。Windows 下通常需要管理员权限；macOS 下会弹出系统授权提示。
           </NAlert>
           
           <div class="flex items-center justify-between">
@@ -472,11 +486,34 @@ async function clearLogs() {
             <div>
               <p class="text-sm font-medium">FFmpeg</p>
               <p class="text-xs text-text-secondary">用于合并音视频流（B站高清视频需要）</p>
+              <p
+                v-if="store.appInfo?.ffmpegPath"
+                class="text-xs text-text-secondary truncate max-w-md"
+                :title="store.appInfo?.ffmpegPath"
+              >
+                {{ store.appInfo?.ffmpegPath }}
+              </p>
             </div>
-            <NTag :type="store.ffmpegAvailable ? 'success' : 'warning'" size="small">
-              {{ store.ffmpegAvailable ? '已安装' : '未检测到' }}
-            </NTag>
+            <NSpace align="center">
+              <NTag :type="store.ffmpegAvailable ? 'success' : 'warning'" size="small">
+                {{ store.ffmpegAvailable ? '已安装' : '未检测到' }}
+              </NTag>
+              <NButton
+                size="small"
+                type="primary"
+                secondary
+                :loading="installingFFmpeg"
+                :disabled="store.ffmpegAvailable"
+                @click="installFFmpeg"
+              >
+                {{ store.ffmpegAvailable ? '已就绪' : '安装 FFmpeg' }}
+              </NButton>
+            </NSpace>
           </div>
+
+          <NAlert v-if="!store.ffmpegAvailable" type="info" :bordered="false" class="rounded-lg">
+            macOS 下会优先使用应用内置或系统现有的 FFmpeg；若都不存在，程序会尝试自动安装。
+          </NAlert>
         </div>
       </NCard>
       

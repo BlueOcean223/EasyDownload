@@ -288,7 +288,7 @@ function handleKeydown(e: KeyboardEvent) {
         class="mt-3"
         title="FFmpeg 未安装"
       >
-        下载高清视频需要 FFmpeg 进行音视频合并，请先安装 FFmpeg 并将其添加到系统 PATH
+        下载高清视频需要 FFmpeg 进行音视频合并。可在「设置」页自动安装，或手动安装后重启应用。
       </NAlert>
     </div>
     
@@ -451,4 +451,3 @@ function handleKeydown(e: KeyboardEvent) {
   color: var(--text-secondary, #999);
 }
 </style>
-
