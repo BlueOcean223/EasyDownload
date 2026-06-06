@@ -10,9 +10,12 @@ import (
 )
 
 type proxyEndpointState struct {
-	Enabled bool
-	Server  string
-	Port    int
+	Enabled       bool
+	Server        string
+	Port          int
+	Authenticated bool
+	Username      string
+	Password      string
 }
 
 type autoProxyURLState struct {
@@ -154,31 +157,26 @@ func (sp *SystemProxy) GetCurrentProxy() string {
 }
 
 func buildRestoreCommands(state proxyServiceState) [][]string {
-	commands := make([][]string, 0, 8)
-
-	if state.Web.Enabled && state.Web.Server != "" && state.Web.Port > 0 {
-		commands = append(commands, []string{"/usr/sbin/networksetup", "-setwebproxy", state.Service, state.Web.Server, strconv.Itoa(state.Web.Port), "off"})
-	} else {
-		commands = append(commands, []string{"/usr/sbin/networksetup", "-setwebproxystate", state.Service, "off"})
-	}
-
-	if state.Secure.Enabled && state.Secure.Server != "" && state.Secure.Port > 0 {
-		commands = append(commands, []string{"/usr/sbin/networksetup", "-setsecurewebproxy", state.Service, state.Secure.Server, strconv.Itoa(state.Secure.Port), "off"})
-	} else {
-		commands = append(commands, []string{"/usr/sbin/networksetup", "-setsecurewebproxystate", state.Service, "off"})
-	}
-
-	if state.Socks.Enabled && state.Socks.Server != "" && state.Socks.Port > 0 {
-		commands = append(commands, []string{"/usr/sbin/networksetup", "-setsocksfirewallproxy", state.Service, state.Socks.Server, strconv.Itoa(state.Socks.Port), "off"})
-	} else {
-		commands = append(commands, []string{"/usr/sbin/networksetup", "-setsocksfirewallproxystate", state.Service, "off"})
-	}
-
-	if state.AutoProxyURL.Enabled && state.AutoProxyURL.URL != "" {
-		commands = append(commands, []string{"/usr/sbin/networksetup", "-setautoproxyurl", state.Service, state.AutoProxyURL.URL})
-	} else {
-		commands = append(commands, []string{"/usr/sbin/networksetup", "-setautoproxystate", state.Service, "off"})
-	}
+	commands := make([][]string, 0, 12)
+	commands = append(commands, buildRestoreEndpointCommands(
+		state.Service,
+		state.Web,
+		"-setwebproxy",
+		"-setwebproxystate",
+	)...)
+	commands = append(commands, buildRestoreEndpointCommands(
+		state.Service,
+		state.Secure,
+		"-setsecurewebproxy",
+		"-setsecurewebproxystate",
+	)...)
+	commands = append(commands, buildRestoreEndpointCommands(
+		state.Service,
+		state.Socks,
+		"-setsocksfirewallproxy",
+		"-setsocksfirewallproxystate",
+	)...)
+	commands = append(commands, buildRestoreAutoProxyURLCommands(state.Service, state.AutoProxyURL)...)
 
 	if state.AutoDiscovery {
 		commands = append(commands, []string{"/usr/sbin/networksetup", "-setproxyautodiscovery", state.Service, "on"})
@@ -195,6 +193,47 @@ func buildRestoreCommands(state proxyServiceState) [][]string {
 	}
 
 	return commands
+}
+
+func buildRestoreEndpointCommands(service string, endpoint proxyEndpointState, setCommand, stateCommand string) [][]string {
+	if endpoint.Server == "" || endpoint.Port <= 0 {
+		return [][]string{{"/usr/sbin/networksetup", stateCommand, service, "off"}}
+	}
+
+	command := []string{
+		"/usr/sbin/networksetup",
+		setCommand,
+		service,
+		endpoint.Server,
+		strconv.Itoa(endpoint.Port),
+		darwinOnOff(endpoint.Authenticated),
+	}
+	if endpoint.Authenticated && endpoint.Username != "" && endpoint.Password != "" {
+		command = append(command, endpoint.Username, endpoint.Password)
+	}
+
+	return [][]string{
+		command,
+		{"/usr/sbin/networksetup", stateCommand, service, darwinOnOff(endpoint.Enabled)},
+	}
+}
+
+func buildRestoreAutoProxyURLCommands(service string, state autoProxyURLState) [][]string {
+	if state.URL == "" {
+		return [][]string{{"/usr/sbin/networksetup", "-setautoproxystate", service, "off"}}
+	}
+
+	return [][]string{
+		{"/usr/sbin/networksetup", "-setautoproxyurl", service, state.URL},
+		{"/usr/sbin/networksetup", "-setautoproxystate", service, darwinOnOff(state.Enabled)},
+	}
+}
+
+func darwinOnOff(enabled bool) string {
+	if enabled {
+		return "on"
+	}
+	return "off"
 }
 
 func listDarwinNetworkServices() ([]string, error) {
@@ -264,9 +303,12 @@ func parseDarwinNetworkServices(output string) []string {
 func parseDarwinProxyEndpoint(output string) proxyEndpointState {
 	values := parseDarwinKeyValueOutput(output)
 	return proxyEndpointState{
-		Enabled: parseDarwinBool(values["Enabled"]),
-		Server:  values["Server"],
-		Port:    parseDarwinPort(values["Port"]),
+		Enabled:       parseDarwinBool(values["Enabled"]),
+		Server:        values["Server"],
+		Port:          parseDarwinPort(values["Port"]),
+		Authenticated: parseDarwinBool(values["Authenticated Proxy Enabled"]),
+		Username:      firstDarwinValue(values, "Username", "User", "Authenticated Proxy Username"),
+		Password:      firstDarwinValue(values, "Password", "Authenticated Proxy Password"),
 	}
 }
 
@@ -321,6 +363,15 @@ func parseDarwinKeyValueOutput(output string) map[string]string {
 		result[key] = value
 	}
 	return result
+}
+
+func firstDarwinValue(values map[string]string, keys ...string) string {
+	for _, key := range keys {
+		if value := values[key]; value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func parseDarwinBool(value string) bool {

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { useAppStore } from '@/stores/app'
 import {
   NCard, NButton, NInput, NSpace, NTag,
@@ -32,6 +32,7 @@ import {
   IsAdmin,
   RestartAsAdmin
 } from '../../wailsjs/go/main/App'
+import { Environment } from '../../wailsjs/runtime/runtime'
 import { getErrorMessage, isPermissionError } from '@/utils/errors'
 
 const store = useAppStore()
@@ -54,6 +55,8 @@ const closeAction = ref<'' | 'exit' | 'minimize'>('')
 const showAdminDialog = ref(false)
 const restarting = ref(false)
 const adminDialogAction = ref<'install' | 'uninstall'>('install')
+const platform = ref('')
+const canInstallFFmpeg = computed(() => platform.value === 'darwin')
 
 const closeActionOptions = [
   { label: '每次询问', value: '' },
@@ -62,6 +65,12 @@ const closeActionOptions = [
 ]
 
 onMounted(async () => {
+  try {
+    platform.value = (await Environment()).platform
+  } catch (e) {
+    console.error('Failed to get runtime environment:', e)
+  }
+
   // Check if SESSDATA is set (without exposing the actual value for security)
   try {
     hasSessData.value = await HasBilibiliSessData()
@@ -499,6 +508,7 @@ async function clearLogs() {
                 {{ store.ffmpegAvailable ? '已安装' : '未检测到' }}
               </NTag>
               <NButton
+                v-if="store.ffmpegAvailable || canInstallFFmpeg"
                 size="small"
                 type="primary"
                 secondary
@@ -512,7 +522,10 @@ async function clearLogs() {
           </div>
 
           <NAlert v-if="!store.ffmpegAvailable" type="info" :bordered="false" class="rounded-lg">
-            macOS 下会优先使用应用内置或系统现有的 FFmpeg；若都不存在，程序会尝试自动安装。
+            {{ canInstallFFmpeg
+              ? 'macOS 下会优先使用应用内置或系统现有的 FFmpeg；若都不存在，程序会尝试自动安装。'
+              : '当前平台暂不支持自动安装 FFmpeg，请手动安装并确保 ffmpeg 可在系统 PATH 中使用。'
+            }}
           </NAlert>
         </div>
       </NCard>

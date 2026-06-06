@@ -29,7 +29,9 @@ func TestParseDarwinProxyEndpoint(t *testing.T) {
 Enabled: Yes
 Server: 127.0.0.1
 Port: 8899
-Authenticated Proxy Enabled: 0
+Authenticated Proxy Enabled: 1
+Username: proxy-user
+Password: proxy-password
 `
 
 	state := parseDarwinProxyEndpoint(output)
@@ -41,6 +43,15 @@ Authenticated Proxy Enabled: 0
 	}
 	if state.Port != 8899 {
 		t.Fatalf("unexpected port: %d", state.Port)
+	}
+	if !state.Authenticated {
+		t.Fatal("expected authenticated proxy to be enabled")
+	}
+	if state.Username != "proxy-user" {
+		t.Fatalf("unexpected username: %q", state.Username)
+	}
+	if state.Password != "proxy-password" {
+		t.Fatalf("unexpected password: %q", state.Password)
 	}
 }
 
@@ -78,6 +89,39 @@ func TestDisableWithoutOriginalStateIsNoop(t *testing.T) {
 	}
 }
 
+func TestBuildRestoreCommandsRestoresDisabledConfiguredEndpoint(t *testing.T) {
+	state := proxyServiceState{
+		Service: "Wi-Fi",
+		Web: proxyEndpointState{
+			Enabled: false,
+			Server:  "proxy.example.com",
+			Port:    8080,
+		},
+	}
+
+	commands := buildRestoreCommands(state)
+	assertCommand(t, commands, 0, []string{"/usr/sbin/networksetup", "-setwebproxy", "Wi-Fi", "proxy.example.com", "8080", "off"})
+	assertCommand(t, commands, 1, []string{"/usr/sbin/networksetup", "-setwebproxystate", "Wi-Fi", "off"})
+}
+
+func TestBuildRestoreCommandsRestoresAuthenticatedEndpoint(t *testing.T) {
+	state := proxyServiceState{
+		Service: "Wi-Fi",
+		Web: proxyEndpointState{
+			Enabled:       true,
+			Server:        "proxy.example.com",
+			Port:          8080,
+			Authenticated: true,
+			Username:      "proxy-user",
+			Password:      "proxy-password",
+		},
+	}
+
+	commands := buildRestoreCommands(state)
+	assertCommand(t, commands, 0, []string{"/usr/sbin/networksetup", "-setwebproxy", "Wi-Fi", "proxy.example.com", "8080", "on", "proxy-user", "proxy-password"})
+	assertCommand(t, commands, 1, []string{"/usr/sbin/networksetup", "-setwebproxystate", "Wi-Fi", "on"})
+}
+
 func TestBuildDarwinPrivilegedScriptUsesFailFastChaining(t *testing.T) {
 	script := buildDarwinPrivilegedScript(
 		[]string{"/usr/sbin/networksetup", "-setwebproxystate", "Wi-Fi", "off"},
@@ -92,5 +136,21 @@ func TestBuildDarwinPrivilegedScriptUsesFailFastChaining(t *testing.T) {
 	}
 	if strings.Contains(script, " ; ") {
 		t.Fatalf("expected no semicolon chaining, got %q", script)
+	}
+}
+
+func assertCommand(t *testing.T, commands [][]string, index int, expected []string) {
+	t.Helper()
+	if len(commands) <= index {
+		t.Fatalf("expected command at index %d, got %#v", index, commands)
+	}
+	actual := commands[index]
+	if len(actual) != len(expected) {
+		t.Fatalf("command %d length = %d, want %d: %#v", index, len(actual), len(expected), actual)
+	}
+	for i := range expected {
+		if actual[i] != expected[i] {
+			t.Fatalf("command %d arg %d = %q, want %q: %#v", index, i, actual[i], expected[i], actual)
+		}
 	}
 }
