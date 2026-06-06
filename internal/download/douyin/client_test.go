@@ -381,6 +381,73 @@ func TestClientFallbackToSharePage(t *testing.T) {
 	}
 }
 
+func TestClientGetItemInfoSharePageFirst(t *testing.T) {
+	var apiCalled bool
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/media/") {
+			w.Header().Set("Content-Type", "video/mp4")
+			w.Header().Set("Content-Range", "bytes 0-1/1234")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write([]byte("ok"))
+			return
+		}
+		if r.URL.Query().Get("aweme_id") != "" {
+			apiCalled = true
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, videoResponse)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/share/video/") {
+			shareResponse := fmt.Sprintf(`{"status_code":0,"item_list":[{"aweme_id":"sf1","desc":"share first","aweme_type":0,"author":{"nickname":"bob","uid":"u1"},"duration":1000,"video":{"duration":1000,"cover":{"url_list":["%s/cover.jpg"]},"play_addr":{"url_list":["%s/media/source.mp4"],"width":720,"height":1280}}}]}`, ts.URL, ts.URL)
+			w.Header().Set("Content-Type", "text/html")
+			fmt.Fprintf(w, `<html><script>window._ROUTER_DATA = {"loaderData":{"video_page":{"videoInfoRes":%s}}};</script></html>`, shareResponse)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer ts.Close()
+
+	client := newTestClient(ts)
+	item, err := client.GetItemInfo("sf1")
+	if err != nil {
+		t.Fatalf("GetItemInfo returned error: %v", err)
+	}
+	if apiCalled {
+		t.Fatal("expected share page to be used before API")
+	}
+	if item.ID != "sf1" || item.Title != "share first" {
+		t.Fatalf("unexpected item: %+v", item)
+	}
+}
+
+func TestClientFallbackToAPIWhenSharePageFails(t *testing.T) {
+	const response = `{"status_code":0,"item_list":[{"aweme_id":"api1","desc":"api fallback","aweme_type":0,"author":{"nickname":"bob","uid":"u1"},"duration":1000,"video":{"duration":1000,"cover":{"url_list":["https://example.com/cover.jpg"]},"play_addr":{"url_list":["https://example.com/playwm/base"],"width":720,"height":1280}}}]}`
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/share/") {
+			w.Header().Set("Content-Type", "text/html")
+			io.WriteString(w, `<html>empty shell</html>`)
+			return
+		}
+		if r.URL.Query().Get("aweme_id") != "" {
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, response)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer ts.Close()
+
+	client := newTestClient(ts)
+	item, err := client.GetItemInfo("api1")
+	if err != nil {
+		t.Fatalf("GetItemInfo returned error: %v", err)
+	}
+	if item.ID != "api1" || item.Title != "api fallback" {
+		t.Fatalf("unexpected item: %+v", item)
+	}
+}
+
 func TestQualityFromGear(t *testing.T) {
 	if qualityFromGear("normal_720_0") != "720p" {
 		t.Fatal("expected 720p from gear")
@@ -543,8 +610,116 @@ func TestSetHTTPClientValid(t *testing.T) {
 	c := NewClient()
 	newClient := &http.Client{Timeout: 30 * time.Second}
 	c.SetHTTPClient(newClient)
-	if c.httpClient != newClient {
+	if c.httpClient == nil {
 		t.Fatal("expected http client to be updated")
+	}
+	if c.httpClient == newClient {
+		t.Fatal("expected http client to be cloned")
+	}
+	if c.httpClient.Timeout != 30*time.Second {
+		t.Fatal("expected timeout to be preserved")
+	}
+	if c.httpClient.Jar == nil {
+		t.Fatal("expected cookie jar to be installed")
+	}
+	if newClient.Jar != nil {
+		t.Fatal("expected original client to remain unchanged")
+	}
+}
+
+func TestNewClientWithClientClonesAndAddsCookieJar(t *testing.T) {
+	original := &http.Client{Timeout: 20 * time.Second}
+	c := NewClientWithClient(original)
+	if c.httpClient == original {
+		t.Fatal("expected custom client to be cloned")
+	}
+	if c.httpClient.Timeout != original.Timeout {
+		t.Fatal("expected timeout to be preserved")
+	}
+	if c.httpClient.Jar == nil {
+		t.Fatal("expected cookie jar to be installed")
+	}
+	if original.Jar != nil {
+		t.Fatal("expected original client to remain unchanged")
+	}
+}
+
+func TestFetchContentSizeRangeGET(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Fatalf("expected GET, got %s", r.Method)
+		}
+		if r.Header.Get("Range") != "bytes=0-1" {
+			t.Fatalf("expected ranged request, got %s", r.Header.Get("Range"))
+		}
+		if r.Header.Get("Accept") != "*/*" {
+			t.Fatalf("expected Accept */*, got %s", r.Header.Get("Accept"))
+		}
+		w.Header().Set("Content-Type", "video/mp4")
+		w.Header().Set("Content-Range", "bytes 0-1/5678")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer ts.Close()
+
+	c := NewClient()
+	if size := c.fetchContentSize(ts.Client(), ts.URL); size != 5678 {
+		t.Fatalf("expected size 5678, got %d", size)
+	}
+}
+
+func TestFetchContentSizeDoesNotUseRedirectContentLength(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", "/cdn/video.mp4")
+		w.Header().Set("Content-Length", "616")
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer ts.Close()
+
+	client := ts.Client()
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	c := NewClient()
+	if size := c.fetchContentSize(client, ts.URL); size != 0 {
+		t.Fatalf("expected redirect content length to be ignored, got %d", size)
+	}
+}
+
+func TestFetchStreamSizesPreservesExistingSize(t *testing.T) {
+	var hits int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	c := NewClientWithClient(ts.Client())
+	item := &DouyinItem{
+		Type:    "video",
+		Streams: []Stream{{QualityKey: "1080p", URL: ts.URL, Size: 123}},
+	}
+	c.fetchStreamSizes(item)
+	if hits != 0 {
+		t.Fatalf("expected existing size to skip probing, got %d hits", hits)
+	}
+	if item.Streams[0].Size != 123 {
+		t.Fatalf("expected existing size to be preserved, got %d", item.Streams[0].Size)
+	}
+}
+
+func TestParseTotalFromContentRange(t *testing.T) {
+	cases := map[string]int64{
+		"bytes 0-1/123456": 123456,
+		"bytes */987654":   987654,
+		"bytes 0-1/*":      0,
+		"":                 0,
+		"invalid":          0,
+	}
+	for input, expected := range cases {
+		if got := parseTotalFromContentRange(input); got != expected {
+			t.Fatalf("parseTotalFromContentRange(%q)=%d, expected %d", input, got, expected)
+		}
 	}
 }
 
@@ -686,68 +861,80 @@ func TestBuildItemInfoURLEmptyBase(t *testing.T) {
 	}
 }
 
-func TestBuildStreamsWithURI(t *testing.T) {
-	// Test that when BitRate is empty but URI is present, multiple quality streams are constructed
+func TestBuildStreamsDoesNotBlindlyConstructURI(t *testing.T) {
 	video := videoInfo{
 		Width:  1920,
 		Height: 1080,
 		PlayAddr: playAddr{
-			URLList: []string{"https://example.com/playwm/base"},
-			Width:   1920,
-			Height:  1080,
-			URI:     "v0200fg10000test123456789",
+			Width:  1920,
+			Height: 1080,
+			URI:    "v0200fg10000test123456789",
 		},
-		BitRate: []bitRateInfo{}, // Empty BitRate array
+		BitRate: []bitRateInfo{},
 	}
 	streams := buildStreams(video)
-
-	// Should have 3 streams: 1080p, 720p, 540p
-	if len(streams) != 3 {
-		t.Fatalf("expected 3 streams when URI is present, got %d", len(streams))
-	}
-
-	// Check that streams are sorted by resolution (highest first)
-	expectedQualities := []string{"1080p", "720p", "540p"}
-	for i, expected := range expectedQualities {
-		if streams[i].QualityKey != expected {
-			t.Fatalf("expected stream[%d] to be %s, got %s", i, expected, streams[i].QualityKey)
-		}
-	}
-
-	// Check that URLs are constructed correctly with video_id
-	for _, s := range streams {
-		if !strings.Contains(s.URL, "video_id=v0200fg10000test123456789") {
-			t.Fatalf("expected URL to contain video_id, got %s", s.URL)
-		}
-		if !strings.Contains(s.URL, "ratio="+s.QualityKey) {
-			t.Fatalf("expected URL to contain ratio=%s, got %s", s.QualityKey, s.URL)
-		}
+	if len(streams) != 0 {
+		t.Fatalf("expected no streams from URI without probing, got %d", len(streams))
 	}
 }
 
-func TestBuildStreamsWithURIFromAPI(t *testing.T) {
-	// Test full flow with API response containing URI
+func TestClientProbeRatioStreamsWhenBitRateEmpty(t *testing.T) {
 	const responseWithURI = `{"status_code":0,"item_list":[{"aweme_id":"123456","desc":"test","aweme_type":0,"author":{"nickname":"bob","uid":"u1"},"duration":15000,"video":{"duration":15000,"width":1920,"height":1080,"cover":{"url_list":["https://example.com/cover.jpg"]},"play_addr":{"url_list":["https://example.com/playwm/base"],"width":1920,"height":1080,"uri":"v0200fg10000test123456789"}}}]}`
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		io.WriteString(w, responseWithURI)
+		if strings.HasPrefix(r.URL.Path, "/aweme/v1/play/") {
+			if r.Method != http.MethodGet {
+				w.WriteHeader(http.StatusMethodNotAllowed)
+				return
+			}
+			if r.Header.Get("Range") != "bytes=0-1" {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			sizes := map[string]string{
+				"1080p": "300",
+				"720p":  "200",
+				"540p":  "100",
+				"480p":  "300",
+				"360p":  "300",
+			}
+			size := sizes[r.URL.Query().Get("ratio")]
+			if size == "" {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			w.Header().Set("Content-Type", "video/mp4")
+			w.Header().Set("Content-Range", "bytes 0-1/"+size)
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write([]byte("ok"))
+			return
+		}
+		if r.URL.Query().Get("aweme_id") != "" {
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, responseWithURI)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
 	}))
 	defer ts.Close()
 
 	client := newTestClient(ts)
+	client.playBaseURL = ts.URL + "/aweme/v1/play/"
 	item, err := client.GetItemInfo("123456")
 	if err != nil {
 		t.Fatalf("GetItemInfo returned error: %v", err)
 	}
 
-	// Should have 3 streams constructed from URI
 	if len(item.Streams) != 3 {
-		t.Fatalf("expected 3 streams, got %d", len(item.Streams))
+		t.Fatalf("expected 3 probed streams, got %d", len(item.Streams))
 	}
-
-	// First stream should be 1080p (highest quality)
-	if item.Streams[0].QualityKey != "1080p" {
-		t.Fatalf("expected first stream to be 1080p, got %s", item.Streams[0].QualityKey)
+	expectedQualities := []string{"1080p", "720p", "540p"}
+	for i, expected := range expectedQualities {
+		if item.Streams[i].QualityKey != expected {
+			t.Fatalf("expected stream[%d] to be %s, got %s", i, expected, item.Streams[i].QualityKey)
+		}
+	}
+	if item.Streams[0].Size != 300 || item.Streams[1].Size != 200 || item.Streams[2].Size != 100 {
+		t.Fatalf("unexpected stream sizes: %+v", item.Streams)
 	}
 }

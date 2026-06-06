@@ -10,9 +10,11 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -29,6 +31,8 @@ var (
 	ErrRequestTimeout = errors.New("douyin api request timeout")
 	// ErrAPIError indicates a general API error with additional details.
 	ErrAPIError = errors.New("douyin api error")
+	// errIncompleteItem indicates that one fetch path found the item but did not expose usable media.
+	errIncompleteItem = errors.New("douyin item incomplete")
 )
 
 // Default values for API requests.
@@ -37,6 +41,8 @@ const (
 	defaultUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Mobile/15E148 Safari/604.1"
 	// defaultBaseURL is the primary API endpoint for fetching video details.
 	defaultBaseURL = "https://www.iesdouyin.com/aweme/v1/web/aweme/detail/"
+	// defaultPlayURL is the play endpoint used for ratio probing.
+	defaultPlayURL = "https://aweme.snssdk.com/aweme/v1/play/"
 )
 
 // shareRouterDataPattern matches the embedded JSON data in Douyin share pages.
@@ -45,14 +51,16 @@ const (
 var shareRouterDataPattern = regexp.MustCompile(`(?s)window\._ROUTER_DATA\s*=\s*({.*?})\s*;?\s*</script>`)
 
 // Client is an API client for fetching Douyin video/album information.
-// It supports two methods of fetching data:
-//  1. Direct API endpoint (primary method)
-//  2. Share page HTML parsing (fallback method)
+// It supports multiple methods of fetching data:
+//  1. Share page HTML parsing (preferred method)
+//  2. Direct API endpoint (fallback method)
+//  3. Slidesinfo endpoint (final fallback for slide/mixed posts)
 type Client struct {
-	httpClient *http.Client // HTTP client for making requests
-	userAgent  string       // User-Agent header for requests
-	baseURL    string       // Base URL for the video detail API
-	shareBase  string       // Base URL for share page fallback
+	httpClient  *http.Client // HTTP client for making requests
+	userAgent   string       // User-Agent header for requests
+	baseURL     string       // Base URL for the video detail API
+	shareBase   string       // Base URL for share page fallback
+	playBaseURL string       // Base URL for ratio probing
 }
 
 // NewClient creates a new Client with default settings.
@@ -65,12 +73,21 @@ func NewClient() *Client {
 func NewClientWithClient(client *http.Client) *Client {
 	if client == nil {
 		client = &http.Client{Timeout: 10 * time.Second}
+	} else {
+		copied := *client
+		client = &copied
+	}
+	if client.Jar == nil {
+		if jar, err := cookiejar.New(nil); err == nil {
+			client.Jar = jar
+		}
 	}
 	return &Client{
-		httpClient: client,
-		userAgent:  defaultUserAgent,
-		baseURL:    defaultBaseURL,
-		shareBase:  "https://www.iesdouyin.com/share",
+		httpClient:  client,
+		userAgent:   defaultUserAgent,
+		baseURL:     defaultBaseURL,
+		shareBase:   "https://www.iesdouyin.com/share",
+		playBaseURL: defaultPlayURL,
 	}
 }
 
@@ -90,7 +107,13 @@ func (c *Client) SetHTTPClient(client *http.Client) {
 	if client == nil {
 		return
 	}
-	c.httpClient = client
+	copied := *client
+	if copied.Jar == nil {
+		if jar, err := cookiejar.New(nil); err == nil {
+			copied.Jar = jar
+		}
+	}
+	c.httpClient = &copied
 }
 
 // SetBaseURL sets a custom base URL for the video detail API.
@@ -114,53 +137,65 @@ func (c *Client) SetShareBaseURL(baseURL string) {
 }
 
 // GetItemInfo fetches detailed information about a Douyin video or album.
-// It first attempts to use the direct API endpoint, then falls back to
-// parsing the share page HTML if the API fails.
+// It first attempts to parse the SSR share page, then falls back to the
+// detail API and slidesinfo endpoint if needed.
 //
 // Returns a DouyinItem containing video/album metadata and download URLs.
-// For videos, it also fetches file sizes for each quality stream via HEAD requests.
+// For videos, it also fetches file sizes for streams that do not already have one.
 func (c *Client) GetItemInfo(awemeID string) (*DouyinItem, error) {
 	awemeID = strings.TrimSpace(awemeID)
 	if awemeID == "" {
 		return nil, ErrInvalidAwemeID
 	}
 
-	// Try the direct API endpoint first (faster and more reliable).
-	item, apiErr := c.fetchItemInfoAPI(awemeID)
-	if apiErr == nil {
-		c.fetchStreamSizes(item)
-		return item, nil
-	}
-
-	// Try the slidesinfo endpoint next.
-	// Some swipeable multi-video posts (looks like an album) only expose per-page
-	// `images[].video.play_addr` via this endpoint; share page SSR may degrade to
-	// static covers and lose video URLs.
-	item, slidesErr := c.fetchItemInfoSlidesInfo(awemeID)
-	if slidesErr == nil {
-		c.fetchStreamSizes(item)
-		return item, nil
-	}
-
-	// Fallback to parsing the share page HTML.
-	// This is slower but works when the API is blocked or rate-limited.
+	// Prefer the SSR share page. It is designed for webview/share scenarios and
+	// naturally sets anonymous cookies such as ttwid into the client's CookieJar.
 	item, shareErr := c.fetchItemInfoFromSharePage(awemeID)
 	if shareErr == nil {
-		c.fetchStreamSizes(item)
-		return item, nil
+		if isUsableItem(item) {
+			c.fetchStreamSizes(item)
+			return item, nil
+		}
+		shareErr = errIncompleteItem
 	}
 
-	// Return the more specific error if available.
-	if shouldReturnAPIError(apiErr) {
-		return nil, apiErr
+	// Fall back to the direct API endpoint when the share page is empty, blocked,
+	// or its HTML structure changes.
+	item, apiErr := c.fetchItemInfoAPI(awemeID)
+	if apiErr == nil {
+		if isUsableItem(item) {
+			c.fetchStreamSizes(item)
+			return item, nil
+		}
+		apiErr = errIncompleteItem
 	}
-	if shouldReturnAPIError(slidesErr) {
-		return nil, slidesErr
+
+	// Final fallback for slide/mixed posts where slidesinfo may expose per-page
+	// video URLs that are absent from share SSR.
+	item, slidesErr := c.fetchItemInfoSlidesInfo(awemeID)
+	if slidesErr == nil {
+		if isUsableItem(item) {
+			c.fetchStreamSizes(item)
+			return item, nil
+		}
+		slidesErr = errIncompleteItem
 	}
-	return nil, fmt.Errorf("douyin api error: %w; slidesinfo error: %v; share page error: %v", apiErr, slidesErr, shareErr)
+
+	if allErrorsAre(ErrItemNotFound, shareErr, apiErr, slidesErr) {
+		return nil, ErrItemNotFound
+	}
+	if allErrorsAre(ErrRateLimited, shareErr, apiErr, slidesErr) {
+		return nil, ErrRateLimited
+	}
+	if allErrorsAre(ErrRequestTimeout, shareErr, apiErr, slidesErr) {
+		return nil, ErrRequestTimeout
+	}
+
+	joined := errors.Join(shareErr, apiErr, slidesErr)
+	return nil, fmt.Errorf("douyin item fetch failed: share page error: %v; api error: %v; slidesinfo error: %v: %w", shareErr, apiErr, slidesErr, joined)
 }
 
-// fetchStreamSizes fetches file sizes for all video streams via HEAD requests.
+// fetchStreamSizes fetches missing file sizes for all video streams via ranged GET requests.
 // This allows displaying accurate file sizes before download.
 // Only applies to video items, not albums.
 func (c *Client) fetchStreamSizes(item *DouyinItem) {
@@ -174,42 +209,35 @@ func (c *Client) fetchStreamSizes(item *DouyinItem) {
 	}
 
 	for i := range item.Streams {
-		size := c.fetchContentLength(client, item.Streams[i].URL)
-		item.Streams[i].Size = size
-		if size > 0 {
-			logger.Debug("[Douyin] Stream %s size: %d bytes", item.Streams[i].QualityKey, size)
+		if item.Streams[i].Size > 0 {
+			continue
 		}
+		size := c.fetchContentSize(client, item.Streams[i].URL)
+		if size <= 0 {
+			continue
+		}
+		item.Streams[i].Size = size
+		logger.Debug("[Douyin] Stream %s size: %d bytes", item.Streams[i].QualityKey, size)
 	}
 }
 
-// fetchContentLength gets file size via a HEAD request.
+// fetchContentSize gets file size via a small ranged GET request.
 // Returns 0 if the size cannot be determined.
-func (c *Client) fetchContentLength(client *http.Client, url string) int64 {
-	if url == "" {
+func (c *Client) fetchContentSize(client *http.Client, rawURL string) int64 {
+	probe := c.fetchContentSizeProbe(client, rawURL)
+	if probe.statusCode >= http.StatusMultipleChoices && probe.statusCode < http.StatusBadRequest {
 		return 0
 	}
-
-	req, err := http.NewRequest("HEAD", url, nil)
-	if err != nil {
-		return 0
+	if probe.contentRangeTotal > 0 {
+		return probe.contentRangeTotal
 	}
-	c.applyHeaders(req)
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return 0
+	if probe.statusCode == http.StatusOK && probe.contentLength > 0 {
+		return probe.contentLength
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return 0
-	}
-
-	return resp.ContentLength
+	return 0
 }
 
 // fetchItemInfoAPI fetches video/album info from the direct API endpoint.
-// This is the primary method for getting video details.
 // API endpoint: https://www.iesdouyin.com/aweme/v1/web/aweme/detail/?aweme_id=xxx
 func (c *Client) fetchItemInfoAPI(awemeID string) (*DouyinItem, error) {
 	client := c.httpClient
@@ -255,7 +283,7 @@ func (c *Client) fetchItemInfoAPI(awemeID string) (*DouyinItem, error) {
 	if err := json.Unmarshal(body, &detailPayload); err == nil {
 		if detailPayload.StatusCode == 0 && detailPayload.AwemeDetail != nil {
 			logger.Debug("[Douyin] Using new API format (aweme_detail)")
-			return buildDouyinItem(*detailPayload.AwemeDetail), nil
+			return c.buildDouyinItem(*detailPayload.AwemeDetail), nil
 		}
 	}
 
@@ -282,11 +310,10 @@ func (c *Client) fetchItemInfoAPI(awemeID string) (*DouyinItem, error) {
 	}
 
 	logger.Debug("[Douyin] Using legacy API format (item_list)")
-	return buildDouyinItem(payload.ItemList[0]), nil
+	return c.buildDouyinItem(payload.ItemList[0]), nil
 }
 
 // fetchItemInfoFromSharePage fetches video/album info by parsing the share page HTML.
-// This is a fallback method when the direct API fails.
 // It tries both /video/ and /note/ URL patterns.
 func (c *Client) fetchItemInfoFromSharePage(awemeID string) (*DouyinItem, error) {
 	shareBase := strings.TrimRight(strings.TrimSpace(c.shareBase), "/")
@@ -295,15 +322,19 @@ func (c *Client) fetchItemInfoFromSharePage(awemeID string) (*DouyinItem, error)
 	}
 	// Try both video and note share page URLs.
 	// Videos use /share/video/, notes (image posts) use /share/note/.
+	var firstErr error
 	for _, kind := range []string{"video", "note"} {
 		endpoint := fmt.Sprintf("%s/%s/%s/?app=aweme", shareBase, kind, awemeID)
 		item, err := c.fetchSharePageItem(endpoint)
 		if err == nil {
-			return buildDouyinItem(*item), nil
+			return c.buildDouyinItem(*item), nil
 		}
-		if !errors.Is(err, ErrItemNotFound) {
-			return nil, err
+		if firstErr == nil || errors.Is(firstErr, ErrItemNotFound) {
+			firstErr = err
 		}
+	}
+	if firstErr != nil {
+		return nil, firstErr
 	}
 	return nil, ErrItemNotFound
 }
@@ -386,7 +417,7 @@ func (c *Client) fetchItemInfoSlidesInfo(awemeID string) (*DouyinItem, error) {
 		return nil, ErrItemNotFound
 	}
 
-	return buildDouyinItem(payload.AwemeDetails[0]), nil
+	return c.buildDouyinItem(payload.AwemeDetails[0]), nil
 }
 
 func (c *Client) shareOrigin() (string, error) {
@@ -468,20 +499,6 @@ func (c *Client) buildItemInfoURL(awemeID string) (string, error) {
 	return u.String(), nil
 }
 
-// shouldReturnAPIError checks if an API error should be returned directly
-// instead of attempting fallback methods.
-// Specific errors like ErrItemNotFound indicate the video doesn't exist,
-// so fallback wouldn't help.
-func shouldReturnAPIError(err error) bool {
-	if err == nil {
-		return false
-	}
-	return errors.Is(err, ErrItemNotFound) ||
-		errors.Is(err, ErrAPIError) ||
-		errors.Is(err, ErrRateLimited) ||
-		errors.Is(err, ErrRequestTimeout)
-}
-
 // applyHeaders sets standard HTTP headers required for Douyin API requests.
 // These headers help bypass some API restrictions and mimic a real browser.
 func (c *Client) applyHeaders(req *http.Request) {
@@ -494,6 +511,72 @@ func (c *Client) applyHeaders(req *http.Request) {
 	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
 	req.Header.Set("Origin", "https://www.douyin.com")
 	req.Header.Set("Referer", "https://www.douyin.com/")
+}
+
+type contentSizeProbe struct {
+	statusCode        int
+	contentRangeTotal int64
+	contentLength     int64
+	contentType       string
+}
+
+func (c *Client) fetchContentSizeProbe(client *http.Client, rawURL string) contentSizeProbe {
+	if strings.TrimSpace(rawURL) == "" {
+		return contentSizeProbe{}
+	}
+	if client == nil {
+		client = &http.Client{Timeout: 5 * time.Second}
+	}
+
+	req, err := http.NewRequest("GET", rawURL, nil)
+	if err != nil {
+		return contentSizeProbe{}
+	}
+	c.applyHeaders(req)
+	req.Header.Set("Range", "bytes=0-1")
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Referer", "https://www.douyin.com/")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return contentSizeProbe{}
+	}
+	defer resp.Body.Close()
+
+	return contentSizeProbe{
+		statusCode:        resp.StatusCode,
+		contentRangeTotal: parseTotalFromContentRange(resp.Header.Get("Content-Range")),
+		contentLength:     resp.ContentLength,
+		contentType:       resp.Header.Get("Content-Type"),
+	}
+}
+
+func parseTotalFromContentRange(cr string) int64 {
+	cr = strings.TrimSpace(cr)
+	if cr == "" {
+		return 0
+	}
+	slash := strings.LastIndex(cr, "/")
+	if slash < 0 || slash == len(cr)-1 {
+		return 0
+	}
+	total := strings.TrimSpace(cr[slash+1:])
+	if total == "" || total == "*" {
+		return 0
+	}
+	n, err := strconv.ParseInt(total, 10, 64)
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
+}
+
+func isVideoLikeContentType(contentType string) bool {
+	contentType = strings.ToLower(strings.TrimSpace(contentType))
+	if contentType == "" {
+		return true
+	}
+	return strings.Contains(contentType, "video") || strings.Contains(contentType, "octet-stream")
 }
 
 // parseSharePageItem extracts video info from share page HTML.
@@ -621,6 +704,130 @@ type imageInfo struct {
 	Height          int             `json:"height"`            // Media height
 }
 
+func (c *Client) buildDouyinItem(item itemInfoItem) *DouyinItem {
+	result := buildDouyinItem(item)
+	if result == nil || result.Type != "video" || len(item.Video.BitRate) > 0 {
+		return result
+	}
+
+	uri := strings.TrimSpace(item.Video.PlayAddr.URI)
+	if uri == "" {
+		return result
+	}
+
+	sourceW := firstNonZero(item.Video.PlayAddr.Width, item.Video.Width)
+	sourceH := firstNonZero(item.Video.PlayAddr.Height, item.Video.Height)
+	probed := c.probeRatioStreams(uri, sourceW, sourceH)
+	if len(probed) > 0 {
+		result.Streams = probed
+	}
+	return result
+}
+
+func (c *Client) probeRatioStreams(uri string, sourceW, sourceH int) []Stream {
+	uri = strings.TrimSpace(uri)
+	if uri == "" {
+		return nil
+	}
+
+	client := c.httpClient
+	if client == nil {
+		client = &http.Client{Timeout: 10 * time.Second}
+	}
+
+	ratios := []string{"1080p", "720p", "540p", "480p", "360p"}
+	streams := make([]Stream, 0, len(ratios))
+	seenSizes := make(map[int64]struct{}, len(ratios))
+	for _, ratio := range ratios {
+		playURL := c.buildPlayURL(uri, ratio)
+		if playURL == "" {
+			continue
+		}
+		probe := c.fetchContentSizeProbe(client, playURL)
+		if probe.statusCode != http.StatusPartialContent || probe.contentRangeTotal <= 2 || !isVideoLikeContentType(probe.contentType) {
+			logger.Debug("[Douyin] Ratio probe skipped: ratio=%s status=%d size=%d content-type=%s", ratio, probe.statusCode, probe.contentRangeTotal, probe.contentType)
+			continue
+		}
+		if _, ok := seenSizes[probe.contentRangeTotal]; ok {
+			logger.Debug("[Douyin] Ratio probe duplicate: ratio=%s size=%d", ratio, probe.contentRangeTotal)
+			continue
+		}
+		seenSizes[probe.contentRangeTotal] = struct{}{}
+		width, height := dimensionsForRatio(ratio, sourceW, sourceH)
+		streams = append(streams, Stream{
+			QualityKey:  ratio,
+			QualityName: ratio,
+			Width:       width,
+			Height:      height,
+			URL:         playURL,
+			Size:        probe.contentRangeTotal,
+		})
+		logger.Debug("[Douyin] Ratio probe accepted: ratio=%s size=%d", ratio, probe.contentRangeTotal)
+	}
+	sortStreamsByResolution(streams)
+	return streams
+}
+
+func (c *Client) buildPlayURL(uri, ratio string) string {
+	uri = strings.TrimSpace(uri)
+	if uri == "" {
+		return ""
+	}
+	baseURL := strings.TrimSpace(c.playBaseURL)
+	if baseURL == "" {
+		baseURL = defaultPlayURL
+	}
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return ""
+	}
+	q := u.Query()
+	q.Set("video_id", uri)
+	if strings.TrimSpace(ratio) != "" {
+		q.Set("ratio", strings.TrimSpace(ratio))
+	}
+	q.Set("line", "0")
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+func dimensionsForRatio(ratio string, sourceW, sourceH int) (int, int) {
+	res := qualityRank(ratio)
+	if res <= 0 || sourceW <= 0 || sourceH <= 0 {
+		return 0, 0
+	}
+	if sourceW < sourceH {
+		return res, (res*sourceH + sourceW/2) / sourceW
+	}
+	return (res*sourceW + sourceH/2) / sourceH, res
+}
+
+func isUsableItem(item *DouyinItem) bool {
+	if item == nil {
+		return false
+	}
+	switch item.Type {
+	case "video":
+		return len(item.Streams) > 0
+	case "album":
+		return len(item.Images) > 0
+	default:
+		return true
+	}
+}
+
+func allErrorsAre(target error, errs ...error) bool {
+	if target == nil || len(errs) == 0 {
+		return false
+	}
+	for _, err := range errs {
+		if !errors.Is(err, target) {
+			return false
+		}
+	}
+	return true
+}
+
 // buildDouyinItem converts an API response item to a DouyinItem.
 // It determines the content type (video vs album) and extracts relevant fields.
 // For albums (AwemeType 68 or items with images), it extracts image URLs.
@@ -687,7 +894,7 @@ func buildDouyinItem(item itemInfoItem) *DouyinItem {
 
 // buildStreams extracts available video quality streams from the API response.
 // It prioritizes the BitRate array which contains multiple quality options.
-// Falls back to constructing URLs using the video URI if BitRate is empty.
+// Falls back only to explicit PlayAddr URLs if BitRate is empty.
 func buildStreams(video videoInfo) []Stream {
 	logger.Debug("[Douyin] Building streams from API response: BitRate count=%d, PlayAddr.Width=%d, PlayAddr.Height=%d",
 		len(video.BitRate), video.PlayAddr.Width, video.PlayAddr.Height)
@@ -741,59 +948,29 @@ func buildStreams(video videoInfo) []Stream {
 	if len(streams) == 0 {
 		logger.Warn("[Douyin] No streams from BitRate array, falling back to PlayAddr")
 
-		// Fallback: construct URLs using video URI.
-		// The URI can be used to build quality-specific playback URLs.
-		uri := video.PlayAddr.URI
-		if uri != "" {
-			logger.Debug("[Douyin] Using URI to construct quality URLs: %s", uri)
-			// Build streams for common quality levels: 540p, 720p, 1080p.
-			// URL format: https://aweme.snssdk.com/aweme/v1/play/?video_id={uri}&ratio={quality}&line=0
-			qualityOptions := []struct {
-				ratio  string
-				width  int
-				height int
-			}{
-				{"1080p", 1920, 1080},
-				{"720p", 1280, 720},
-				{"540p", 960, 540},
+		// Final fallback: use the original PlayAddr URL. Ratio probing is handled by
+		// Client.probeRatioStreams so this pure builder does not blindly expose
+		// constructed URLs.
+		url := pickNoWatermarkURL(video.PlayAddr.URLList)
+		if url != "" {
+			width := video.PlayAddr.Width
+			height := video.PlayAddr.Height
+			if width == 0 && height == 0 {
+				width = fallbackWidth
+				height = fallbackHeight
 			}
-
-			for _, opt := range qualityOptions {
-				constructedURL := fmt.Sprintf("https://aweme.snssdk.com/aweme/v1/play/?video_id=%s&ratio=%s&line=0", uri, opt.ratio)
-				streams = append(streams, Stream{
-					QualityKey:  opt.ratio,
-					QualityName: opt.ratio,
-					Width:       opt.width,
-					Height:      opt.height,
-					URL:         constructedURL,
-				})
-				logger.Debug("[Douyin] Constructed stream: %s (%dx%d)", opt.ratio, opt.width, opt.height)
+			qualityKey := resolutionKey(width, height)
+			if qualityKey == "" {
+				qualityKey = "source"
 			}
-		}
-
-		// Final fallback: use the original PlayAddr URL if URI is empty.
-		if len(streams) == 0 {
-			url := pickNoWatermarkURL(video.PlayAddr.URLList)
-			if url != "" {
-				width := video.PlayAddr.Width
-				height := video.PlayAddr.Height
-				if width == 0 && height == 0 {
-					width = fallbackWidth
-					height = fallbackHeight
-				}
-				qualityKey := resolutionKey(width, height)
-				if qualityKey == "" {
-					qualityKey = "source"
-				}
-				streams = append(streams, Stream{
-					QualityKey:  qualityKey,
-					QualityName: qualityKey,
-					Width:       width,
-					Height:      height,
-					URL:         url,
-				})
-				logger.Debug("[Douyin] Fallback stream from PlayAddr: %dx%d, key=%s", width, height, qualityKey)
-			}
+			streams = append(streams, Stream{
+				QualityKey:  qualityKey,
+				QualityName: qualityKey,
+				Width:       width,
+				Height:      height,
+				URL:         url,
+			})
+			logger.Debug("[Douyin] Fallback stream from PlayAddr: %dx%d, key=%s", width, height, qualityKey)
 		}
 	}
 
@@ -1081,13 +1258,31 @@ func resolutionValue(width, height int) int {
 	return height
 }
 
+// qualityRank extracts a numeric rank from quality keys such as "1080p".
+func qualityRank(quality string) int {
+	key := qualityFromGear(quality)
+	if key == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(strings.TrimSuffix(key, "p"))
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
+}
+
 // sortStreamsByResolution sorts streams by resolution (highest first).
-// For equal resolutions, sorts by bitrate (highest first).
+// For equal resolutions, sorts by quality key and then bitrate (highest first).
 func sortStreamsByResolution(streams []Stream) {
 	sort.SliceStable(streams, func(i, j int) bool {
 		ri := resolutionValue(streams[i].Width, streams[i].Height)
 		rj := resolutionValue(streams[j].Width, streams[j].Height)
 		if ri == rj {
+			qi := qualityRank(streams[i].QualityKey)
+			qj := qualityRank(streams[j].QualityKey)
+			if qi != qj {
+				return qi > qj
+			}
 			return streams[i].Bitrate > streams[j].Bitrate
 		}
 		return ri > rj

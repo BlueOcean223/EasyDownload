@@ -23,7 +23,7 @@ type Stream struct {
 	Height      int    // Video height in pixels
 	Bitrate     int    // Video bitrate in bits per second
 	URL         string // Direct download URL for this quality
-	Size        int64  // File size in bytes (estimated via HEAD request, may be 0)
+	Size        int64  // File size in bytes when known; 0 if unavailable
 }
 
 // Image represents a single media item in a Douyin album.
