@@ -2,7 +2,10 @@
 
 package proxy
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestParseDarwinNetworkServices(t *testing.T) {
 	output := `
@@ -60,5 +63,34 @@ func TestParseDarwinAutoDiscovery(t *testing.T) {
 	}
 	if parseDarwinAutoDiscovery("Auto Proxy Discovery: Off") {
 		t.Fatal("expected auto discovery to be disabled")
+	}
+}
+
+func TestDisableWithoutOriginalStateIsNoop(t *testing.T) {
+	sp := NewSystemProxy()
+	sp.currentProxy = "127.0.0.1:8899"
+
+	if err := sp.Disable(); err != nil {
+		t.Fatalf("Disable returned error: %v", err)
+	}
+	if sp.currentProxy != "" {
+		t.Fatalf("expected current proxy to be cleared, got %q", sp.currentProxy)
+	}
+}
+
+func TestBuildDarwinPrivilegedScriptUsesFailFastChaining(t *testing.T) {
+	script := buildDarwinPrivilegedScript(
+		[]string{"/usr/sbin/networksetup", "-setwebproxystate", "Wi-Fi", "off"},
+		[]string{"/usr/sbin/networksetup", "-setsecurewebproxystate", "Wi-Fi", "off"},
+	)
+
+	if script == "" {
+		t.Fatal("expected script")
+	}
+	if !strings.Contains(script, " && ") {
+		t.Fatalf("expected fail-fast command chaining, got %q", script)
+	}
+	if strings.Contains(script, " ; ") {
+		t.Fatalf("expected no semicolon chaining, got %q", script)
 	}
 }

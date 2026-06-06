@@ -938,3 +938,59 @@ func TestClientProbeRatioStreamsWhenBitRateEmpty(t *testing.T) {
 		t.Fatalf("unexpected stream sizes: %+v", item.Streams)
 	}
 }
+
+func TestClientProbeRatioStreamsWhenBitRateURLsEmpty(t *testing.T) {
+	const responseWithURIOnlyBitRate = `{"status_code":0,"item_list":[{"aweme_id":"123456","desc":"test","aweme_type":0,"author":{"nickname":"bob","uid":"u1"},"duration":15000,"video":{"duration":15000,"width":1920,"height":1080,"cover":{"url_list":["https://example.com/cover.jpg"]},"play_addr":{"url_list":[],"width":1920,"height":1080,"uri":"v0200fg10000test123456789"},"bit_rate":[{"gear_name":"normal_720_0","bit_rate":1000,"play_addr":{"url_list":[],"width":1280,"height":720}},{"gear_name":"normal_1080_0","bit_rate":2000,"play_addr":{"url_list":[],"width":1920,"height":1080}}]}}]}`
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/aweme/v1/play/") {
+			if r.Method != http.MethodGet {
+				w.WriteHeader(http.StatusMethodNotAllowed)
+				return
+			}
+			if r.Header.Get("Range") != "bytes=0-1" {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			sizes := map[string]string{
+				"1080p": "300",
+				"720p":  "200",
+				"540p":  "100",
+			}
+			size := sizes[r.URL.Query().Get("ratio")]
+			if size == "" {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			w.Header().Set("Content-Type", "video/mp4")
+			w.Header().Set("Content-Range", "bytes 0-1/"+size)
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write([]byte("ok"))
+			return
+		}
+		if r.URL.Query().Get("aweme_id") != "" {
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, responseWithURIOnlyBitRate)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer ts.Close()
+
+	client := newTestClient(ts)
+	client.playBaseURL = ts.URL + "/aweme/v1/play/"
+	item, err := client.GetItemInfo("123456")
+	if err != nil {
+		t.Fatalf("GetItemInfo returned error: %v", err)
+	}
+
+	if len(item.Streams) != 3 {
+		t.Fatalf("expected 3 probed streams, got %d", len(item.Streams))
+	}
+	expectedQualities := []string{"1080p", "720p", "540p"}
+	for i, expected := range expectedQualities {
+		if item.Streams[i].QualityKey != expected {
+			t.Fatalf("expected stream[%d] to be %s, got %s", i, expected, item.Streams[i].QualityKey)
+		}
+	}
+}

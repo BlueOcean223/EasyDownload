@@ -706,7 +706,11 @@ type imageInfo struct {
 
 func (c *Client) buildDouyinItem(item itemInfoItem) *DouyinItem {
 	result := buildDouyinItem(item)
-	if result == nil || result.Type != "video" || len(item.Video.BitRate) > 0 {
+	if result == nil || result.Type != "video" {
+		return result
+	}
+	shouldProbeRatioStreams := len(item.Video.BitRate) == 0 || len(result.Streams) == 0
+	if !shouldProbeRatioStreams {
 		return result
 	}
 

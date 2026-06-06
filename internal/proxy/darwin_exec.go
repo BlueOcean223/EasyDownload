@@ -25,6 +25,11 @@ func runDarwinCommand(name string, args ...string) (string, error) {
 }
 
 func runDarwinPrivilegedCommands(commands ...[]string) error {
+	script := buildDarwinPrivilegedScript(commands...)
+	return runDarwinPrivilegedShell(script)
+}
+
+func buildDarwinPrivilegedScript(commands ...[]string) string {
 	lines := make([]string, 0, len(commands))
 	for _, command := range commands {
 		if len(command) == 0 {
@@ -33,9 +38,9 @@ func runDarwinPrivilegedCommands(commands ...[]string) error {
 		lines = append(lines, shellescape.QuoteCommand(command))
 	}
 	if len(lines) == 0 {
-		return nil
+		return ""
 	}
-	return runDarwinPrivilegedShell(strings.Join(lines, " ; "))
+	return strings.Join(lines, " && ")
 }
 
 func runDarwinPrivilegedShell(script string) error {

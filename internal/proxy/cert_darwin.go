@@ -3,35 +3,25 @@
 package proxy
 
 import (
-	"crypto/sha1"
-	"crypto/sha256"
 	"crypto/x509"
-	"encoding/hex"
 	"encoding/pem"
 	"fmt"
 	"os"
-	"strings"
 )
 
 // IsCertInstalled checks whether the generated certificate is trusted by macOS.
 func (cm *CertManager) IsCertInstalled() bool {
-	cert, err := cm.loadCertificate()
-	if err != nil {
+	if _, err := cm.loadCertificate(); err != nil {
 		return false
 	}
 
-	output, err := runDarwinCommand("/usr/bin/security", "find-certificate", "-a", "-Z", "-c", cert.Subject.CommonName)
-	if err != nil {
-		return false
-	}
+	command := buildDarwinCertTrustCommand(cm.CertPath)
+	_, err := runDarwinCommand(command[0], command[1:]...)
+	return err == nil
+}
 
-	sha256Sum := sha256.Sum256(cert.Raw)
-	sha1Sum := sha1.Sum(cert.Raw)
-	sha256Hex := strings.ToUpper(hex.EncodeToString(sha256Sum[:]))
-	sha1Hex := strings.ToUpper(hex.EncodeToString(sha1Sum[:]))
-	upperOutput := strings.ToUpper(output)
-
-	return strings.Contains(upperOutput, sha256Hex) || strings.Contains(upperOutput, sha1Hex)
+func buildDarwinCertTrustCommand(certPath string) []string {
+	return []string{"/usr/bin/security", "verify-cert", "-c", certPath, "-p", "basic", "-l", "-L", "-q"}
 }
 
 // InstallCert installs the CA certificate into the macOS System keychain.

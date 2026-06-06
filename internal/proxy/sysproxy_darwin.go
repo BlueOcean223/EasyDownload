@@ -93,25 +93,6 @@ func (sp *SystemProxy) Enable(proxyAddress string) error {
 // Disable restores the previous proxy state when possible.
 func (sp *SystemProxy) Disable() error {
 	if len(sp.originalStates) == 0 {
-		services, err := listDarwinNetworkServices()
-		if err != nil {
-			return err
-		}
-		if len(services) == 0 {
-			return nil
-		}
-
-		commands := make([][]string, 0, len(services)*3)
-		for _, service := range services {
-			commands = append(commands,
-				[]string{"/usr/sbin/networksetup", "-setwebproxystate", service, "off"},
-				[]string{"/usr/sbin/networksetup", "-setsecurewebproxystate", service, "off"},
-				[]string{"/usr/sbin/networksetup", "-setsocksfirewallproxystate", service, "off"},
-			)
-		}
-		if err := runDarwinPrivilegedCommands(commands...); err != nil {
-			return err
-		}
 		sp.currentProxy = ""
 		return nil
 	}
