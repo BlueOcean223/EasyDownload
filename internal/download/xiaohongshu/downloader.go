@@ -135,11 +135,11 @@ func (d *Downloader) BuildDownloadFunc(item *XHSItem, selectedImages []int, qual
 				task.Progress = 100
 			}
 		} else {
-			streamURL := selectStreamURL(item, quality)
-			if streamURL == "" {
+			stream := selectStream(item, quality)
+			if stream == nil || strings.TrimSpace(stream.URL) == "" {
 				return ErrStreamNotFound
 			}
-			if err := d.downloadFile(ctx, streamURL, destPath, onProgress); err != nil {
+			if err := d.downloadFileWithFallback(ctx, stream.URL, stream.BackupURLs, destPath, onProgress); err != nil {
 				return err
 			}
 		}
@@ -196,24 +196,43 @@ func normalizeSelection(indices []int, n int) []int {
 	return out
 }
 
-func selectStreamURL(item *XHSItem, quality string) string {
+func selectStream(item *XHSItem, quality string) *XHSStream {
 	if item == nil {
-		return ""
+		return nil
 	}
 	quality = strings.ToLower(strings.TrimSpace(quality))
 	if quality != "" {
-		for _, s := range item.Streams {
+		for i := range item.Streams {
+			s := &item.Streams[i]
 			if strings.ToLower(strings.TrimSpace(s.QualityKey)) == quality && strings.TrimSpace(s.URL) != "" {
-				return strings.TrimSpace(s.URL)
+				return s
+			}
+		}
+		for i := range item.Streams {
+			s := &item.Streams[i]
+			if strings.ToLower(strings.TrimSpace(s.QualityName)) == quality && strings.TrimSpace(s.URL) != "" {
+				return s
+			}
+			if s.StreamType > 0 && fmt.Sprintf("%d", s.StreamType) == quality && strings.TrimSpace(s.URL) != "" {
+				return s
 			}
 		}
 	}
-	for _, s := range item.Streams {
+	for i := range item.Streams {
+		s := &item.Streams[i]
 		if strings.TrimSpace(s.URL) != "" {
-			return strings.TrimSpace(s.URL)
+			return s
 		}
 	}
-	return ""
+	return nil
+}
+
+func selectStreamURL(item *XHSItem, quality string) string {
+	stream := selectStream(item, quality)
+	if stream == nil {
+		return ""
+	}
+	return strings.TrimSpace(stream.URL)
 }
 
 // downloadAlbumZip downloads album images with resumable support.
@@ -283,7 +302,7 @@ func (d *Downloader) downloadAlbumZip(ctx context.Context, item *XHSItem, indice
 		if _, ok := targetSet[idx]; !ok {
 			continue
 		}
-		if utils.FileExists(utils.AlbumImageTempPath(tempDir, idx)) {
+		if albumAssetsComplete(tempDir, idx, item.Images[idx]) {
 			completed[idx] = struct{}{}
 		}
 	}
@@ -316,13 +335,14 @@ func (d *Downloader) downloadAlbumZip(ctx context.Context, item *XHSItem, indice
 			return ctx.Err()
 		}
 
-		raw := strings.TrimSpace(item.Images[idx].URL)
+		img := item.Images[idx]
+		raw := strings.TrimSpace(img.URL)
 		if raw == "" {
 			_ = utils.SaveAlbumState(state)
 			return fmt.Errorf("empty image url: index %d", idx)
 		}
 
-		data, dlErr := d.downloadBytes(ctx, raw)
+		data, dlErr := d.downloadBytesWithFallback(ctx, raw, img.BackupURLs)
 		if dlErr != nil {
 			_ = utils.SaveAlbumState(state)
 			return dlErr
@@ -332,6 +352,13 @@ func (d *Downloader) downloadAlbumZip(ctx context.Context, item *XHSItem, indice
 		if err := os.WriteFile(tempPath, data, 0644); err != nil {
 			_ = utils.SaveAlbumState(state)
 			return err
+		}
+
+		if liveURL := strings.TrimSpace(img.LivePhotoURL); liveURL != "" {
+			if err := d.downloadToFileAtomic(ctx, liveURL, albumLivePhotoTempPath(tempDir, idx), maxLivePhotoSize); err != nil {
+				_ = utils.SaveAlbumState(state)
+				return err
+			}
 		}
 
 		completed[idx] = struct{}{}
@@ -371,19 +398,64 @@ func (d *Downloader) downloadAlbumZip(ctx context.Context, item *XHSItem, indice
 	return nil
 }
 
-func imageExt(raw string) string {
+func albumLivePhotoTempPath(tempDir string, index int) string {
+	return filepath.Join(tempDir, fmt.Sprintf("%d.live", index))
+}
+
+func albumAssetsComplete(tempDir string, index int, img XHSImage) bool {
+	if !utils.FileExists(utils.AlbumImageTempPath(tempDir, index)) {
+		return false
+	}
+	if strings.TrimSpace(img.LivePhotoURL) == "" {
+		return true
+	}
+	return utils.FileExists(albumLivePhotoTempPath(tempDir, index))
+}
+
+func mediaExt(raw string, fallback string) string {
 	u, err := url.Parse(strings.TrimSpace(raw))
 	if err == nil {
 		if ext := path.Ext(u.Path); ext != "" && len(ext) <= 6 {
 			return ext
 		}
 	}
-	return ".jpg"
+	return fallback
+}
+
+func imageExt(raw string) string {
+	return mediaExt(raw, ".jpg")
+}
+
+func videoExt(raw string) string {
+	return mediaExt(raw, ".mp4")
 }
 
 // maxImageSize is the maximum allowed size for image downloads (50MB).
 // This prevents memory exhaustion from malicious or oversized responses.
 const maxImageSize = 50 * 1024 * 1024
+
+// maxLivePhotoSize is the maximum allowed size for Live Photo video sidecars (200MB).
+const maxLivePhotoSize = 200 * 1024 * 1024
+
+func (d *Downloader) downloadBytesWithFallback(ctx context.Context, primaryURL string, backupURLs []string) ([]byte, error) {
+	urls := collectDownloadURLs(primaryURL, backupURLs)
+	if len(urls) == 0 {
+		return nil, fmt.Errorf("empty url")
+	}
+
+	var lastErr error
+	for _, rawURL := range urls {
+		data, err := d.downloadBytes(ctx, rawURL)
+		if err == nil {
+			return data, nil
+		}
+		if ctx.Err() != nil {
+			return nil, err
+		}
+		lastErr = err
+	}
+	return nil, fmt.Errorf("all xhs image URLs failed: %w", lastErr)
+}
 
 func (d *Downloader) downloadBytes(ctx context.Context, rawURL string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", rawURL, nil)
@@ -448,6 +520,91 @@ func (d *Downloader) downloadFile(ctx context.Context, rawURL string, destPath s
 	return nil
 }
 
+func (d *Downloader) downloadToFileAtomic(ctx context.Context, rawURL string, destPath string, maxBytes int64) (err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("User-Agent", d.userAgent)
+	req.Header.Set("Referer", d.referer)
+
+	resp, err := d.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("unexpected status %d", resp.StatusCode)
+	}
+
+	if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+		return err
+	}
+	tmpPath := destPath + ".tmp"
+	_ = os.Remove(tmpPath)
+	out, err := os.Create(tmpPath)
+	if err != nil {
+		return err
+	}
+	closed := false
+	defer func() {
+		if !closed {
+			_ = out.Close()
+		}
+		if err != nil {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	var reader io.Reader = resp.Body
+	if maxBytes > 0 {
+		reader = io.LimitReader(resp.Body, maxBytes+1)
+	}
+	written, err := io.Copy(out, reader)
+	if err != nil {
+		return err
+	}
+	if maxBytes > 0 && written > maxBytes {
+		return fmt.Errorf("download size exceeds limit (%d bytes)", maxBytes)
+	}
+	if err = out.Sync(); err != nil {
+		return err
+	}
+	if err = out.Close(); err != nil {
+		return err
+	}
+	closed = true
+
+	_ = os.Remove(destPath)
+	if err = os.Rename(tmpPath, destPath); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (d *Downloader) downloadFileWithFallback(ctx context.Context, primaryURL string, backupURLs []string, destPath string, onProgress func(downloaded, total int64)) error {
+	urls := collectDownloadURLs(primaryURL, backupURLs)
+	if len(urls) == 0 {
+		return fmt.Errorf("empty url")
+	}
+
+	var lastErr error
+	for _, rawURL := range urls {
+		err := d.downloadFile(ctx, rawURL, destPath, onProgress)
+		if err == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return err
+		}
+		if errors.Is(err, ErrVideoTooLarge) {
+			return err
+		}
+		lastErr = err
+	}
+	return fmt.Errorf("all xhs download URLs failed: %w", lastErr)
+}
+
 // writeAlbumZip creates a ZIP archive from downloaded temp images.
 func writeAlbumZip(destPath, tempDir string, images []XHSImage, indices []int) (err error) {
 	if len(indices) == 0 {
@@ -466,6 +623,12 @@ func writeAlbumZip(destPath, tempDir string, images []XHSImage, indices []int) (
 			Path: utils.AlbumImageTempPath(tempDir, idx),
 			Name: fmt.Sprintf("%03d%s", idx+1, imageExt(images[idx].URL)),
 		})
+		if strings.TrimSpace(images[idx].LivePhotoURL) != "" {
+			files = append(files, utils.ZipFile{
+				Path: albumLivePhotoTempPath(tempDir, idx),
+				Name: fmt.Sprintf("%03d_live%s", idx+1, videoExt(images[idx].LivePhotoURL)),
+			})
+		}
 	}
 
 	return utils.WriteZipAtomic(destPath, files, utils.WriteZipOptions{

@@ -110,6 +110,164 @@ func TestDownloadVideoQualitySelect(t *testing.T) {
 	assert.NotZero(t, hdHits.Load())
 }
 
+func TestDownloadVideoUsesBackupURL(t *testing.T) {
+	var primaryHits, backupHits atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v/primary.mp4":
+			primaryHits.Add(1)
+			http.Error(w, "blocked", http.StatusForbidden)
+		case "/v/backup.mp4":
+			backupHits.Add(1)
+			w.Header().Set("Content-Length", "6")
+			_, _ = w.Write([]byte("backup"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	item := &XHSItem{
+		Type:   "video",
+		ID:     "note123",
+		Title:  "hello",
+		Author: "author",
+		Streams: []XHSStream{
+			{QualityKey: "hd_115", QualityName: "HD", URL: ts.URL + "/v/primary.mp4", BackupURLs: []string{ts.URL + "/v/backup.mp4"}},
+		},
+	}
+
+	dl := NewDownloaderWithClient(ts.Client())
+	outDir := t.TempDir()
+	fn := dl.BuildDownloadFunc(item, nil, "hd_115", outDir)
+
+	err := fn(context.Background(), &downloader.DownloadTask{}, nil, nil)
+	require.NoError(t, err)
+	assert.NotZero(t, primaryHits.Load())
+	assert.Equal(t, int32(1), backupHits.Load())
+}
+
+func TestDownloadVideoFallbackContinuesPartialFile(t *testing.T) {
+	payload := []byte("0123456789")
+	var backupRange atomic.Value
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v/primary.mp4":
+			w.Header().Set("Content-Length", "10")
+			_, _ = w.Write(payload[:5])
+		case "/v/backup.mp4":
+			backupRange.Store(r.Header.Get("Range"))
+			if r.Header.Get("Range") == "bytes=5-" {
+				w.Header().Set("Content-Range", "bytes 5-9/10")
+				w.Header().Set("Content-Length", "5")
+				w.WriteHeader(http.StatusPartialContent)
+				_, _ = w.Write(payload[5:])
+				return
+			}
+			w.Header().Set("Content-Length", "10")
+			_, _ = w.Write(payload)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	item := &XHSItem{
+		Type:   "video",
+		ID:     "note123",
+		Title:  "hello",
+		Author: "author",
+		Streams: []XHSStream{
+			{QualityKey: "hd_115", QualityName: "HD", URL: ts.URL + "/v/primary.mp4", BackupURLs: []string{ts.URL + "/v/backup.mp4"}},
+		},
+	}
+
+	dl := NewDownloaderWithClient(ts.Client())
+	outDir := t.TempDir()
+	fn := dl.BuildDownloadFunc(item, nil, "hd_115", outDir)
+
+	var completePath string
+	err := fn(context.Background(), &downloader.DownloadTask{}, nil, func(p string) { completePath = p })
+	require.NoError(t, err)
+	assert.Equal(t, "bytes=5-", backupRange.Load())
+
+	data, err := os.ReadFile(completePath)
+	require.NoError(t, err)
+	assert.Equal(t, payload, data)
+}
+
+func TestDownloadAlbumUsesImageBackupURL(t *testing.T) {
+	var primaryHits, backupHits atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/img-primary.jpg":
+			primaryHits.Add(1)
+			http.Error(w, "blocked", http.StatusForbidden)
+		case "/img-backup.jpg":
+			backupHits.Add(1)
+			_, _ = w.Write([]byte("image-backup"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	item := &XHSItem{
+		Type:   "image",
+		ID:     "note123",
+		Title:  "hello",
+		Author: "author",
+		Images: []XHSImage{{URL: ts.URL + "/img-primary.jpg", BackupURLs: []string{ts.URL + "/img-backup.jpg"}}},
+	}
+
+	dl := NewDownloaderWithClient(ts.Client())
+	outDir := t.TempDir()
+	fn := dl.BuildDownloadFunc(item, nil, "", outDir)
+
+	var completePath string
+	err := fn(context.Background(), &downloader.DownloadTask{}, nil, func(p string) { completePath = p })
+	require.NoError(t, err)
+	assert.NotZero(t, primaryHits.Load())
+	assert.Equal(t, int32(1), backupHits.Load())
+
+	zipFiles := readZipFiles(t, completePath)
+	assert.Equal(t, []byte("image-backup"), zipFiles["001.jpg"])
+}
+
+func TestDownloadAlbumIncludesLivePhotoVideo(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/img.jpg":
+			_, _ = w.Write([]byte("still"))
+		case "/live.mp4":
+			_, _ = w.Write([]byte("live-video"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	item := &XHSItem{
+		Type:   "image",
+		ID:     "note123",
+		Title:  "hello",
+		Author: "author",
+		Images: []XHSImage{{URL: ts.URL + "/img.jpg", LivePhoto: true, LivePhotoURL: ts.URL + "/live.mp4"}},
+	}
+
+	dl := NewDownloaderWithClient(ts.Client())
+	outDir := t.TempDir()
+	fn := dl.BuildDownloadFunc(item, nil, "", outDir)
+
+	var completePath string
+	err := fn(context.Background(), &downloader.DownloadTask{}, nil, func(p string) { completePath = p })
+	require.NoError(t, err)
+
+	zipFiles := readZipFiles(t, completePath)
+	assert.Equal(t, []byte("still"), zipFiles["001.jpg"])
+	assert.Equal(t, []byte("live-video"), zipFiles["001_live.mp4"])
+}
+
 func TestDownloadProgressCallback(t *testing.T) {
 	payload := strings.Repeat("a", 1024)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -216,6 +374,10 @@ func TestSelectStreamURL(t *testing.T) {
 	assert.Equal(t, "http://example.com/hd.mp4", selectStreamURL(item, "hd"))
 	assert.Equal(t, "http://example.com/sd.mp4", selectStreamURL(item, "unknown"))
 	assert.Empty(t, selectStreamURL(nil, ""))
+
+	streamTypeItem := &XHSItem{Streams: []XHSStream{{QualityKey: "hd_115", QualityName: "HD", StreamType: 115, URL: "http://example.com/115.mp4"}}}
+	assert.Equal(t, "http://example.com/115.mp4", selectStreamURL(streamTypeItem, "115"))
+	assert.Equal(t, "http://example.com/115.mp4", selectStreamURL(streamTypeItem, "HD"))
 }
 
 func readZipFiles(t *testing.T, zipPath string) map[string][]byte {
