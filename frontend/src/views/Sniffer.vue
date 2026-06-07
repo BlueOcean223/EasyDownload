@@ -158,11 +158,6 @@ async function downloadVideo(video: DetectedVideo) {
   try {
     // Get selected quality format
     const selectedFormat = getSelectedQuality(video)
-    console.log('[Sniffer] Download video:', video.title)
-    console.log('[Sniffer] Video specs:', video.specs)
-    console.log('[Sniffer] Video fileFormats:', video.fileFormats)
-    console.log('[Sniffer] Quality options:', getQualityOptions(video))
-    console.log('[Sniffer] Selected format:', selectedFormat)
     // Pass the selected quality to download
     await store.downloadDetectedVideo(video, selectedFormat)
     message.success('已添加到下载队列')

@@ -13,4 +13,16 @@ export default defineConfig({
     host: '0.0.0.0',
     port: 5173,
   },
+  build: {
+    chunkSizeWarningLimit: 700,
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          vue: ['vue', 'vue-router', 'pinia'],
+          naive: ['naive-ui'],
+          icons: ['@vicons/ionicons5'],
+        },
+      },
+    },
+  },
 })
