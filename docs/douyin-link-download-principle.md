@@ -1,6 +1,6 @@
 # 抖音链接解析下载原理
 
-本文档说明 EasyDownload 中抖音“根据分享链接解析并下载”的完整链路。抖音侧整体遵循 `Parser -> Client -> Downloader -> App` 的结构，但实现上更偏接口化：先想办法把分享文本统一收敛为 `aweme_id`，再尽量走接口拿详情，最后才回退到分享页 HTML。
+本文档说明 EasyDownload 中抖音“根据分享链接解析并下载”的完整链路。抖音侧整体遵循 `Parser -> Client -> Downloader -> App` 的结构：先把分享文本统一收敛为 `aweme_id`，再由 `Client` 优先解析分享页 SSR 数据，失败后回退到详情接口和 `slidesinfo`，最后交给下载器落盘。普通视频在返回数据缺少清晰度列表时，还会通过 `play_addr.uri` 做 ratio 阶梯探测，识别真实可下载档位。
 
 ## 1. 适用范围
 
@@ -31,10 +31,11 @@
 2. `Parser` 从输入里找出第一个合法的抖音 URL
 3. 如果 URL 是 `v.douyin.com` 短链，则先展开成真实长链接
 4. 从长链接的路径或查询参数里提取 `aweme_id`
-5. `Client` 用 `aweme_id` 请求详情接口或分享页，构建 `DouyinItem`
-6. 前端展示封面、作者、标题、清晰度、图集预览等信息
-7. 用户点击下载后，`App` 层重新用原始分享文本走一遍解析和抓取
-8. `Downloader` 按内容类型把资源落盘成 `.mp4` 或 `.zip`
+5. `Client` 用 `aweme_id` 优先请求分享页 SSR，失败再请求详情接口或 `slidesinfo`，构建 `DouyinItem`
+6. 如果普通视频缺少 `bit_rate` 清晰度列表，基于 `play_addr.uri` 做 ratio 阶梯探测
+7. 前端展示封面、作者、标题、清晰度、图集预览等信息
+8. 用户点击下载后，`App` 层重新用原始分享文本走一遍解析和抓取
+9. `Downloader` 按内容类型把资源落盘成 `.mp4` 或 `.zip`
 
 这里有一个很重要的设计点：抖音下载入口依赖的是原始输入，不是前端缓存的 `DouyinItem`。这意味着下载时会重新解析和抓取一次，目的是保证后端始终以自己的最新结果为准。
 
@@ -89,11 +90,34 @@
 
 ## 4. 信息抓取阶段
 
-拿到 `aweme_id` 后，`Client` 会按优先级尝试三条路径。
+拿到 `aweme_id` 后，`Client` 当前采用“分享页优先、接口兜底”的顺序。每条路径返回后都会先做可用性检查：视频必须有可用 `streams`，图集必须有 `images`。如果某条路径能解析出对象但没有可下载媒体，会标记为“不完整”并继续尝试下一条路径。
 
-### 4.1 第一条路径：`aweme/detail`
+客户端构造时会确保 `http.Client` 带有 `CookieJar`。优先请求分享页的原因是分享页本来就是官方 WebView/分享场景，带浏览器 `User-Agent` 和 `Referer` 就能拿到 SSR 数据，并且响应会自然下发匿名 `ttwid`，由 `CookieJar` 自动管理；实现不会主动调用额外的 `ttwid` 注册端点，也不依赖登录 Cookie。
 
-优先请求官方 Web 详情接口：
+### 4.1 第一条路径：分享页 SSR
+
+客户端会先尝试分享页：
+
+- `/share/video/{aweme_id}/?app=aweme`
+- `/share/note/{aweme_id}/?app=aweme`
+
+请求头同样模拟浏览器环境，然后从 HTML 中提取：
+
+- `window._ROUTER_DATA`
+
+解析时会遍历 `loaderData`，找到其中的 `videoInfoRes.item_list[0]`，再继续映射成内部对象。
+
+这个路径现在是主路径，原因是：
+
+- 分享页 SSR 对匿名访问更贴近官方分享场景
+- 首次访问即可让服务端下发匿名 `ttwid`
+- 普通视频通常能拿到 `play_addr.uri`，后续可用于清晰度探测
+
+如果分享页被限流、返回空壳、页面结构变化，或者解析出的对象没有可用媒体，客户端不会立即失败，而是继续尝试接口兜底。
+
+### 4.2 第二条路径：`aweme/detail`
+
+分享页不可用时，客户端回退到官方 Web 详情接口：
 
 - `https://www.iesdouyin.com/aweme/v1/web/aweme/detail/`
 
@@ -121,41 +145,50 @@
 
 - `item_list`
 
-这一步成功的话，通常可以直接构造视频或图集的内部对象。
+这一步不再是首选路径，但仍可在分享页空壳、HTML 结构变化或接口数据更完整时兜底。
 
-### 4.2 第二条路径：`slidesinfo`
+### 4.3 第三条路径：`slidesinfo`
 
-如果第一条路径失败，客户端会尝试：
+如果分享页和详情接口都不可用，客户端最后会尝试：
 
 - `https://www.iesdouyin.com/web/api/v2/aweme/slidesinfo/`
 
 这条路径主要是为了补图集或“看起来像图集、但每页里可能带视频”的内容。某些滑动作品在普通详情或分享页里只能看到静态封面，但 `slidesinfo` 能给出 `images[].video.play_addr` 这类更完整的媒体信息。
 
-因此它并不是通用替代，而是专门为图集/混合内容兜底。
+因此它不是通用替代，而是专门为图集/混合内容兜底。
 
-### 4.3 第三条路径：分享页 HTML 回退
+### 4.4 视频流构建与 ratio 探测
 
-如果接口路径都失败，客户端最后会请求分享页：
+视频流优先来自返回数据里的 `video.bit_rate`：每个条目对应一个清晰度档位，客户端会从 `gear_name` 或宽高推导 `qualityKey`，并优先选择无水印地址。
 
-- `/share/video/{aweme_id}/?app=aweme`
-- `/share/note/{aweme_id}/?app=aweme`
+如果 `bit_rate` 为空，或者最终没有构造出可用 `streams`，客户端会检查 `video.play_addr.uri`。只要有 URI，就按固定阶梯探测 play 端点：
 
-然后从 HTML 中提取：
+- `1080p`
+- `720p`
+- `540p`
+- `480p`
+- `360p`
 
-- `window._ROUTER_DATA`
+探测 URL 形如：
 
-再从里面找到 `videoInfoRes`，继续构造成内部对象。
+- `https://aweme.snssdk.com/aweme/v1/play/?video_id={uri}&ratio={ratio}&line=0`
 
-这个回退路径的意义是：
+每次探测都发送 `GET` 请求，并带上 `Range: bytes=0-1`。只有满足下面条件的结果才会被认为是真实可下载档位：
 
-- 当接口被限流时还能多试一条路
-- 当分享页 SSR 仍带有核心数据时，不至于完全失败
+- HTTP 状态是 `206 Partial Content`
+- `Content-Range` 能解析出大于 0 的总大小
+- `Content-Type` 看起来是视频或二进制流
+- 文件总大小没有和已接受档位重复
 
-但它比接口方案更脆，因为它依赖页面结构和脚本注入格式。
+这样可以避免“盲构造 URL 后实际回落到同一档位或不存在档位”的问题。探测成功后，客户端会用探测到的真实档位替换普通 fallback 流，并按分辨率排序。
 
-### 4.4 元数据补全
+### 4.5 元数据补全
 
-如果拿到的是视频内容，客户端还会对每个清晰度流地址额外发送 `HEAD` 请求，补出文件大小。
+如果拿到的是视频内容，客户端还会对缺少文件大小的清晰度流额外发送小范围 `GET` 请求：
+
+- `Range: bytes=0-1`
+
+优先从 `Content-Range` 解析总大小；如果服务端直接返回 `200 OK`，则回退使用 `Content-Length`。这里不再使用 `HEAD`，避免某些 CDN 节点对 `HEAD` 不稳定。
 
 这样前端在展示清晰度选项时，就能带上更完整的尺寸和大小信息，而不是只显示分辨率。
 
@@ -177,11 +210,11 @@
 如果作品被识别成视频，`DouyinItem` 会包含：
 
 - `Type = video`
-- 多个清晰度流
-- 每个流对应的 `qualityKey`
+- 多个清晰度流（来自 `bit_rate`，或在 `bit_rate` 缺失时来自 ratio 探测）
+- 每个流对应的 `qualityKey`，例如 `1080p`、`720p`、`source`
 - 宽高、码率、URL、文件大小
 
-下载器后续就按 `qualityKey` 选流。
+下载器后续就按 `qualityKey` 选流。探测出来的流可能没有码率，但会尽量带上文件大小。
 
 ### 5.2 图集内容
 
@@ -292,13 +325,14 @@ App 层不会自己直接落盘，而是把平台下载器包装成 `DownloadFun
 - 短链没有返回合法重定向
 - 最终长链接里拿不到 `aweme_id`
 
-### 8.2 接口失败
+### 8.2 抓取失败
 
 常见原因：
 
-- 详情接口返回 403 或 429
+- 分享页返回 403/429、空壳 HTML，或 `window._ROUTER_DATA` 不再匹配
+- 详情接口返回 403/429，或者没有 `aweme_detail` / `item_list`
 - `slidesinfo` 不包含目标内容
-- 分享页结构变化，`window._ROUTER_DATA` 不再匹配
+- 普通视频既没有可用 `bit_rate`，也无法通过 `play_addr.uri` 探测出真实档位
 
 ### 8.3 下载失败
 
@@ -314,7 +348,9 @@ App 层不会自己直接落盘，而是把平台下载器包装成 `DownloadFun
 抖音当前实现的工程特征可以概括为：
 
 - 输入非常宽松，尽量兼容分享文本
-- 抓取阶段优先走接口，而不是先抓页面
+- 抓取阶段优先走分享页 SSR，再用 `aweme/detail` 和 `slidesinfo` 兜底
+- 使用 `CookieJar` 自动管理分享页下发的匿名 `ttwid`，不依赖登录 Cookie
+- 普通视频在 `bit_rate` 缺失时通过 ratio 探测识别真实清晰度，并用 Range GET 补文件大小
 - 图集兼容性考虑得比较多，尤其是混合图/视频内容
 - 下载阶段追求吞吐和恢复能力
 - 下载入口设计成“重新解析”，而不是盲信前端结果
