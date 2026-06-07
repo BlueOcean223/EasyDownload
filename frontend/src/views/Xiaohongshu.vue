@@ -12,7 +12,7 @@ import {
   ListOutline,
   BookOutline
 } from '@vicons/ionicons5'
-import type { XHSItem, DisplayImage } from '@/types'
+import type { XHSItem, XHSStream, DisplayImage } from '@/types'
 import { GetXHSNoteInfo, DownloadXHSNote } from '../../wailsjs/go/main/App'
 import ProxiedImage from '@/components/ProxiedImage.vue'
 import ImageSelector from '@/components/ImageSelector.vue'
@@ -80,6 +80,25 @@ function formatDuration(seconds: number) {
   return `${mins}:${secs.toString().padStart(2, '0')}`
 }
 
+function formatCodec(codec?: string) {
+  const normalized = (codec || '').toLowerCase().replace(/[._-]/g, '')
+  if (normalized === 'hevc' || normalized === 'h265') return 'H.265'
+  if (normalized === 'avc' || normalized === 'h264') return 'H.264'
+  if (normalized === 'h266' || normalized === 'vvc') return 'H.266'
+  if (normalized === 'av1') return 'AV1'
+  return codec || ''
+}
+
+function streamOptionLabel(stream: XHSStream) {
+  const parts = [stream.QualityName || (stream.StreamType ? `Stream ${stream.StreamType}` : '默认')]
+  if (stream.Width && stream.Height) parts.push(`${stream.Width}x${stream.Height}`)
+  const codec = formatCodec(stream.VideoCodec)
+  if (codec) parts.push(codec)
+  if (stream.Weight) parts.push(`权重 ${stream.Weight}`)
+  if (stream.FPS) parts.push(`${stream.FPS}fps`)
+  return parts.join(' · ')
+}
+
 async function fetchXHSInfo() {
   if (!url.value.trim()) {
     message.warning('请输入小红书链接或文本')
@@ -98,7 +117,7 @@ async function fetchXHSInfo() {
 
     if (info.Type === 'video') {
       qualityOptions.value = info.Streams.map((s) => ({
-        label: `${s.QualityName} (${s.Width}x${s.Height})`,
+        label: streamOptionLabel(s),
         value: s.QualityKey
       }))
       selectedQuality.value = info.Streams[0]?.QualityKey || null

@@ -179,12 +179,43 @@ export interface XHSStream {
   Width: number
   Height: number
   URL: string
+  BackupURLs?: string[]
   Size: number
+  Format?: string
+  FPS?: number
+  VideoCodec?: string
+  VideoBitrate?: number
+  AudioCodec?: string
+  AudioBitrate?: number
+  StreamDesc?: string
+  StreamType?: number
+  Weight?: number
+  Duration?: number
+  DefaultStream?: number
+  HDRType?: number
+  Rotate?: number
+}
+
+export interface XHSTag {
+  ID: string
+  Name: string
+  Type: string
+}
+
+export interface XHSInteractInfo {
+  LikedCount: string
+  CollectedCount: string
+  CommentCount: string
+  ShareCount: string
 }
 
 // XHS image (extends DisplayImage for shared component compatibility)
 export interface XHSImage extends DisplayImage {
+  BackupURLs?: string[]
   TraceId?: string
+  FileID?: string
+  LivePhoto?: boolean
+  LivePhotoURL?: string
 }
 
 // XHS item (note)
@@ -198,6 +229,9 @@ export interface XHSItem {
   AuthorID: string
   AuthorAvatar: string
   Timestamp: number
+  IPLocation?: string
+  Tags?: XHSTag[]
+  InteractInfo?: XHSInteractInfo
   Streams: XHSStream[]
   Images: XHSImage[]
 }
