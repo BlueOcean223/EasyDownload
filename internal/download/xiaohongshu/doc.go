@@ -2,9 +2,10 @@
 //
 // This package implements the XiaoHongShu content parser and downloader, which supports:
 //   - Parsing XiaoHongShu share URLs and extracting note metadata
-//   - Downloading videos with quality selection
-//   - Downloading image albums with resumable support
-//   - ZIP packaging for album downloads
+//   - Downloading videos with codec/weight-aware quality selection
+//   - Fallback downloads via backup CDN URLs when primary stream URLs fail
+//   - Downloading image albums with resumable support and image URL fallback
+//   - ZIP packaging for album downloads, including Live Photo video sidecars when present
 //   - Integration with DownloadManager for unified task management
 //
 // Supported Content Types:
@@ -31,6 +32,6 @@
 //	}
 //
 //	downloader := xiaohongshu.NewDownloader()
-//	downloadFunc := downloader.BuildDownloadFunc(item, nil, "1080p", outputDir)
+//	downloadFunc := downloader.BuildDownloadFunc(item, nil, "hd_115", outputDir)
 //	manager.AddTaskWithDownloader(id, url, title, cover, "xiaohongshu", quality, downloadFunc)
 package xiaohongshu
