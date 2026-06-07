@@ -1,8 +1,14 @@
 package bilibili
 
 import (
-	"EasyDownload/internal/config"
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"strings"
 	"testing"
+
+	"EasyDownload/internal/config"
 
 	"github.com/leanovate/gopter"
 	"github.com/leanovate/gopter/gen"
@@ -177,6 +183,66 @@ func TestSetFFmpegPath(t *testing.T) {
 	bd.SetFFmpegPath("/usr/bin/ffmpeg")
 	if bd.ffmpegPath != "/usr/bin/ffmpeg" {
 		t.Errorf("ffmpegPath = %s, want /usr/bin/ffmpeg", bd.ffmpegPath)
+	}
+}
+
+func TestSelectURLsPromotesBackupAndDeduplicates(t *testing.T) {
+	primary, backups := selectURLs(
+		"",
+		"",
+		[]string{"", " https://cdn.example.com/a ", "https://cdn.example.com/a"},
+		[]string{"https://cdn.example.com/b", "https://cdn.example.com/a"},
+	)
+
+	if primary != "https://cdn.example.com/a" {
+		t.Fatalf("primary = %q, want backup promoted", primary)
+	}
+	if len(backups) != 1 || backups[0] != "https://cdn.example.com/b" {
+		t.Fatalf("backups = %#v, want only unique remaining backup", backups)
+	}
+}
+
+func TestBuildQualityNameFallbacks(t *testing.T) {
+	if got := buildQualityName(120, []supportFormatEntry{{Quality: 120}}, "4K 超清"); got != "4K 超清" {
+		t.Fatalf("buildQualityName fallback to acceptDesc = %q, want %q", got, "4K 超清")
+	}
+	if got := buildQualityName(80, nil, ""); got != "1080P" {
+		t.Fatalf("buildQualityName fallback to map = %q, want %q", got, "1080P")
+	}
+}
+
+func TestDownloadFileWithFallbackNoURL(t *testing.T) {
+	bd := NewBilibiliDownloader()
+	_, err := bd.downloadFileWithFallback(context.Background(), "", []string{"", " "}, filepath.Join(t.TempDir(), "out.m4s"), 0, nil)
+	if err == nil || !strings.Contains(err.Error(), "no download URL available") {
+		t.Fatalf("error = %v, want no download URL available", err)
+	}
+}
+
+func TestGetContentLengthWithFallbackUsesBackup(t *testing.T) {
+	var primaryHEADs int
+	var backupHEADs int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/primary":
+			primaryHEADs++
+			w.WriteHeader(http.StatusForbidden)
+		case "/backup":
+			backupHEADs++
+			w.Header().Set("Content-Length", "123")
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer ts.Close()
+
+	bd := NewBilibiliDownloader()
+	if got := bd.getContentLengthWithFallback(ts.URL+"/primary", []string{ts.URL + "/backup"}); got != 123 {
+		t.Fatalf("content length = %d, want 123", got)
+	}
+	if primaryHEADs != 1 || backupHEADs != 1 {
+		t.Fatalf("HEAD calls: primary=%d backup=%d, want 1 each", primaryHEADs, backupHEADs)
 	}
 }
 

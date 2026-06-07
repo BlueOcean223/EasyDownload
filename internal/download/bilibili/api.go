@@ -129,41 +129,191 @@ func (bd *BilibiliDownloader) GetVideoInfoWithParts(bvid string) (*BilibiliVideo
 	return video, nil
 }
 
+// codecPriority returns the priority of a codec for selection.
+// Lower number = higher priority. AV1 (13) > HEVC (12) > H.264 (7).
+// Unknown codecs get priority 99 (lowest).
+func codecPriority(codecid int) int {
+	switch codecid {
+	case 13: // AV1
+		return 0
+	case 12: // HEVC
+		return 1
+	case 7: // H.264/AVC
+		return 2
+	default:
+		return 99
+	}
+}
+
+// dashVideoEntry holds a single DASH video stream entry from the API response.
+// Fields use both camelCase and snake_case JSON tags to handle API response variance.
+type dashVideoEntry struct {
+	ID         int    `json:"id"`
+	BaseURL    string `json:"baseUrl"`
+	Bandwidth  int64  `json:"bandwidth"`
+	Codecs     string `json:"codecs"`
+	CodecID    int    `json:"codecid"`
+	Width      int    `json:"width"`
+	Height     int    `json:"height"`
+	FrameRate  string `json:"frameRate"`
+	MimeType   string `json:"mimeType"`
+	BackupURL1 string `json:"-"`
+	BackupURL2 string `json:"-"`
+}
+
+// dashAudioEntry holds a single DASH audio stream entry from the API response.
+type dashAudioEntry struct {
+	ID         int    `json:"id"`
+	BaseURL    string `json:"baseUrl"`
+	Bandwidth  int64  `json:"bandwidth"`
+	Codecs     string `json:"codecs"`
+	BackupURL1 string `json:"-"`
+	BackupURL2 string `json:"-"`
+}
+
+// supportFormatEntry holds a quality format entry from support_formats.
+type supportFormatEntry struct {
+	Quality        int    `json:"quality"`
+	Format         string `json:"format"`
+	NewDescription string `json:"new_description"`
+	DisplayDesc    string `json:"display_desc"`
+	Superscript    string `json:"superscript"`
+}
+
+// rawDashVideo is the raw DASH video entry with both camelCase and snake_case backup URL fields.
+type rawDashVideo struct {
+	ID             int      `json:"id"`
+	BaseURL        string   `json:"baseUrl"`
+	BaseURLSnake   string   `json:"base_url"`
+	BackupURL      []string `json:"backupUrl"`
+	BackupURLSnake []string `json:"backup_url"`
+	Bandwidth      int64    `json:"bandwidth"`
+	Codecs         string   `json:"codecs"`
+	CodecID        int      `json:"codecid"`
+	Width          int      `json:"width"`
+	Height         int      `json:"height"`
+	FrameRate      string   `json:"frameRate"`
+	FrameRateSnake string   `json:"frame_rate"`
+	MimeType       string   `json:"mimeType"`
+	MimeTypeSnake  string   `json:"mime_type"`
+}
+
+// rawDashAudio is the raw DASH audio entry with both camelCase and snake_case backup URL fields.
+type rawDashAudio struct {
+	ID             int      `json:"id"`
+	BaseURL        string   `json:"baseUrl"`
+	BaseURLSnake   string   `json:"base_url"`
+	BackupURL      []string `json:"backupUrl"`
+	BackupURLSnake []string `json:"backup_url"`
+	Bandwidth      int64    `json:"bandwidth"`
+	Codecs         string   `json:"codecs"`
+}
+
+// selectURLs picks the primary URL from the two possible field names (camelCase priority),
+// merges backup URL arrays from both field names, de-duplicates URLs, and promotes
+// the first backup URL when no primary URL is provided.
+func selectURLs(baseURL, baseURLSnake string, backupURL, backupURLSnake []string) (primary string, backups []string) {
+	backupCandidates := make([]string, 0, len(backupURL)+len(backupURLSnake))
+	backupCandidates = append(backupCandidates, backupURL...)
+	backupCandidates = append(backupCandidates, backupURLSnake...)
+
+	urls := collectDownloadURLs(selectString(baseURL, baseURLSnake), backupCandidates)
+	if len(urls) == 0 {
+		return "", nil
+	}
+	return urls[0], urls[1:]
+}
+
+// selectString picks the first non-empty string from the given candidates.
+func selectString(candidates ...string) string {
+	for _, s := range candidates {
+		if s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+// selectBestVideoStream picks the best DASH video stream for a given quality.
+// Priority: AV1 > HEVC > H.264, then higher bandwidth within the same codec family.
+func selectBestVideoStream(candidates []rawDashVideo) *rawDashVideo {
+	if len(candidates) == 0 {
+		return nil
+	}
+	best := &candidates[0]
+	for i := 1; i < len(candidates); i++ {
+		c := &candidates[i]
+		pBest := codecPriority(best.CodecID)
+		pCurr := codecPriority(c.CodecID)
+		if pCurr < pBest || (pCurr == pBest && c.Bandwidth > best.Bandwidth) {
+			best = c
+		}
+	}
+	return best
+}
+
+// selectBestAudio picks the DASH audio stream with the highest bandwidth.
+func selectBestAudio(candidates []rawDashAudio) *rawDashAudio {
+	if len(candidates) == 0 {
+		return nil
+	}
+	best := &candidates[0]
+	for i := 1; i < len(candidates); i++ {
+		if candidates[i].Bandwidth > best.Bandwidth {
+			best = &candidates[i]
+		}
+	}
+	return best
+}
+
+// qualityNameMap is a fallback mapping when support_formats is unavailable.
+var qualityNameMap = map[int]string{
+	127: "8K",
+	126: "杜比视界",
+	125: "HDR",
+	120: "4K",
+	116: "1080P60",
+	112: "1080P+",
+	80:  "1080P",
+	74:  "720P60",
+	64:  "720P",
+	32:  "480P",
+	16:  "360P",
+}
+
+// buildQualityName resolves a quality name from support_formats first, then API/fallback maps.
+func buildQualityName(q int, supportFormats []supportFormatEntry, acceptDesc string) string {
+	for _, sf := range supportFormats {
+		if sf.Quality == q {
+			name := selectString(sf.NewDescription, sf.DisplayDesc, sf.Format)
+			if sf.Superscript != "" {
+				if name != "" {
+					name += " " + sf.Superscript
+				} else {
+					name = sf.Superscript
+				}
+			}
+			if name != "" {
+				return name
+			}
+			break
+		}
+	}
+	if acceptDesc != "" {
+		return acceptDesc
+	}
+	if name, ok := qualityNameMap[q]; ok {
+		return name
+	}
+	return fmt.Sprintf("未知(%d)", q)
+}
+
 // getStreamInfo fetches available stream URLs and qualities for a video part.
-// This is an internal method that calls the Bilibili playurl API.
+// It selects the best codec per quality (AV1 > HEVC > H.264), the highest-bandwidth
+// audio track, and collects backup CDN URLs for resilience.
 //
 // API: GET https://api.bilibili.com/x/player/playurl
-//
-// Request Parameters:
-//   - bvid: Video BV ID (e.g., "BV1xx411c7mD")
-//   - cid:  Content ID for the specific part
-//   - fnval: Video stream format flags (bitwise OR):
-//   - 1:    MP4 format (legacy)
-//   - 16:   DASH format (modern, separate video/audio streams)
-//   - 64:   Require HDR video
-//   - 128:  Require 4K video
-//   - 256:  Require Dolby Audio
-//   - 512:  Require Dolby Vision
-//   - 1024: Require 8K video
-//   - 2048: Require AV1 codec
-//     Value 4048 = 16|64|128|256|512|1024|2048 (request all high-quality formats)
-//   - fnver: Format version, always 0
-//   - fourk: Enable 4K quality (1=enable, 0=disable)
-//
-// Quality (qn) values returned in response:
-//   - 127: 8K Ultra HD
-//   - 126: Dolby Vision
-//   - 125: HDR True Color
-//   - 120: 4K Ultra HD (requires VIP)
-//   - 116: 1080P60 High Frame Rate (requires VIP)
-//   - 112: 1080P+ High Bitrate (requires VIP)
-//   - 80:  1080P Full HD
-//   - 74:  720P60 High Frame Rate
-//   - 64:  720P HD
-//   - 32:  480P Standard Definition
-//   - 16:  360P Low Definition
 func (bd *BilibiliDownloader) getStreamInfo(bvid string, _ int64, cid int64, duration int) ([]BilibiliStream, error) {
-	// Play URL API - fnval=4048 requests DASH format with all quality options
 	apiURL := fmt.Sprintf("https://api.bilibili.com/x/player/playurl?bvid=%s&cid=%d&fnval=4048&fnver=0&fourk=1", bvid, cid)
 
 	req, err := http.NewRequest("GET", apiURL, nil)
@@ -188,21 +338,13 @@ func (bd *BilibiliDownloader) getStreamInfo(bvid string, _ int64, cid int64, dur
 	var result struct {
 		Code int `json:"code"`
 		Data struct {
-			Quality       int      `json:"quality"`
-			AcceptQuality []int    `json:"accept_quality"`
-			AcceptDesc    []string `json:"accept_description"`
-			Dash          struct {
-				Video []struct {
-					ID        int    `json:"id"`
-					BaseURL   string `json:"baseUrl"`
-					Bandwidth int64  `json:"bandwidth"`
-					Codecs    string `json:"codecs"`
-				} `json:"video"`
-				Audio []struct {
-					ID        int    `json:"id"`
-					BaseURL   string `json:"baseUrl"`
-					Bandwidth int64  `json:"bandwidth"`
-				} `json:"audio"`
+			Quality        int                  `json:"quality"`
+			AcceptQuality  []int                `json:"accept_quality"`
+			AcceptDesc     []string             `json:"accept_description"`
+			SupportFormats []supportFormatEntry `json:"support_formats"`
+			Dash           struct {
+				Video []rawDashVideo `json:"video"`
+				Audio []rawDashAudio `json:"audio"`
 			} `json:"dash"`
 		} `json:"data"`
 	}
@@ -215,64 +357,79 @@ func (bd *BilibiliDownloader) getStreamInfo(bvid string, _ int64, cid int64, dur
 		return nil, fmt.Errorf("failed to get stream info")
 	}
 
-	qualityNames := map[int]string{
-		127: "8K",
-		126: "杜比视界",
-		125: "HDR",
-		120: "4K",
-		116: "1080P60",
-		112: "1080P+",
-		80:  "1080P",
-		74:  "720P60",
-		64:  "720P",
-		32:  "480P",
-		16:  "360P",
+	// Select best audio track (highest bandwidth)
+	bestAudio := selectBestAudio(result.Data.Dash.Audio)
+	var audioBandwidth int64
+	var audioURL string
+	var audioBackupURLs []string
+	if bestAudio != nil {
+		audioBandwidth = bestAudio.Bandwidth
+		audioURL, audioBackupURLs = selectURLs(
+			bestAudio.BaseURL, bestAudio.BaseURLSnake,
+			bestAudio.BackupURL, bestAudio.BackupURLSnake,
+		)
 	}
+
+	// Build support_formats lookup for quality names
+	supportFormats := result.Data.SupportFormats
 
 	var streams []BilibiliStream
 
-	// Get best audio bandwidth for size estimation
-	var audioBandwidth int64
-	if len(result.Data.Dash.Audio) > 0 {
-		audioBandwidth = result.Data.Dash.Audio[0].Bandwidth
-	}
-
-	// Create stream entries for each quality
 	for i, q := range result.Data.AcceptQuality {
-		stream := BilibiliStream{
-			Quality:     q,
-			QualityName: qualityNames[q],
-			Format:      "dash",
-		}
-
+		acceptDesc := ""
 		if i < len(result.Data.AcceptDesc) {
-			stream.QualityName = result.Data.AcceptDesc[i]
+			acceptDesc = result.Data.AcceptDesc[i]
 		}
 
-		// Find matching video stream
-		var videoBandwidth int64
+		// Collect all video streams for this quality across codecs
+		var candidates []rawDashVideo
 		for _, v := range result.Data.Dash.Video {
 			if v.ID == q {
-				stream.VideoURL = v.BaseURL
-				videoBandwidth = v.Bandwidth
-				break
+				candidates = append(candidates, v)
 			}
 		}
+		if len(candidates) == 0 {
+			continue
+		}
 
-		// Get first audio stream
-		if len(result.Data.Dash.Audio) > 0 {
-			stream.AudioURL = result.Data.Dash.Audio[0].BaseURL
+		best := selectBestVideoStream(candidates)
+		if best == nil {
+			continue
+		}
+
+		videoURL, videoBackupURLs := selectURLs(
+			best.BaseURL, best.BaseURLSnake,
+			best.BackupURL, best.BackupURLSnake,
+		)
+		if videoURL == "" {
+			continue
+		}
+
+		frameRate := selectString(best.FrameRate, best.FrameRateSnake)
+		mimeType := selectString(best.MimeType, best.MimeTypeSnake)
+
+		stream := BilibiliStream{
+			Quality:         q,
+			QualityName:     buildQualityName(q, supportFormats, acceptDesc),
+			Format:          "dash",
+			VideoURL:        videoURL,
+			AudioURL:        audioURL,
+			Width:           best.Width,
+			Height:          best.Height,
+			FrameRate:       frameRate,
+			Codecs:          best.Codecs,
+			CodecID:         best.CodecID,
+			MimeType:        mimeType,
+			BackupURLs:      videoBackupURLs,
+			AudioBackupURLs: audioBackupURLs,
 		}
 
 		// Estimate file size: (video_bandwidth + audio_bandwidth) * duration / 8
-		// bandwidth is in bits per second, duration is in seconds
-		if duration > 0 && videoBandwidth > 0 {
-			stream.Size = (videoBandwidth + audioBandwidth) * int64(duration) / 8
+		if duration > 0 && best.Bandwidth > 0 {
+			stream.Size = (best.Bandwidth + audioBandwidth) * int64(duration) / 8
 		}
 
-		if stream.VideoURL != "" {
-			streams = append(streams, stream)
-		}
+		streams = append(streams, stream)
 	}
 
 	return streams, nil

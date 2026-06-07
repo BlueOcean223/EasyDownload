@@ -292,8 +292,8 @@ func (bd *BilibiliDownloader) downloadCore(
 	logger.Debug("Using output path: %s, base path: %s", outputPath, basePath)
 
 	// 处理旧格式（无音频）
-	if stream.AudioURL == "" {
-		return bd.downloadFileWithContext(ctx, stream.VideoURL, outputPath, 0, onProgress)
+	if stream.AudioURL == "" && len(stream.AudioBackupURLs) == 0 {
+		return bd.downloadFileWithFallback(ctx, stream.VideoURL, stream.BackupURLs, outputPath, 0, onProgress)
 	}
 
 	// DASH 格式 - 需要分别下载视频和音频，然后合并
@@ -303,9 +303,9 @@ func (bd *BilibiliDownloader) downloadCore(
 	}
 	logger.Debug("Using DASH format, will merge video and audio")
 
-	// 获取内容长度以进行精确的进度计算
-	videoSize, _ := bd.getContentLength(stream.VideoURL)
-	audioSize, _ := bd.getContentLength(stream.AudioURL)
+	// 获取内容长度以进行精确的进度计算；主 URL 获取失败时尝试备用 URL
+	videoSize := bd.getContentLengthWithFallback(stream.VideoURL, stream.BackupURLs)
+	audioSize := bd.getContentLengthWithFallback(stream.AudioURL, stream.AudioBackupURLs)
 	logger.Debug("Video size: %d, Audio size: %d", videoSize, audioSize)
 
 	// 通知调用者总文件大小
@@ -331,8 +331,8 @@ func (bd *BilibiliDownloader) downloadCore(
 	}
 
 	// 下载视频
-	logger.Debug("Downloading video stream to: %s", videoPath)
-	if _, err := bd.downloadFileWithContext(ctx, stream.VideoURL, videoPath, videoSize, func(p float64) {
+	logger.Debug("Downloading video stream to: %s (backups: %d)", videoPath, len(stream.BackupURLs))
+	if _, err := bd.downloadFileWithFallback(ctx, stream.VideoURL, stream.BackupURLs, videoPath, videoSize, func(p float64) {
 		tracker.UpdateVideoProgress(p)
 	}); err != nil {
 		// 如果上下文被取消（暂停/取消），保留临时文件以便恢复
@@ -354,8 +354,8 @@ func (bd *BilibiliDownloader) downloadCore(
 	}
 
 	// 下载音频
-	logger.Debug("Downloading audio stream to: %s", audioPath)
-	if _, err := bd.downloadFileWithContext(ctx, stream.AudioURL, audioPath, audioSize, func(p float64) {
+	logger.Debug("Downloading audio stream to: %s (backups: %d)", audioPath, len(stream.AudioBackupURLs))
+	if _, err := bd.downloadFileWithFallback(ctx, stream.AudioURL, stream.AudioBackupURLs, audioPath, audioSize, func(p float64) {
 		tracker.UpdateAudioProgress(p)
 	}); err != nil {
 		// 如果上下文被取消（暂停/取消），保留临时文件以便恢复

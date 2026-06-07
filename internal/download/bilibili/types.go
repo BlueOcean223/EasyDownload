@@ -45,12 +45,20 @@ type BilibiliPart struct {
 //   - 32:  480P Standard Definition
 //   - 16:  360P Low Definition
 type BilibiliStream struct {
-	Quality     int    `json:"quality"`     // Quality ID (qn value), higher means better quality
-	QualityName string `json:"qualityName"` // Human-readable quality name (e.g., "1080P", "4K")
-	Format      string `json:"format"`      // Stream format, typically "dash" for modern videos
-	Size        int64  `json:"size"`        // Estimated file size in bytes (video + audio)
-	VideoURL    string `json:"videoUrl"`    // Direct URL to video stream (m4s format for DASH)
-	AudioURL    string `json:"audioUrl"`    // Direct URL to audio stream (m4s format for DASH)
+	Quality         int      `json:"quality"`         // Quality ID (qn value), higher means better quality
+	QualityName     string   `json:"qualityName"`     // Human-readable quality name (e.g., "1080P", "4K")
+	Format          string   `json:"format"`          // Stream format, typically "dash" for modern videos
+	Size            int64    `json:"size"`            // Estimated file size in bytes (video + audio)
+	VideoURL        string   `json:"videoUrl"`        // Direct URL to video stream (m4s format for DASH)
+	AudioURL        string   `json:"audioUrl"`        // Direct URL to audio stream (m4s format for DASH)
+	Width           int      `json:"width"`           // Video width in pixels
+	Height          int      `json:"height"`          // Video height in pixels
+	FrameRate       string   `json:"frameRate"`       // Frame rate, e.g. "30.000", "29.412"
+	Codecs          string   `json:"codecs"`          // Codec string, e.g. "avc1.640033", "hev1.1.6.L120.90"
+	CodecID         int      `json:"codecId"`         // Codec ID: 7=H.264, 12=HEVC, 13=AV1
+	MimeType        string   `json:"mimeType"`        // MIME type, e.g. "video/mp4"
+	BackupURLs      []string `json:"backupUrls"`      // Fallback CDN URLs for video stream
+	AudioBackupURLs []string `json:"audioBackupUrls"` // Fallback CDN URLs for audio stream
 }
 
 // FFmpegManagerInterface defines the interface for FFmpeg management.

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strings"
 )
 
 const bilibiliUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -29,7 +30,30 @@ func (bd *BilibiliDownloader) getContentLength(url string) (int64, error) {
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return 0, fmt.Errorf("unexpected status while fetching content length: %s", resp.Status)
+	}
+	if resp.ContentLength <= 0 {
+		return 0, fmt.Errorf("content length unavailable")
+	}
+
 	return resp.ContentLength, nil
+}
+
+// getContentLengthWithFallback fetches content length from the primary URL first,
+// then tries backup URLs until a valid content length is available.
+func (bd *BilibiliDownloader) getContentLengthWithFallback(primaryURL string, backupURLs []string) int64 {
+	urls := collectDownloadURLs(primaryURL, backupURLs)
+	for i, url := range urls {
+		size, err := bd.getContentLength(url)
+		if err == nil && size > 0 {
+			return size
+		}
+		if err != nil {
+			logger.Debug("Failed to get content length for URL %d/%d: %v", i+1, len(urls), err)
+		}
+	}
+	return 0
 }
 
 // downloadFileWithContext downloads a file with cancellation and resume support.
@@ -167,6 +191,57 @@ func (bd *BilibiliDownloader) downloadFileSequential(ctx context.Context, url, p
 		onProgress(float64(downloaded) / float64(total) * 100)
 	}
 	return path, nil
+}
+
+// collectDownloadURLs builds an ordered, de-duplicated list of candidate download URLs.
+func collectDownloadURLs(primaryURL string, backupURLs []string) []string {
+	urls := make([]string, 0, 1+len(backupURLs))
+	seen := make(map[string]struct{}, 1+len(backupURLs))
+	add := func(url string) {
+		url = strings.TrimSpace(url)
+		if url == "" {
+			return
+		}
+		if _, ok := seen[url]; ok {
+			return
+		}
+		seen[url] = struct{}{}
+		urls = append(urls, url)
+	}
+
+	add(primaryURL)
+	for _, url := range backupURLs {
+		add(url)
+	}
+	return urls
+}
+
+// downloadFileWithFallback downloads a file, trying primary URL first then fallback URLs.
+// It uses the same download strategy as downloadFileWithContext but iterates over backup URLs
+// when the primary fails. Returns the final path and any error.
+func (bd *BilibiliDownloader) downloadFileWithFallback(ctx context.Context, primaryURL string, backupURLs []string, path string, knownSize int64, onProgress func(float64)) (string, error) {
+	urls := collectDownloadURLs(primaryURL, backupURLs)
+	if len(urls) == 0 {
+		return "", fmt.Errorf("no download URL available")
+	}
+
+	var lastErr error
+	for i, url := range urls {
+		if i > 0 {
+			logger.Info("Download URL failed, trying fallback URL %d/%d: %s", i, len(urls)-1, url[:min(60, len(url))])
+		}
+		result, err := bd.downloadFileWithContext(ctx, url, path, knownSize, onProgress)
+		if err == nil {
+			return result, nil
+		}
+		// If cancelled, don't retry
+		if ctx.Err() != nil {
+			return "", err
+		}
+		lastErr = err
+		logger.Debug("Download failed for URL %d: %v", i+1, err)
+	}
+	return "", fmt.Errorf("all download URLs failed: %w", lastErr)
 }
 
 // setHeaders sets common HTTP headers required for Bilibili API requests.
