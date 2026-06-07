@@ -131,6 +131,16 @@ func TestIsBilibiliURL(t *testing.T) {
 			want:  false,
 		},
 		{
+			name:  "lookalike domain",
+			input: "https://bilibili.com.evil.example/video/BV1xx411c7mD",
+			want:  false,
+		},
+		{
+			name:  "schemeless host",
+			input: "www.bilibili.com/video/BV1xx411c7mD",
+			want:  true,
+		},
+		{
 			name: "empty",
 		},
 	}

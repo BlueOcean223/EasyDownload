@@ -105,6 +105,10 @@ func TestParseInvalidInput(t *testing.T) {
 	if _, err := parser.parseURL("https://example.com/video/123", 0); !errors.Is(err, ErrInvalidDouyinURL) {
 		t.Fatalf("expected ErrInvalidDouyinURL, got %v", err)
 	}
+
+	if _, err := parser.Parse("https://douyin.com.evil.example/video/123456"); !errors.Is(err, ErrNoDouyinURL) {
+		t.Fatalf("expected ErrNoDouyinURL for lookalike domain, got %v", err)
+	}
 }
 
 func TestShortLinkMissingLocation(t *testing.T) {

@@ -32,6 +32,11 @@ func TestExtractStableURLParams(t *testing.T) {
 	if got != want {
 		t.Fatalf("expected %q, got %q", want, got)
 	}
+
+	evil := "https://finder.video.qq.com.evil.example/123/stodownload?encfilekey=key123&m=mmm"
+	if got := ExtractStableURLParams(evil); got != evil {
+		t.Fatalf("lookalike host should be left unchanged, got %q", got)
+	}
 }
 
 func TestCanonicalKeyForVideo(t *testing.T) {
@@ -56,6 +61,7 @@ func TestIsValidVODURL(t *testing.T) {
 		{"https://finder.video.qq.com/123/other?encfilekey=key123&m=mmm", false},
 		{"https://finder.video.qq.com/123/stodownload?m=mmm", false},
 		{"https://finder.video.qq.com/123/stodownload?encfilekey=key123&m=mmm", true},
+		{"https://finder.video.qq.com.evil.example/123/stodownload?m=mmm", true},
 	}
 
 	for _, tc := range cases {

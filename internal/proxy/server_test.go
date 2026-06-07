@@ -12,6 +12,28 @@ import (
 // For any video streaming domain (finder.video.qq.com, findermp.video.qq.com, szextshort.weixin.qq.com),
 // that domain should NOT appear in the MITM configuration list.
 // This ensures video streaming domains pass through directly without MITM to avoid slow video loading.
+func TestHostMatchesDomain(t *testing.T) {
+	cases := []struct {
+		name   string
+		host   string
+		domain string
+		want   bool
+	}{
+		{"exact", "finder.video.qq.com", "finder.video.qq.com", true},
+		{"subdomain", "a.finder.video.qq.com", "finder.video.qq.com", true},
+		{"with port", "finder.video.qq.com:443", "finder.video.qq.com", true},
+		{"lookalike", "finder.video.qq.com.evil.example", "finder.video.qq.com", false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := hostMatchesDomain(tc.host, tc.domain); got != tc.want {
+				t.Fatalf("hostMatchesDomain(%q, %q) = %v, want %v", tc.host, tc.domain, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestMITMDomainConfigurationProperty(t *testing.T) {
 	parameters := gopter.DefaultTestParameters()
 	parameters.MinSuccessfulTests = 100

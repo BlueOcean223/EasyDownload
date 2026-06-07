@@ -2,6 +2,7 @@ package bilibili
 
 import (
 	"fmt"
+	"net/url"
 	"regexp"
 	"strings"
 )
@@ -40,8 +41,32 @@ func (bd *BilibiliDownloader) ParseURLMust(url string) string {
 	return bvid
 }
 
-// IsBilibiliURL checks if a URL is a Bilibili video URL.
-// Returns true for URLs containing "bilibili.com" or "b23.tv" (short link domain).
-func IsBilibiliURL(url string) bool {
-	return strings.Contains(url, "bilibili.com") || strings.Contains(url, "b23.tv")
+// IsBilibiliURL checks if a URL belongs to a Bilibili or b23 short-link domain.
+func IsBilibiliURL(raw string) bool {
+	host := parsedHostname(raw)
+	return isDomainOrSubdomain(host, "bilibili.com") || isDomainOrSubdomain(host, "b23.tv")
+}
+
+func parsedHostname(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	if u.Hostname() == "" && !strings.Contains(raw, "://") {
+		u, err = url.Parse("//" + raw)
+		if err != nil {
+			return ""
+		}
+	}
+	return strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
+}
+
+func isDomainOrSubdomain(host, domain string) bool {
+	host = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
+	domain = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(domain), "."))
+	return host == domain || strings.HasSuffix(host, "."+domain)
 }

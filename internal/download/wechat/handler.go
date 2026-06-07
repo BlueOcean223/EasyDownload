@@ -4,6 +4,7 @@ import (
 	"EasyDownload/internal/infra/logger"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -106,8 +107,8 @@ func (h *Handler) maybeProbeAndUpdateFileSize(videoInfo *VideoInfo) {
 		return
 	}
 
-	lu := strings.ToLower(strings.TrimSpace(videoInfo.URL))
-	if !strings.Contains(lu, "finder.video.qq.com") && !strings.Contains(lu, "findermp.video.qq.com") {
+	parsedURL, err := url.Parse(strings.TrimSpace(videoInfo.URL))
+	if err != nil || !isFinderVideoHost(parsedURL.Hostname()) {
 		return
 	}
 

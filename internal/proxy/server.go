@@ -322,7 +322,7 @@ func (ps *ProxyServer) setupHandlers() {
 	ps.proxy.OnRequest().HandleConnectFunc(func(host string, ctx *goproxy.ProxyCtx) (*goproxy.ConnectAction, string) {
 		// Check if this is a video streaming domain that should pass through
 		for _, domain := range PassThroughDomains() {
-			if strings.Contains(host, domain) {
+			if hostMatchesDomain(host, domain) {
 				if ps.debug {
 					logger.Info("[proxy-debug] CONNECT pass-through (no MITM): %s", host)
 				}
@@ -339,6 +339,16 @@ func (ps *ProxyServer) setupHandlers() {
 
 	// Set up WeChat-specific handlers
 	ps.setupWeChatHandlers()
+}
+
+func hostMatchesDomain(host, domain string) bool {
+	host = strings.TrimSpace(strings.ToLower(host))
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	host = strings.TrimSuffix(host, ".")
+	domain = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(domain)), ".")
+	return host == domain || strings.HasSuffix(host, "."+domain)
 }
 
 // readResponseBody reads and (if possible) decompresses the response body.

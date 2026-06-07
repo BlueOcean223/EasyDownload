@@ -156,7 +156,7 @@ func (p *Parser) parseURL(raw string, depth int) (string, error) {
 	}
 
 	// Verify this is a Douyin domain before attempting to extract aweme_id.
-	if !strings.Contains(hostname, "douyin.com") {
+	if !isDouyinContentDomain(hostname) {
 		return "", ErrInvalidDouyinURL
 	}
 
@@ -253,16 +253,25 @@ func (p *Parser) extractShareURL(input string) (string, error) {
 }
 
 // isAcceptableHost checks if a hostname is valid for Douyin content.
-// Accepts any domain containing "douyin.com" or known short-link domains.
 func (p *Parser) isAcceptableHost(host string) bool {
-	host = strings.ToLower(host)
+	host = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
 	if host == "" {
 		return false
 	}
-	if strings.Contains(host, "douyin.com") {
+	if isDouyinContentDomain(host) {
 		return true
 	}
 	return p.isShortDomain(host)
+}
+
+func isDouyinContentDomain(host string) bool {
+	return domainMatches(host, "douyin.com") || domainMatches(host, "iesdouyin.com")
+}
+
+func domainMatches(host, domain string) bool {
+	host = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
+	domain = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(domain), "."))
+	return host == domain || strings.HasSuffix(host, "."+domain)
 }
 
 // looksLikeURL performs a quick check if a string appears to be a URL.

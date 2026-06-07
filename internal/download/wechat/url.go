@@ -92,9 +92,8 @@ func ExtractStableURLParams(videoURL string) string {
 		return videoURL
 	}
 
-	host := strings.ToLower(parsed.Host)
-	// Only process WeChat finder download hosts
-	if !strings.Contains(host, "finder.video.qq.com") && !strings.Contains(host, "findermp.video.qq.com") {
+	// Only process WeChat finder download hosts.
+	if !isFinderVideoHost(parsed.Hostname()) {
 		return videoURL
 	}
 
@@ -161,9 +160,8 @@ func IsValidVODURL(raw string) (bool, string) {
 	// Validate WeChat-specific URL requirements
 	pu, err := url.Parse(raw)
 	if err == nil {
-		host := strings.ToLower(pu.Host)
 		// WeChat video finder URLs must have specific path and parameters
-		if strings.Contains(host, "finder.video.qq.com") || strings.Contains(host, "findermp.video.qq.com") {
+		if isFinderVideoHost(pu.Hostname()) {
 			// Must be a storage download URL, not a streaming endpoint
 			if !strings.Contains(lu, "stodownload") {
 				return false, "not stodownload"
@@ -175,4 +173,10 @@ func IsValidVODURL(raw string) (bool, string) {
 		}
 	}
 	return true, ""
+}
+
+func isFinderVideoHost(host string) bool {
+	host = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
+	return host == "finder.video.qq.com" || strings.HasSuffix(host, ".finder.video.qq.com") ||
+		host == "findermp.video.qq.com" || strings.HasSuffix(host, ".findermp.video.qq.com")
 }
