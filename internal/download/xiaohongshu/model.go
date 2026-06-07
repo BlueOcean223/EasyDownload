@@ -25,16 +25,40 @@ type XHSItem struct {
 	AuthorAvatar string
 	Timestamp    int64
 
+	IPLocation   string
+	Tags         []XHSTag
+	InteractInfo XHSInteractInfo
+
 	Streams []XHSStream
 	Images  []XHSImage
 }
 
+// XHSTag represents a topic/tag attached to a note.
+type XHSTag struct {
+	ID   string
+	Name string
+	Type string
+}
+
+// XHSInteractInfo contains interaction counters exposed by the note page.
+// Counts are kept as strings because XiaoHongShu may return compact values such as "1万+".
+type XHSInteractInfo struct {
+	LikedCount     string
+	CollectedCount string
+	CommentCount   string
+	ShareCount     string
+}
+
 // XHSImage represents an image in an album.
 type XHSImage struct {
-	URL     string
-	Width   int
-	Height  int
-	TraceId string
+	URL          string
+	BackupURLs   []string
+	Width        int
+	Height       int
+	TraceId      string
+	FileID       string
+	LivePhoto    bool
+	LivePhotoURL string
 }
 
 // XHSStream represents a downloadable video stream.
@@ -44,8 +68,22 @@ type XHSStream struct {
 	Width       int
 	Height      int
 	URL         string
+	BackupURLs  []string
 	Size        int64
 	Format      string
+
+	FPS           int
+	VideoCodec    string
+	VideoBitrate  int64
+	AudioCodec    string
+	AudioBitrate  int64
+	StreamDesc    string
+	StreamType    int
+	Weight        int
+	Duration      int64
+	DefaultStream int
+	HDRType       int
+	Rotate        int
 }
 
 // IsAlbum returns true if this item is an image album.

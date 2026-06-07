@@ -12,6 +12,8 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -272,6 +274,9 @@ func buildItemFromNote(noteID string, noteObj map[string]any) *XHSItem {
 	item.Title = firstNonEmpty(getString(noteObj, "title"), getString(noteObj, "desc"))
 	item.Desc = strings.TrimSpace(getString(noteObj, "desc"))
 	item.Timestamp = firstNonZeroInt64(getInt64(noteObj, "time"), getInt64(noteObj, "lastUpdateTime"))
+	item.IPLocation = getString(noteObj, "ipLocation")
+	item.Tags = parseTags(noteObj["tagList"])
+	item.InteractInfo = parseInteractInfo(getMap(noteObj, "interactInfo"))
 
 	if user := getMap(noteObj, "user"); user != nil {
 		item.Author = getString(user, "nickname")
@@ -380,16 +385,21 @@ func parseImages(noteObj map[string]any) []XHSImage {
 		if !ok {
 			continue
 		}
-		u := firstNonEmpty(
+		urls := collectDownloadURLs(
 			getString(m, "urlDefault"),
-			getString(m, "urlPre"),
-			getString(m, "url"),
-			firstURLFromInfoList(m["infoList"]),
+			append([]string{getString(m, "urlPre"), getString(m, "url")}, urlsFromInfoList(m["infoList"])...),
 		)
-		if u == "" {
+		if len(urls) == 0 {
 			continue
 		}
-		img := XHSImage{URL: u, TraceId: getString(m, "traceId")}
+		img := XHSImage{
+			URL:          urls[0],
+			BackupURLs:   urls[1:],
+			TraceId:      getString(m, "traceId"),
+			FileID:       firstNonEmpty(getString(m, "fileId"), getString(m, "fileID")),
+			LivePhoto:    getBool(m, "livePhoto"),
+			LivePhotoURL: firstMediaURL(m["stream"]),
+		}
 		if w, ok := m["width"].(float64); ok {
 			img.Width = int(w)
 		}
@@ -399,6 +409,11 @@ func parseImages(noteObj map[string]any) []XHSImage {
 		out = append(out, img)
 	}
 	return out
+}
+
+type rawStreamCandidate struct {
+	data      map[string]any
+	codecHint string
 }
 
 func parseVideoStreams(noteObj map[string]any) []XHSStream {
@@ -415,21 +430,21 @@ func parseVideoStreams(noteObj map[string]any) []XHSStream {
 		return nil
 	}
 
-	candidates := make([]map[string]any, 0, 8)
+	candidates := make([]rawStreamCandidate, 0, 8)
 
 	// Old schema: stream is an array.
 	if streamList, ok := streamAny.([]any); ok {
 		for _, el := range streamList {
 			m, ok := el.(map[string]any)
 			if ok {
-				candidates = append(candidates, m)
+				candidates = append(candidates, rawStreamCandidate{data: m})
 			}
 		}
 	}
 
 	// New schema: stream is an object keyed by codec (e.g. h264/h265/av1).
 	if streamMap, ok := streamAny.(map[string]any); ok {
-		for _, codecAny := range streamMap {
+		for codecKey, codecAny := range streamMap {
 			list, ok := codecAny.([]any)
 			if !ok {
 				continue
@@ -437,7 +452,7 @@ func parseVideoStreams(noteObj map[string]any) []XHSStream {
 			for _, el := range list {
 				m, ok := el.(map[string]any)
 				if ok {
-					candidates = append(candidates, m)
+					candidates = append(candidates, rawStreamCandidate{data: m, codecHint: codecKey})
 				}
 			}
 		}
@@ -448,8 +463,8 @@ func parseVideoStreams(noteObj map[string]any) []XHSStream {
 	}
 
 	bestByKey := make(map[string]XHSStream)
-	for _, m := range candidates {
-		stream, ok := parseStreamCandidate(m)
+	for _, candidate := range candidates {
+		stream, ok := parseStreamCandidate(candidate.data, candidate.codecHint)
 		if !ok {
 			continue
 		}
@@ -545,6 +560,55 @@ func getString(m map[string]any, key string) string {
 	return strings.TrimSpace(s)
 }
 
+func getStringValue(m map[string]any, key string) string {
+	if m == nil {
+		return ""
+	}
+	v, ok := m[key]
+	if !ok || v == nil {
+		return ""
+	}
+	switch n := v.(type) {
+	case string:
+		return strings.TrimSpace(n)
+	case int:
+		return fmt.Sprintf("%d", n)
+	case int64:
+		return fmt.Sprintf("%d", n)
+	case float64:
+		if n == float64(int64(n)) {
+			return fmt.Sprintf("%d", int64(n))
+		}
+		return strings.TrimRight(strings.TrimRight(fmt.Sprintf("%f", n), "0"), ".")
+	case json.Number:
+		return n.String()
+	}
+	return ""
+}
+
+func getBool(m map[string]any, key string) bool {
+	if m == nil {
+		return false
+	}
+	v, ok := m[key]
+	if !ok || v == nil {
+		return false
+	}
+	switch b := v.(type) {
+	case bool:
+		return b
+	case string:
+		return strings.EqualFold(strings.TrimSpace(b), "true") || strings.TrimSpace(b) == "1"
+	case float64:
+		return b != 0
+	case int:
+		return b != 0
+	case int64:
+		return b != 0
+	}
+	return false
+}
+
 func getInt64(m map[string]any, key string) int64 {
 	if m == nil {
 		return 0
@@ -560,9 +624,23 @@ func getInt64(m map[string]any, key string) int64 {
 		return int64(n)
 	case float64:
 		return int64(n)
+	case string:
+		n = strings.TrimSpace(n)
+		if n == "" {
+			return 0
+		}
+		if i, err := strconv.ParseInt(n, 10, 64); err == nil {
+			return i
+		}
+		if f, err := strconv.ParseFloat(n, 64); err == nil {
+			return int64(f)
+		}
 	case json.Number:
 		if i, err := n.Int64(); err == nil {
 			return i
+		}
+		if f, err := n.Float64(); err == nil {
+			return int64(f)
 		}
 	}
 	return 0
@@ -577,20 +655,6 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
-func firstStringFromSlice(v any) string {
-	list, ok := v.([]any)
-	if !ok {
-		return ""
-	}
-	for _, el := range list {
-		s, ok := el.(string)
-		if ok && strings.TrimSpace(s) != "" {
-			return strings.TrimSpace(s)
-		}
-	}
-	return ""
-}
-
 func firstNonZeroInt64(values ...int64) int64 {
 	for _, v := range values {
 		if v != 0 {
@@ -600,62 +664,284 @@ func firstNonZeroInt64(values ...int64) int64 {
 	return 0
 }
 
-func firstURLFromInfoList(v any) string {
+func parseTags(v any) []XHSTag {
 	list, ok := v.([]any)
 	if !ok {
-		return ""
+		return nil
 	}
+	out := make([]XHSTag, 0, len(list))
+	for _, el := range list {
+		m, ok := el.(map[string]any)
+		if !ok {
+			continue
+		}
+		tag := XHSTag{
+			ID:   firstNonEmpty(getStringValue(m, "id"), getStringValue(m, "tagId"), getStringValue(m, "tagID")),
+			Name: firstNonEmpty(getStringValue(m, "name"), getStringValue(m, "tagName")),
+			Type: firstNonEmpty(getStringValue(m, "type"), getStringValue(m, "tagType")),
+		}
+		if tag.ID == "" && tag.Name == "" && tag.Type == "" {
+			continue
+		}
+		out = append(out, tag)
+	}
+	return out
+}
+
+func parseInteractInfo(m map[string]any) XHSInteractInfo {
+	if m == nil {
+		return XHSInteractInfo{}
+	}
+	return XHSInteractInfo{
+		LikedCount:     firstNonEmpty(getStringValue(m, "likedCount"), getStringValue(m, "likeCount")),
+		CollectedCount: firstNonEmpty(getStringValue(m, "collectedCount"), getStringValue(m, "collectCount")),
+		CommentCount:   getStringValue(m, "commentCount"),
+		ShareCount:     getStringValue(m, "shareCount"),
+	}
+}
+
+func urlsFromInfoList(v any) []string {
+	list, ok := v.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(list))
 	for _, el := range list {
 		m, ok := el.(map[string]any)
 		if !ok {
 			continue
 		}
 		if u := strings.TrimSpace(getString(m, "url")); u != "" {
-			return u
+			out = append(out, u)
+		}
+	}
+	return out
+}
+
+func firstMediaURL(v any) string {
+	switch x := v.(type) {
+	case string:
+		return strings.TrimSpace(x)
+	case []any:
+		for _, el := range x {
+			if u := firstMediaURL(el); u != "" {
+				return u
+			}
+		}
+	case map[string]any:
+		urls := collectDownloadURLs(firstNonEmpty(getString(x, "masterUrl"), getString(x, "url")), collectStringSlice(x["backupUrls"]))
+		if len(urls) > 0 {
+			return urls[0]
+		}
+
+		// Prefer known codec keys in a deterministic order; Go map iteration is random.
+		for _, key := range []string{"h265", "h264", "av1", "h266", "hevc", "avc"} {
+			if el, ok := x[key]; ok {
+				if u := firstMediaURL(el); u != "" {
+					return u
+				}
+			}
+		}
+
+		keys := make([]string, 0, len(x))
+		for key := range x {
+			switch key {
+			case "masterUrl", "url", "backupUrls", "h265", "h264", "av1", "h266", "hevc", "avc":
+				continue
+			}
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			if u := firstMediaURL(x[key]); u != "" {
+				return u
+			}
 		}
 	}
 	return ""
 }
 
-func parseStreamCandidate(m map[string]any) (XHSStream, bool) {
-	qualityName := firstNonEmpty(getString(m, "qualityType"), getString(m, "quality"))
-	qualityKey := strings.ToLower(strings.TrimSpace(qualityName))
-	u := getString(m, "masterUrl")
-	if u == "" {
-		u = firstStringFromSlice(m["backupUrls"])
+func collectStringSlice(v any) []string {
+	switch list := v.(type) {
+	case string:
+		if strings.TrimSpace(list) == "" {
+			return nil
+		}
+		return []string{strings.TrimSpace(list)}
+	case []string:
+		out := make([]string, 0, len(list))
+		for _, s := range list {
+			if strings.TrimSpace(s) != "" {
+				out = append(out, strings.TrimSpace(s))
+			}
+		}
+		return out
+	case []any:
+		out := make([]string, 0, len(list))
+		for _, el := range list {
+			if s, ok := el.(string); ok && strings.TrimSpace(s) != "" {
+				out = append(out, strings.TrimSpace(s))
+			}
+		}
+		return out
 	}
-	if strings.TrimSpace(u) == "" {
+	return nil
+}
+
+func collectDownloadURLs(primaryURL string, backupURLs []string) []string {
+	urls := make([]string, 0, 1+len(backupURLs))
+	seen := make(map[string]struct{}, 1+len(backupURLs))
+	add := func(raw string) {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			return
+		}
+		if _, ok := seen[raw]; ok {
+			return
+		}
+		seen[raw] = struct{}{}
+		urls = append(urls, raw)
+	}
+
+	add(primaryURL)
+	for _, raw := range backupURLs {
+		add(raw)
+	}
+	return urls
+}
+
+func parseStreamCandidate(m map[string]any, codecHint string) (XHSStream, bool) {
+	streamType := int(getInt64(m, "streamType"))
+	qualityName := firstNonEmpty(getString(m, "qualityType"), getString(m, "quality"))
+	if qualityName == "" && streamType > 0 {
+		qualityName = fmt.Sprintf("Stream %d", streamType)
+	}
+	qualityKey := buildStreamQualityKey(qualityName, streamType)
+
+	urls := collectDownloadURLs(getString(m, "masterUrl"), collectStringSlice(m["backupUrls"]))
+	if len(urls) == 0 {
 		return XHSStream{}, false
 	}
 
 	return XHSStream{
-		QualityKey:  firstNonEmpty(qualityKey, qualityName),
-		QualityName: qualityName,
-		Width:       int(getInt64(m, "width")),
-		Height:      int(getInt64(m, "height")),
-		URL:         strings.TrimSpace(u),
-		Size:        getInt64(m, "size"),
-		Format:      getString(m, "format"),
+		QualityKey:    qualityKey,
+		QualityName:   qualityName,
+		Width:         int(getInt64(m, "width")),
+		Height:        int(getInt64(m, "height")),
+		URL:           urls[0],
+		BackupURLs:    urls[1:],
+		Size:          getInt64(m, "size"),
+		Format:        getString(m, "format"),
+		FPS:           int(getInt64(m, "fps")),
+		VideoCodec:    firstNonEmpty(getString(m, "videoCodec"), codecHint),
+		VideoBitrate:  getInt64(m, "videoBitrate"),
+		AudioCodec:    getString(m, "audioCodec"),
+		AudioBitrate:  getInt64(m, "audioBitrate"),
+		StreamDesc:    getString(m, "streamDesc"),
+		StreamType:    streamType,
+		Weight:        int(getInt64(m, "weight")),
+		Duration:      getInt64(m, "duration"),
+		DefaultStream: int(getInt64(m, "defaultStream")),
+		HDRType:       int(getInt64(m, "hdrType")),
+		Rotate:        int(getInt64(m, "rotate")),
 	}, true
 }
 
+func buildStreamQualityKey(qualityName string, streamType int) string {
+	base := strings.ToLower(strings.TrimSpace(qualityName))
+	if streamType > 0 {
+		if base == "" || strings.HasPrefix(base, "stream ") {
+			return fmt.Sprintf("stream_%d", streamType)
+		}
+		base = strings.NewReplacer(" ", "_", "/", "_", "\\", "_", ":", "_").Replace(base)
+		return fmt.Sprintf("%s_%d", base, streamType)
+	}
+	return firstNonEmpty(base, qualityName)
+}
+
 func streamBetterThan(a, b XHSStream) bool {
+	if (strings.TrimSpace(a.URL) != "") != (strings.TrimSpace(b.URL) != "") {
+		return strings.TrimSpace(a.URL) != ""
+	}
+	if ar, br := streamCodecRank(a), streamCodecRank(b); ar != br {
+		return ar > br
+	}
+	if a.Weight != b.Weight {
+		return a.Weight > b.Weight
+	}
+	if ar, br := streamTypeRank(a.StreamType), streamTypeRank(b.StreamType); ar != br {
+		return ar > br
+	}
+	if a.DefaultStream != b.DefaultStream {
+		return a.DefaultStream > b.DefaultStream
+	}
 	aPixels := int64(a.Width) * int64(a.Height)
 	bPixels := int64(b.Width) * int64(b.Height)
 	if aPixels != bPixels {
 		return aPixels > bPixels
 	}
+	if a.VideoBitrate != b.VideoBitrate {
+		return a.VideoBitrate > b.VideoBitrate
+	}
 	if a.Size != b.Size {
 		return a.Size > b.Size
 	}
-	return a.URL != "" && b.URL == ""
+	if len(a.BackupURLs) != len(b.BackupURLs) {
+		return len(a.BackupURLs) > len(b.BackupURLs)
+	}
+	return false
+}
+
+func streamCodecRank(stream XHSStream) int {
+	if rank := codecRank(stream.VideoCodec); rank > 1 {
+		return rank
+	}
+	switch stream.StreamType {
+	case 114, 115:
+		return codecRank("h265")
+	case 259:
+		return codecRank("h264")
+	}
+	return 1
+}
+
+func codecRank(codec string) int {
+	switch normalizeCodec(codec) {
+	case "h265", "hevc":
+		return 4
+	case "h264", "avc":
+		return 3
+	case "av1", "h266", "vvc":
+		return 2
+	}
+	return 1
+}
+
+func normalizeCodec(codec string) string {
+	codec = strings.ToLower(strings.TrimSpace(codec))
+	codec = strings.ReplaceAll(codec, ".", "")
+	codec = strings.ReplaceAll(codec, "-", "")
+	codec = strings.ReplaceAll(codec, "_", "")
+	return codec
+}
+
+func streamTypeRank(streamType int) int {
+	switch streamType {
+	case 115:
+		return 300
+	case 114:
+		return 200
+	case 259:
+		return 100
+	}
+	return 0
 }
 
 func sortStreams(streams []XHSStream) {
 	if len(streams) < 2 {
 		return
 	}
-	// Simple in-place sort: larger resolution/size first.
+	// Keep the default stream first: efficient codec, official weight, then resolution.
 	for i := 0; i < len(streams)-1; i++ {
 		for j := i + 1; j < len(streams); j++ {
 			if streamBetterThan(streams[j], streams[i]) {
