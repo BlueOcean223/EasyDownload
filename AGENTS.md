@@ -9,6 +9,9 @@ Use `wails dev` to run the full app with Go + Vite hot reload. Use `wails build`
 ## Coding Style & Naming Conventions
 Format Go code with `gofmt`; keep packages lowercase and follow existing platform suffixes like `_windows.go`, `_darwin.go`, and `_other.go`. Keep Vue/TypeScript formatting consistent with the current codebase: 2-space indentation, no semicolons, and `@/` imports for `frontend/src`. Name Vue SFCs and reusable UI pieces in PascalCase (`WelcomeWizard.vue`), keep route/view names aligned with feature pages, and keep Pinia stores and utility modules concise and feature-focused.
 
+## Documentation Guidelines
+When changing platform parsing, metadata fetching, stream selection, or download behavior, update the corresponding docs in `docs/` (for example `docs/douyin-link-download-principle.md`) and any affected package documentation such as `internal/download/<platform>/doc.go`. Keep README usage text in sync for user-visible feature changes, and avoid editing generated output in `frontend/wailsjs/` or `frontend/dist/`.
+
 ## Testing Guidelines
 Backend tests are colocated with source and use Go `testing` plus `testify`; name them `*_test.go`. Frontend test support is wired through Vitest and `@vue/test-utils`; place new specs beside the component or in the relevant feature folder using `*.test.ts`. Run the narrowest affected test package before opening a PR, then finish with `go test ./...` and `cd frontend && npm run test && npm run typecheck`.
 
