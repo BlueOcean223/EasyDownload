@@ -4,9 +4,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
+
+const maxProxyImageSize = 20 * 1024 * 1024
 
 // ImageProxyHandler handles image proxy requests
 type ImageProxyHandler struct {
@@ -28,6 +31,9 @@ func (iph *ImageProxyHandler) ProxyImage(imageURL string) ([]byte, string, error
 	if imageURL == "" {
 		return nil, "", fmt.Errorf("image URL is empty")
 	}
+	if !isHTTPURL(imageURL) {
+		return nil, "", fmt.Errorf("unsupported image URL")
+	}
 
 	req, err := http.NewRequest(http.MethodGet, imageURL, nil)
 	if err != nil {
@@ -46,10 +52,16 @@ func (iph *ImageProxyHandler) ProxyImage(imageURL string) ([]byte, string, error
 	if resp.StatusCode != http.StatusOK {
 		return nil, "", fmt.Errorf("image request failed with status: %d", resp.StatusCode)
 	}
+	if resp.ContentLength > maxProxyImageSize {
+		return nil, "", fmt.Errorf("image too large")
+	}
 
-	data, err := io.ReadAll(resp.Body)
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxProxyImageSize+1))
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to read image data: %w", err)
+	}
+	if len(data) > maxProxyImageSize {
+		return nil, "", fmt.Errorf("image too large")
 	}
 
 	contentType := resp.Header.Get("Content-Type")
@@ -80,7 +92,12 @@ func (iph *ImageProxyHandler) SetBilibiliHeaders(req *http.Request) {
 }
 
 // isBilibiliURL checks if the URL is a Bilibili image URL
-func isBilibiliURL(url string) bool {
+func isBilibiliURL(raw string) bool {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
 	bilibiliDomains := []string{
 		"hdslb.com",
 		"bilibili.com",
@@ -89,11 +106,19 @@ func isBilibiliURL(url string) bool {
 	}
 
 	for _, domain := range bilibiliDomains {
-		if strings.Contains(url, domain) {
+		if host == domain || strings.HasSuffix(host, "."+domain) {
 			return true
 		}
 	}
 	return false
+}
+
+func isHTTPURL(raw string) bool {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return false
+	}
+	return (u.Scheme == "http" || u.Scheme == "https") && u.Hostname() != ""
 }
 
 // IsBilibiliURL is exported for testing purposes
