@@ -1,6 +1,9 @@
 package proxy
 
 import (
+	"bytes"
+	"io"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -31,6 +34,44 @@ func TestHostMatchesDomain(t *testing.T) {
 				t.Fatalf("hostMatchesDomain(%q, %q) = %v, want %v", tc.host, tc.domain, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestStrictMITMAllowlist(t *testing.T) {
+	if !shouldMITMHost("channels.weixin.qq.com:443") {
+		t.Fatal("expected WeChat page domain to be MITM'ed")
+	}
+	if shouldMITMHost("example.com:443") {
+		t.Fatal("non-allowlisted domain must pass through")
+	}
+	if shouldMITMHost("finder.video.qq.com:443") {
+		t.Fatal("video streaming domain must pass through")
+	}
+}
+
+func TestHTMLUnsupportedEncodingPreservesBody(t *testing.T) {
+	ps := NewProxyServer(nil, 0)
+	original := []byte("<html><body>unchanged</body></html>")
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header: http.Header{
+			"Content-Type":     []string{"text/html; charset=utf-8"},
+			"Content-Encoding": []string{"zstd"},
+		},
+		Body:          io.NopCloser(bytes.NewReader(original)),
+		ContentLength: int64(len(original)),
+	}
+
+	gotResp := ps.handleWeChatHTMLResponse(resp, nil)
+	got, err := io.ReadAll(gotResp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, original) {
+		t.Fatalf("body=%q, want %q", got, original)
+	}
+	if enc := gotResp.Header.Get("Content-Encoding"); enc != "zstd" {
+		t.Fatalf("Content-Encoding=%q, want zstd", enc)
 	}
 }
 

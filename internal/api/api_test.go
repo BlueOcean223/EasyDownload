@@ -36,6 +36,39 @@ func TestGetPort(t *testing.T) {
 	}
 }
 
+func TestInternalAPIAuthMiddleware(t *testing.T) {
+	api := NewInternalAPI(18899)
+
+	handler := api.authHandler(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	unauthorizedReq := httptest.NewRequest(http.MethodGet, "/api/videos", nil)
+	unauthorizedW := httptest.NewRecorder()
+	handler(unauthorizedW, unauthorizedReq)
+	if unauthorizedW.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized status=%d, want %d", unauthorizedW.Code, http.StatusUnauthorized)
+	}
+
+	authorizedReq := httptest.NewRequest(http.MethodGet, "/api/videos", nil)
+	authorizedReq.Header.Set("X-EasyDownload-Token", api.GetToken())
+	authorizedW := httptest.NewRecorder()
+	handler(authorizedW, authorizedReq)
+	if authorizedW.Code != http.StatusNoContent {
+		t.Fatalf("authorized status=%d, want %d", authorizedW.Code, http.StatusNoContent)
+	}
+}
+
+func TestInternalAPIAllowedOriginNoWildcard(t *testing.T) {
+	api := NewInternalAPI(18899)
+	if !api.isAllowedOrigin("http://127.0.0.1:34115") {
+		t.Fatal("localhost dev origin should be allowed")
+	}
+	if api.isAllowedOrigin("https://evil.example") {
+		t.Fatal("arbitrary origin should not be allowed")
+	}
+}
+
 // TestHandleHealth tests health endpoint
 func TestHandleHealth(t *testing.T) {
 	api := NewInternalAPI(18899)

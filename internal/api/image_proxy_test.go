@@ -23,9 +23,18 @@ func TestImageProxyRejectsOversizedImage(t *testing.T) {
 	defer ts.Close()
 
 	handler := NewImageProxyHandler()
+	handler.allowPrivateNetworks = true
 	_, _, err := handler.ProxyImage(ts.URL)
 	if err == nil {
 		t.Fatal("expected oversized image error")
+	}
+}
+
+func TestImageProxyRejectsLocalhostSSRF(t *testing.T) {
+	handler := NewImageProxyHandler()
+	_, _, err := handler.ProxyImage("http://127.0.0.1:8080/image.jpg")
+	if err == nil {
+		t.Fatal("expected localhost SSRF protection error")
 	}
 }
 

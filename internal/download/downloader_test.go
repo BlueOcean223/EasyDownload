@@ -1,9 +1,12 @@
 package downloader
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -739,5 +742,148 @@ func TestDecodeKeyStatePersistence(t *testing.T) {
 
 	if loadedDecodeKey != decodeKey {
 		t.Errorf("Loaded decodeKey = %s, want %s", loadedDecodeKey, decodeKey)
+	}
+}
+
+func waitForAtomicInt32(t *testing.T, value *atomic.Int32, want int32) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if value.Load() == want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("value=%d, want %d", value.Load(), want)
+}
+
+func TestStartTaskConcurrentSameIDStartsOnce(t *testing.T) {
+	dm := NewDownloadManager(t.TempDir(), 2)
+	var started atomic.Int32
+	release := make(chan struct{})
+	downloadFunc := func(ctx context.Context, task *DownloadTask, onProgress func(downloaded, total int64), onComplete func(outputPath string)) error {
+		started.Add(1)
+		select {
+		case <-release:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	_, err := dm.AddTaskWithDownloader("same", "http://example.com/video.mp4", "Same", "", "test", "", downloadFunc)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = dm.StartTask("same")
+		}()
+	}
+	wg.Wait()
+
+	waitForAtomicInt32(t, &started, 1)
+	close(release)
+}
+
+func TestStartTaskQueuesWhenMaxConcurrentReached(t *testing.T) {
+	dm := NewDownloadManager(t.TempDir(), 1)
+	var started atomic.Int32
+	firstRelease := make(chan struct{})
+	secondRelease := make(chan struct{})
+
+	makeFunc := func(release <-chan struct{}) DownloadFunc {
+		return func(ctx context.Context, task *DownloadTask, onProgress func(downloaded, total int64), onComplete func(outputPath string)) error {
+			started.Add(1)
+			select {
+			case <-release:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	}
+
+	if _, err := dm.AddTaskWithDownloader("t1", "http://example.com/1.mp4", "One", "", "test", "", makeFunc(firstRelease)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dm.AddTaskWithDownloader("t2", "http://example.com/2.mp4", "Two", "", "test", "", makeFunc(secondRelease)); err != nil {
+		t.Fatal(err)
+	}
+	if err := dm.StartTask("t1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := dm.StartTask("t2"); err != nil {
+		t.Fatalf("second task should be queued, got error: %v", err)
+	}
+
+	waitForAtomicInt32(t, &started, 1)
+	if got := dm.GetActiveTaskCount(); got != 1 {
+		t.Fatalf("active=%d, want 1", got)
+	}
+	if task, _ := dm.GetTask("t2"); task.GetStatus() != StatusPending {
+		t.Fatalf("queued task status=%s, want pending", task.GetStatus())
+	}
+
+	close(firstRelease)
+	waitForAtomicInt32(t, &started, 2)
+	close(secondRelease)
+}
+
+func TestAddTaskReservesFilenamesAcrossTasks(t *testing.T) {
+	dm := NewDownloadManager(t.TempDir(), 3)
+	first, err := dm.AddTask("a", "http://example.com/a.mp4", "Same Title", "", "test", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := dm.AddTask("b", "http://example.com/b.mp4", "Same Title", "", "test", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.FileName == second.FileName {
+		t.Fatalf("duplicate file names reserved: %s", first.FileName)
+	}
+}
+
+func TestCancelDoesNotBecomeCompletedWhenDownloaderIgnoresContext(t *testing.T) {
+	dm := NewDownloadManager(t.TempDir(), 1)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	downloadFunc := func(ctx context.Context, task *DownloadTask, onProgress func(downloaded, total int64), onComplete func(outputPath string)) error {
+		close(started)
+		<-release
+		return nil
+	}
+
+	_, err := dm.AddTaskWithDownloader("cancel-race", "http://example.com/video.mp4", "Race", "", "test", "", downloadFunc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dm.StartTask("cancel-race"); err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	if err := dm.CancelTask("cancel-race"); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if dm.GetActiveTaskCount() == 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	task, err := dm.GetTask("cancel-race")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := task.GetStatus(); got != StatusCancelled {
+		t.Fatalf("status=%s, want cancelled", got)
 	}
 }
