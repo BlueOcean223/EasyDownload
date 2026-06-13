@@ -1,16 +1,16 @@
 # B站链接解析下载原理
 
-本文档说明 EasyDownload 中 B站视频解析、清晰度选择和 DASH 下载的主要链路。B站实现以官方 Web API 为主：先解析 BV/av 标识，再获取视频元数据和分 P 信息，最后通过 `playurl` 接口获取 DASH 视频/音频流并交给下载管理器执行下载。
+本文档说明 EasyDownload 中 B站视频解析、清晰度选择和 DASH 下载的主要链路。B站实现以官方 Web API 为主：普通视频先解析 BV/av 标识，再获取视频元数据和分 P 信息，最后通过 `x/player/playurl` 接口获取 DASH 视频/音频流；番剧/影视链接先解析 ep/ss/md 标识，再通过 PGC 接口获取季/集信息和播放流，最终都交给下载管理器执行下载。
 
 ## 1. 总体流程
 
 一次完整的 B站下载链路大致如下：
 
-1. 前端传入 BV 号、av 号或完整 B站视频链接
-2. `ParseURL` 解析出视频标识
-3. `GetVideoInfo` / `GetVideoInfoWithParts` 请求视频信息接口
-4. 后端解析标题、封面、作者、总时长、分 P 列表等元数据
-5. `getStreamInfo` 请求 `x/player/playurl` 获取可用 DASH 流
+1. 前端传入 BV 号、av 号、完整普通视频链接，或番剧/影视 ep/ss/md 链接
+2. `ParseURL` 解析普通视频标识；失败后用 `ParseBangumiURL` 解析番剧标识
+3. 普通视频用 `GetVideoInfo` / `GetVideoInfoWithParts` 请求视频信息接口；番剧用 `GetBangumiInfoByID` 请求 PGC season 信息
+4. 后端解析标题、封面、作者/内容类型、总时长、分 P 列表或剧集列表等元数据
+5. 普通视频用 `getStreamInfo` 请求 `x/player/playurl`；番剧用 `getBangumiStreamInfo` 请求 `pgc/player/web/playurl`
 6. 每个清晰度下选择一个视频流，并选择一个音频流
 7. 下载时分别落盘视频 `.m4s` 和音频 `.m4s`
 8. 使用 FFmpeg 合并为最终 `.mp4`
@@ -34,19 +34,43 @@ GET https://api.bilibili.com/x/web-interface/view?bvid={bvid}
 
 如果 `pages` 为空，后端会创建一个默认分 P，保证下载流程统一按分 P 处理。
 
-### 2.2 播放地址接口
+### 2.2 番剧/影视信息接口
+
+```text
+GET https://api.bilibili.com/pgc/view/web/season?ep_id={ep_id}
+GET https://api.bilibili.com/pgc/view/web/season?season_id={season_id}
+```
+
+该接口用于获取 PGC 内容信息：
+
+- `season_id` / `media_id`
+- 标题、封面、简介、内容类型
+- 当前 season 下的完整 `episodes` 列表
+- 每集独立的 `aid`、`bvid`、`cid`、`ep_id`、标题、时长和 badge
+
+`/bangumi/media/md{id}` 会先尝试直接用 `media_id` 请求 season 接口；若不可用，会通过 `pgc/review/user?media_id={media_id}` 解析出 `season_id` 后重试。
+
+### 2.3 播放地址接口
 
 ```text
 GET https://api.bilibili.com/x/player/playurl?bvid={bvid}&cid={cid}&fnval=4048&fnver=0&fourk=1
 ```
 
-当前请求 DASH 格式，并尽量请求高规格流。响应中重点使用：
+普通视频当前请求 DASH 格式，并尽量请求高规格流。响应中重点使用：
 
 - `accept_quality`：可选清晰度 ID
 - `accept_description`：清晰度名称兜底文案
 - `support_formats`：清晰度描述信息
 - `dash.video`：视频流列表
 - `dash.audio`：音频流列表
+
+番剧/影视必须使用 PGC 播放地址接口：
+
+```text
+GET https://api.bilibili.com/pgc/player/web/playurl?bvid={bvid}&cid={cid}&qn={quality}&fnval=4048&fnver=0&fourk=1&drm_tech_type=2&otype=json&platform=web
+```
+
+会员集在无权限时可能返回 `code=0` 但 `dash.video` 为空；此时后端会把它视为无可播放流，而不是仅依赖 `code` 判断成功。PGC CDN URL 同样有时效性，因此下载/恢复时会重新拉取流地址。
 
 ## 3. 流选择策略
 
@@ -138,9 +162,17 @@ ffmpeg -i video.m4s -i audio.m4s -c copy -y output.mp4
 - 不适合 multipart 时回退到顺序下载
 - 暂停或取消时保留临时文件，便于后续恢复
 
-## 6. 注意事项
+## 6. 番剧交互和权限处理
 
-- 高画质通常依赖有效登录态 `SESSDATA`。
+- `/bangumi/play/ep{id}` 默认把该 ep 作为当前集，同时保留整季剧集列表供「展开全部」多选。
+- `/bangumi/play/ss{id}` 和 `/bangumi/media/md{id}` 没有明确 ep 时，默认选择第一集可播放正片作为当前集。
+- 当前集会先拉取清晰度用于直接下载；展开整季时不会批量请求所有集的播放流，避免长番一次性触发大量接口请求。
+- 每集会保留 `badge`（会员/限免/预告等）并在前端选集列表展示。
+
+## 7. 注意事项
+
+- 高画质通常依赖有效登录态 `SESSDATA`，番剧会员集还可能需要大会员权限。
 - DASH 下载依赖 FFmpeg；没有 FFmpeg 时无法合并视频和音频。
 - 当前编码选择偏向更高压缩效率和规格，不额外按设备兼容性降级到 H.264。
 - 备用 CDN 只在下载或获取内容长度失败时使用，不改变用户在前端看到的清晰度列表。
+- 如果 PGC 流返回 `bilidrm_uri` 且没有可用解密 key，当前会提示 DRM 保护内容暂不支持下载。

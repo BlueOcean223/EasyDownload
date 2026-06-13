@@ -7,7 +7,7 @@ A simple and easy-to-use desktop video downloader that supports downloading cont
 ## Features
 
 - **WeChat Channels Sniffer**: Automatically detects videos played in WeChat PC client, one-click download
-- **Bilibili Download**: Supports BV ID, av ID, and full URLs with multiple quality options
+- **Bilibili Download**: Supports BV ID, av ID, ordinary video URLs, and bangumi/PGC ep, ss, md URLs with multiple quality options
 - **Xiaohongshu Download**: Supports downloading videos and image notes from Xiaohongshu
 - **Douyin Download**: Supports Douyin video download, including slideshow preview and download
 - **Visual Interface**: Netflix-style video card display with clear download progress
@@ -54,9 +54,9 @@ A simple and easy-to-use desktop video downloader that supports downloading cont
 ### Download Bilibili Videos
 
 1. Go to the "Bilibili" page
-2. Paste the Bilibili video link (supports BV ID, av ID, or full URL)
+2. Paste the Bilibili video link (supports BV ID, av ID, ordinary video URLs, or bangumi/PGC ep/ss/md URLs)
 3. Click "Parse" button to get video information
-4. Select quality and click "Download Video"
+4. Select quality and click "Download Video" for ordinary videos; for bangumi, download the current episode directly or expand the full season to select multiple episodes
 
 ### Download Xiaohongshu Content
 
