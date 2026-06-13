@@ -11,6 +11,8 @@ A simple and easy-to-use desktop video downloader that supports downloading cont
 - **Xiaohongshu Download**: Supports downloading videos and image notes from Xiaohongshu
 - **Douyin Download**: Supports Douyin video download, including slideshow preview and download
 - **Visual Interface**: Netflix-style video card display with clear download progress
+- **Reliable Downloads**: Built-in queueing, resume support, state persistence, and failed/cancelled grouping
+- **Local Security Boundary**: Internal API and proxy bind to `127.0.0.1` by default, with token checks for browser-facing routes
 - **Zero Configuration**: Automated certificate installation and proxy setup for easy onboarding
 
 ## Screenshots
@@ -51,6 +53,8 @@ A simple and easy-to-use desktop video downloader that supports downloading cont
 3. Detected videos will automatically appear on the "Video Sniffer" page
 4. Click the "Download" button on the video card to download
 
+> The proxy and internal API bind to the local loopback interface by default. MITM is limited to the WeChat Channels page/script allowlist; video CDN and unrelated HTTPS traffic pass through directly.
+
 ### Download Bilibili Videos
 
 1. Go to the "Bilibili" page
@@ -71,6 +75,13 @@ A simple and easy-to-use desktop video downloader that supports downloading cont
 2. Paste the Douyin video link or share text
 3. Click "Parse" button to get video information
 4. Supports slideshow preview, click download to save video
+
+## Download and Security Notes
+
+- Download tasks are handled by a shared queue; tasks above the concurrency limit stay pending instead of being dropped.
+- Task state is persisted under the app data directory and restored on restart. Bilibili tasks rebind their downloader on resume/retry; unfinished Douyin/Xiaohongshu tasks need to be parsed again after restart.
+- The image proxy blocks localhost, private, link-local, metadata-style and other unsafe addresses to avoid internal network probing.
+- See [Security Boundary and Download Reliability](docs/security-and-download-reliability.md) for implementation details.
 
 ## Development
 

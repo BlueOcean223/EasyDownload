@@ -8,7 +8,7 @@
 //   - Downloading DASH format videos with separate video/audio streams
 //   - Fallback downloads via backup CDN URLs when primary stream URLs fail
 //   - Resumable downloads with progress tracking
-//   - FFmpeg integration for merging video and audio streams
+//   - Context-aware FFmpeg integration for merging video and audio streams
 //
 // Bilibili API Overview:
 // The downloader interacts with several Bilibili APIs:
@@ -24,7 +24,9 @@
 // priority (AV1 > HEVC > H.264) and then bandwidth as a tie-breaker. It selects the
 // highest-bandwidth DASH audio stream, records backup CDN URLs, and retries those URLs
 // if the primary URL fails. Content length probing also tries backup URLs so size and
-// progress reporting remain as accurate as possible.
+// progress reporting remain as accurate as possible. FFmpeg merge runs with the
+// download context, so pause/cancel can interrupt the merge stage instead of waiting
+// for the external process to finish.
 //
 // Authentication:
 // Higher quality streams (1080P+, 4K, etc.) require user authentication via SESSDATA cookie.

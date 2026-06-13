@@ -131,7 +131,7 @@ DASH 视频会被拆成两个临时文件：
 ffmpeg -i video.m4s -i audio.m4s -c copy -y output.mp4
 ```
 
-合并成功后删除临时文件和 multipart 状态文件。
+合并使用 context-aware 调用：如果用户在合并阶段暂停或取消，FFmpeg 进程会随 context 终止，临时文件保留供恢复或清理。合并成功后删除临时文件和 multipart 状态文件。
 
 ### 5.2 备用 URL 重试
 
@@ -158,7 +158,9 @@ ffmpeg -i video.m4s -i audio.m4s -c copy -y output.mp4
 实际文件下载复用通用下载能力：
 
 - 已有临时文件时尝试断点续传
-- 大文件且服务端支持 Range 时使用 multipart 下载
+- 大文件且服务端通过 `GET Range` 证实支持 Range 时使用 multipart 下载
+- multipart chunk 必须返回 `206 Partial Content`，并校验 `Content-Range` 起止范围
+- chunk 提前 EOF 会失败，避免生成损坏文件
 - 不适合 multipart 时回退到顺序下载
 - 暂停或取消时保留临时文件，便于后续恢复
 
@@ -173,6 +175,7 @@ ffmpeg -i video.m4s -i audio.m4s -c copy -y output.mp4
 
 - 高画质通常依赖有效登录态 `SESSDATA`，番剧会员集还可能需要大会员权限。
 - DASH 下载依赖 FFmpeg；没有 FFmpeg 时无法合并视频和音频。
+- App 重启后，B站任务会在继续/重试时重新解析流信息并绑定下载函数，因为 CDN URL 具有时效性。
 - 当前编码选择偏向更高压缩效率和规格，不额外按设备兼容性降级到 H.264。
 - 备用 CDN 只在下载或获取内容长度失败时使用，不改变用户在前端看到的清晰度列表。
 - 如果 PGC 流返回 `bilidrm_uri` 且没有可用解密 key，当前会提示 DRM 保护内容暂不支持下载。
