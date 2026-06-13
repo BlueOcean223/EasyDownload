@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -518,18 +520,22 @@ func (a *App) ResumeDownload(id string) error {
 		quality := 80
 		fmt.Sscanf(task.Quality, "%d", &quality)
 
-		bvid, err := a.bilibiliDownloader.ParseURL(task.URL)
-		if err != nil {
-			return fmt.Errorf("failed to parse Bilibili URL: %w", err)
+		partIndex := parseBilibiliTaskPartIndex(task.ID)
+		var video *bilibili.BilibiliVideo
+		if partIndex >= 0 {
+			video, err = a.getBilibiliVideoInfoWithPartsForDownload(task.URL)
+		} else {
+			video, err = a.GetBilibiliVideoInfo(task.URL)
+			if err == nil && video.IsBangumi {
+				partIndex = video.CurrentPartIndex
+			}
 		}
-
-		video, err := a.bilibiliDownloader.GetVideoInfo(bvid)
 		if err != nil {
-			return fmt.Errorf("failed to get video info: %w", err)
+			return fmt.Errorf("failed to get Bilibili video info: %w", err)
 		}
 
 		// Re-create the custom downloader
-		task.SetCustomDownloader(a.createBilibiliDownloader(video, quality, -1))
+		task.SetCustomDownloader(a.createBilibiliDownloader(video, quality, partIndex))
 	}
 
 	// Use unified resume logic for all sources
@@ -558,63 +564,99 @@ func (a *App) GetDownloads() []map[string]interface{} {
 
 // ==================== Bilibili Methods ====================
 
-// GetBilibiliVideoInfo fetches video info from Bilibili
-func (a *App) GetBilibiliVideoInfo(url string) (*bilibili.BilibiliVideo, error) {
-	bvid, err := a.bilibiliDownloader.ParseURL(url)
+// GetBilibiliVideoInfo fetches video info from Bilibili.
+// It supports ordinary BV/av videos and PGC/bangumi ep/ss/md URLs.
+func (a *App) GetBilibiliVideoInfo(rawURL string) (*bilibili.BilibiliVideo, error) {
+	if bvid, err := a.bilibiliDownloader.ParseURL(rawURL); err == nil {
+		return a.bilibiliDownloader.GetVideoInfo(bvid)
+	}
+
+	kind, id, err := a.bilibiliDownloader.ParseBangumiURL(rawURL)
 	if err != nil {
 		return nil, err
 	}
-
-	return a.bilibiliDownloader.GetVideoInfo(bvid)
+	return a.bilibiliDownloader.GetBangumiInfoByID(kind, id)
 }
 
-// GetBilibiliVideoInfoWithAllParts fetches video info with stream info for all parts
-// This is used for the multi-part selector UI to show size estimates for each part
-func (a *App) GetBilibiliVideoInfoWithAllParts(url string) (*bilibili.BilibiliVideo, error) {
-	bvid, err := a.bilibiliDownloader.ParseURL(url)
-	if err != nil {
-		return nil, err
-	}
-
-	video, err := a.bilibiliDownloader.GetVideoInfoWithParts(bvid)
-	if err != nil {
-		return nil, err
-	}
-
-	// Get stream info for all parts
-	if err := a.bilibiliDownloader.GetAllPartsStreams(video); err != nil {
-		logger.Debug("Failed to get all parts streams: %v", err)
-		// Continue anyway, streams will be empty for failed parts
-	}
-
-	// Also get streams for the first part to maintain backward compatibility
-	if len(video.Parts) > 0 {
-		aid := int64(0)
-		fmt.Sscanf(video.AV, "av%d", &aid)
-		streams, err := a.bilibiliDownloader.GetPartStreams(video, 0)
-		if err == nil {
-			video.Streams = streams
+// GetBilibiliVideoInfoWithAllParts fetches video info with stream info for all ordinary-video parts.
+// For bangumi URLs it returns the full season episode list but only fetches streams for the current
+// episode to avoid issuing hundreds of playurl requests for long seasons.
+func (a *App) GetBilibiliVideoInfoWithAllParts(rawURL string) (*bilibili.BilibiliVideo, error) {
+	if bvid, err := a.bilibiliDownloader.ParseURL(rawURL); err == nil {
+		video, err := a.bilibiliDownloader.GetVideoInfoWithParts(bvid)
+		if err != nil {
+			return nil, err
 		}
+
+		// Get stream info for all parts
+		if err := a.bilibiliDownloader.GetAllPartsStreams(video); err != nil {
+			logger.Debug("Failed to get all parts streams: %v", err)
+			// Continue anyway, streams will be empty for failed parts
+		}
+
+		// Also get streams for the first part to maintain backward compatibility
+		if len(video.Parts) > 0 {
+			streams, err := a.bilibiliDownloader.GetPartStreams(video, 0)
+			if err == nil {
+				video.Streams = streams
+			}
+		}
+
+		return video, nil
 	}
 
-	return video, nil
+	kind, id, err := a.bilibiliDownloader.ParseBangumiURL(rawURL)
+	if err != nil {
+		return nil, err
+	}
+	return a.bilibiliDownloader.GetBangumiInfoByID(kind, id)
 }
 
-// DownloadBilibiliVideo downloads a Bilibili video
-func (a *App) DownloadBilibiliVideo(url string, quality int) (string, error) {
-	video, err := a.GetBilibiliVideoInfo(url)
+func (a *App) getBilibiliVideoInfoWithPartsForDownload(rawURL string) (*bilibili.BilibiliVideo, error) {
+	if bvid, err := a.bilibiliDownloader.ParseURL(rawURL); err == nil {
+		return a.bilibiliDownloader.GetVideoInfoWithParts(bvid)
+	}
+
+	kind, id, err := a.bilibiliDownloader.ParseBangumiURL(rawURL)
+	if err != nil {
+		return nil, err
+	}
+	return a.bilibiliDownloader.GetBangumiInfoByID(kind, id)
+}
+
+// DownloadBilibiliVideo downloads a Bilibili video or the current bangumi episode.
+func (a *App) DownloadBilibiliVideo(rawURL string, quality int) (string, error) {
+	video, err := a.GetBilibiliVideoInfo(rawURL)
 	if err != nil {
 		return "", err
 	}
 
-	// Create unique ID
-	id := fmt.Sprintf("bilibili_%s_%d", video.BV, time.Now().UnixNano())
+	partIndex := -1
+	title := video.Title
+	cover := video.Cover
+	idKey := video.BV
+	if video.IsBangumi {
+		partIndex = video.CurrentPartIndex
+		if partIndex < 0 || partIndex >= len(video.Parts) {
+			partIndex = 0
+		}
+		part := video.Parts[partIndex]
+		title = formatBilibiliTaskTitle(video, part)
+		cover = formatBilibiliTaskCover(video, part)
+		idKey = formatBilibiliTaskIDKey(video, part)
+	}
+
+	// Create unique ID. Bangumi uses an explicit part marker so resume can recreate the same episode.
+	id := fmt.Sprintf("bilibili_%s_%d", idKey, time.Now().UnixNano())
+	if partIndex >= 0 {
+		id = fmt.Sprintf("bilibili_%s_p%d_%d", idKey, video.Parts[partIndex].Page, time.Now().UnixNano())
+	}
 
 	// Create custom downloader function for Bilibili DASH format
-	bilibiliDownloader := a.createBilibiliDownloader(video, quality, -1) // -1 means first part
+	bilibiliDownloader := a.createBilibiliDownloader(video, quality, partIndex)
 
 	// Add task with custom downloader
-	task, err := a.downloadManager.AddTaskWithDownloader(id, url, video.Title, video.Cover, "bilibili", fmt.Sprintf("%d", quality), bilibiliDownloader)
+	task, err := a.downloadManager.AddTaskWithDownloader(id, rawURL, title, cover, "bilibili", fmt.Sprintf("%d", quality), bilibiliDownloader)
 	if err != nil {
 		return "", err
 	}
@@ -630,9 +672,9 @@ func (a *App) DownloadBilibiliVideo(url string, quality int) (string, error) {
 	return id, nil
 }
 
-// DownloadBilibiliPart downloads a specific part of a Bilibili video
-func (a *App) DownloadBilibiliPart(url string, partIndex int, quality int) (string, error) {
-	video, err := a.bilibiliDownloader.GetVideoInfoWithParts(a.bilibiliDownloader.ParseURLMust(url))
+// DownloadBilibiliPart downloads a specific part/episode of a Bilibili video.
+func (a *App) DownloadBilibiliPart(rawURL string, partIndex int, quality int) (string, error) {
+	video, err := a.getBilibiliVideoInfoWithPartsForDownload(rawURL)
 	if err != nil {
 		return "", err
 	}
@@ -644,19 +686,17 @@ func (a *App) DownloadBilibiliPart(url string, partIndex int, quality int) (stri
 	part := video.Parts[partIndex]
 
 	// Create unique ID with part info
-	id := fmt.Sprintf("bilibili_%s_p%d_%d", video.BV, part.Page, time.Now().UnixNano())
+	id := fmt.Sprintf("bilibili_%s_p%d_%d", formatBilibiliTaskIDKey(video, part), part.Page, time.Now().UnixNano())
 
 	// Create title with part info
-	title := video.Title
-	if len(video.Parts) > 1 {
-		title = fmt.Sprintf("%s - P%d %s", video.Title, part.Page, part.PartName)
-	}
+	title := formatBilibiliTaskTitle(video, part)
+	cover := formatBilibiliTaskCover(video, part)
 
 	// Create custom downloader function for this specific part
 	bilibiliDownloader := a.createBilibiliDownloader(video, quality, partIndex)
 
 	// Add task with custom downloader
-	task, err := a.downloadManager.AddTaskWithDownloader(id, url, title, video.Cover, "bilibili", fmt.Sprintf("%d", quality), bilibiliDownloader)
+	task, err := a.downloadManager.AddTaskWithDownloader(id, rawURL, title, cover, "bilibili", fmt.Sprintf("%d", quality), bilibiliDownloader)
 	if err != nil {
 		return "", err
 	}
@@ -670,6 +710,69 @@ func (a *App) DownloadBilibiliPart(url string, partIndex int, quality int) (stri
 	runtime.EventsEmit(a.ctx, "download:start", task.TaskToJSON())
 
 	return id, nil
+}
+
+func formatBilibiliTaskTitle(video *bilibili.BilibiliVideo, part bilibili.BilibiliPart) string {
+	if video == nil {
+		return part.PartName
+	}
+	if video.IsBangumi {
+		if video.Title == "" {
+			return part.PartName
+		}
+		if part.PartName == "" {
+			return video.Title
+		}
+		return fmt.Sprintf("%s - %s", video.Title, part.PartName)
+	}
+	if len(video.Parts) > 1 {
+		return fmt.Sprintf("%s - P%d %s", video.Title, part.Page, part.PartName)
+	}
+	return video.Title
+}
+
+func formatBilibiliTaskCover(video *bilibili.BilibiliVideo, part bilibili.BilibiliPart) string {
+	if part.Cover != "" {
+		return part.Cover
+	}
+	if video != nil {
+		return video.Cover
+	}
+	return ""
+}
+
+func formatBilibiliTaskIDKey(video *bilibili.BilibiliVideo, part bilibili.BilibiliPart) string {
+	if video != nil && video.IsBangumi {
+		if part.EpID > 0 {
+			return fmt.Sprintf("ep%d", part.EpID)
+		}
+		if part.BV != "" {
+			return part.BV
+		}
+	}
+	if video != nil && video.BV != "" {
+		return video.BV
+	}
+	if part.BV != "" {
+		return part.BV
+	}
+	return "unknown"
+}
+
+func parseBilibiliTaskPartIndex(id string) int {
+	marker := strings.LastIndex(id, "_p")
+	if marker < 0 {
+		return -1
+	}
+	rest := id[marker+2:]
+	if sep := strings.Index(rest, "_"); sep >= 0 {
+		rest = rest[:sep]
+	}
+	page, err := strconv.Atoi(rest)
+	if err != nil || page <= 0 {
+		return -1
+	}
+	return page - 1
 }
 
 // createBilibiliDownloader creates a custom download function for Bilibili videos

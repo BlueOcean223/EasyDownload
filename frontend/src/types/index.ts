@@ -62,6 +62,10 @@ export interface BilibiliStream {
   size: number
   videoUrl: string
   audioUrl: string
+  drmKey?: string
+  drmTechType?: number
+  kid?: string
+  biliDrmUri?: string
 }
 
 // Bilibili QR code for login
@@ -95,6 +99,13 @@ export interface BilibiliPart {
   partName: string
   duration: number
   streams?: BilibiliStream[]  // Stream info for this part (optional, loaded on demand)
+  bv?: string
+  aid?: number
+  epId?: number
+  badge?: string
+  badgeType?: number
+  sectionType?: number
+  cover?: string
 }
 
 // Bilibili video info
@@ -108,6 +119,14 @@ export interface BilibiliVideo {
   desc: string
   parts: BilibiliPart[]
   streams: BilibiliStream[]
+  seasonId?: number
+  mediaId?: number
+  epId?: number
+  badge?: string
+  seasonType?: number
+  isBangumi?: boolean
+  totalEps?: number
+  currentPartIndex?: number
 }
 
 // App info

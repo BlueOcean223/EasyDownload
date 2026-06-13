@@ -73,7 +73,7 @@ const qualityOptions = ref<{ label: string; value: number }[]>([])
 // Get estimated file size for selected quality
 const selectedStreamSize = computed(() => {
   if (!videoInfo.value || selectedQuality.value === undefined) return null
-  const stream = videoInfo.value.streams.find(s => s.quality === selectedQuality.value)
+  const stream = (videoInfo.value.streams || []).find(s => s.quality === selectedQuality.value)
   return stream?.size || null
 })
 
@@ -95,6 +95,35 @@ const hasMultipleParts = computed(() => {
   return videoInfo.value && videoInfo.value.parts && videoInfo.value.parts.length > 1
 })
 
+const isBangumi = computed(() => !!videoInfo.value?.isBangumi)
+
+const currentPart = computed(() => {
+  if (!videoInfo.value || !videoInfo.value.parts || videoInfo.value.parts.length === 0) return null
+  const index = videoInfo.value.currentPartIndex ?? 0
+  return videoInfo.value.parts[index] || videoInfo.value.parts[0]
+})
+
+const totalEpisodes = computed(() => videoInfo.value?.totalEps || videoInfo.value?.parts?.length || 0)
+
+function seasonTypeName(type?: number) {
+  const map: Record<number, string> = {
+    1: '番剧',
+    2: '电影',
+    3: '纪录片',
+    4: '国创',
+    5: '电视剧',
+    7: '综艺'
+  }
+  return type ? (map[type] || '番剧') : '番剧'
+}
+
+function badgeTagType(badge?: string): 'default' | 'info' | 'success' | 'warning' {
+  if (badge === '会员') return 'warning'
+  if (badge === '限免') return 'success'
+  if (badge === '预告') return 'info'
+  return 'default'
+}
+
 async function fetchVideoInfo() {
   const urlSnapshot = url.value.trim()
   if (!urlSnapshot) {
@@ -106,6 +135,9 @@ async function fetchVideoInfo() {
   loading.value = true
   error.value = ''
   videoInfo.value = null
+  selectedQuality.value = undefined
+  qualityOptions.value = []
+  showPartSelector.value = false
 
   try {
     const info = await GetBilibiliVideoInfo(urlSnapshot) as BilibiliVideo
@@ -115,14 +147,23 @@ async function fetchVideoInfo() {
     videoInfo.value = info
 
     // Build quality options
-    qualityOptions.value = info.streams.map(s => ({
+    const streams = info.streams || []
+    qualityOptions.value = streams.map(s => ({
       label: s.qualityName,
       value: s.quality
     }))
 
-    // Select highest quality by default
-    if (info.streams.length > 0) {
-      selectedQuality.value = info.streams[0].quality
+    // Select highest quality by default. If a bangumi current episode has no
+    // stream list (for example a VIP episode without permission), keep an
+    // automatic quality option so users can still expand the season and queue
+    // other playable episodes; the backend will re-fetch fresh streams per episode.
+    if (streams.length > 0) {
+      selectedQuality.value = streams[0].quality
+    } else if (info.isBangumi) {
+      qualityOptions.value = [{ label: '自动/最高可用', value: 127 }]
+      selectedQuality.value = 127
+    } else {
+      selectedQuality.value = undefined
     }
   } catch (e: any) {
     // Check if URL changed during fetch - discard stale error
@@ -138,16 +179,14 @@ async function fetchVideoInfo() {
 
 const loadingParts = ref(false)
 
-async function downloadVideo() {
-  if (!videoInfo.value || selectedQuality.value === undefined) return
+async function openPartSelector() {
+  if (!videoInfo.value) return
 
-  // If video has multiple parts, fetch all parts info and show part selector
-  if (hasMultipleParts.value) {
-    // Check if we already have stream info for parts
+  // Ordinary multi-P videos fetch all part streams for size estimates. Bangumi seasons can
+  // contain hundreds of episodes, so keep stream loading lazy and fetch only at download time.
+  if (!isBangumi.value) {
     const hasPartStreams = videoInfo.value.parts.some(p => p.streams && p.streams.length > 0)
-    
     if (!hasPartStreams) {
-      // Fetch full info with all parts streams
       loadingParts.value = true
       try {
         const fullInfo = await GetBilibiliVideoInfoWithAllParts(url.value) as BilibiliVideo
@@ -159,12 +198,25 @@ async function downloadVideo() {
         loadingParts.value = false
       }
     }
-    
-    showPartSelector.value = true
+  }
+
+  showPartSelector.value = true
+}
+
+async function downloadVideo() {
+  if (!videoInfo.value) return
+  if (selectedQuality.value === undefined) {
+    message.warning('当前内容没有可用清晰度，可能需要登录或大会员权限')
     return
   }
 
-  // Single part video - download directly
+  // Ordinary multi-P videos keep the existing selector-first behavior.
+  if (hasMultipleParts.value && !isBangumi.value) {
+    await openPartSelector()
+    return
+  }
+
+  // Single ordinary video or current bangumi episode - download directly.
   downloading.value = true
   try {
     await DownloadBilibiliVideo(url.value, selectedQuality.value)
@@ -185,7 +237,7 @@ async function downloadSelectedParts(partIndices: number[]) {
     for (const partIndex of partIndices) {
       await DownloadBilibiliPart(url.value, partIndex, selectedQuality.value)
     }
-    message.success(`已添加 ${partIndices.length} 个分P到下载队列`)
+    message.success(`已添加 ${partIndices.length} 个${isBangumi.value ? '剧集' : '分P'}到下载队列`)
   } catch (e: any) {
     message.error(e.message || '下载失败')
   } finally {
@@ -260,7 +312,7 @@ function handleKeydown(e: KeyboardEvent) {
       <div class="flex gap-3">
         <NInput 
           v-model:value="url"
-          placeholder="请输入B站视频链接 (支持 BV号、av号、完整链接)"
+          placeholder="请输入B站视频链接 (支持 BV号、av号、番剧 ep/ss/md 链接)"
           clearable
           size="large"
           class="flex-1"
@@ -307,7 +359,7 @@ function handleKeydown(e: KeyboardEvent) {
           </template>
           <template #extra>
             <p class="text-text-secondary text-sm mt-2">
-              支持 bilibili.com 和 b23.tv 链接
+              支持普通视频和番剧/影视链接（ep、ss、md）
             </p>
           </template>
         </NEmpty>
@@ -338,9 +390,12 @@ function handleKeydown(e: KeyboardEvent) {
             
             <!-- Info -->
             <div class="flex-1 flex flex-col">
-              <h3 class="text-lg font-semibold mb-3">{{ videoInfo.title }}</h3>
+              <h3 class="text-lg font-semibold mb-2">{{ videoInfo.title }}</h3>
+              <div v-if="isBangumi && currentPart" class="text-sm text-text-secondary mb-3">
+                当前：{{ currentPart.partName }}
+              </div>
               
-              <div class="flex items-center gap-4 text-sm text-text-secondary mb-3">
+              <div class="flex items-center gap-4 text-sm text-text-secondary mb-3 flex-wrap">
                 <span class="flex items-center gap-1">
                   <PersonOutline class="w-4 h-4" />
                   {{ videoInfo.author }}
@@ -349,14 +404,29 @@ function handleKeydown(e: KeyboardEvent) {
                   <TimeOutline class="w-4 h-4" />
                   {{ formatDuration(videoInfo.duration) }}
                 </span>
-                <NTag size="small" type="info">{{ videoInfo.bv }}</NTag>
+                <NTag v-if="isBangumi" size="small" type="primary">
+                  {{ seasonTypeName(videoInfo.seasonType) }}
+                </NTag>
+                <NTag v-if="videoInfo.bv" size="small" type="info">{{ videoInfo.bv }}</NTag>
+                <NTag v-if="isBangumi && currentPart?.badge" size="small" :type="badgeTagType(currentPart.badge)">
+                  {{ currentPart.badge }}
+                </NTag>
               </div>
               
               <p class="text-sm text-text-secondary line-clamp-3 mb-4">
                 {{ videoInfo.desc || '暂无简介' }}
               </p>
+
+              <NAlert
+                v-if="(videoInfo.streams || []).length === 0"
+                type="warning"
+                class="mb-4"
+                title="暂无可用清晰度"
+              >
+                当前集可能需要登录、开通大会员，或暂不可播放；也可以展开整季选择其他可播放剧集。
+              </NAlert>
               
-              <div class="mt-auto flex items-center gap-4">
+              <div class="mt-auto flex items-center gap-4 flex-wrap">
                 <div class="flex items-center gap-2">
                   <span class="text-sm text-text-secondary">画质:</span>
                   <NSelect 
@@ -379,19 +449,29 @@ function handleKeydown(e: KeyboardEvent) {
                   <template #icon>
                     <CloudDownloadOutline class="w-4 h-4" />
                   </template>
-                  {{ loadingParts ? '加载分P信息...' : (hasMultipleParts ? '选择分P下载' : '下载视频') }}
+                  {{ isBangumi ? '下载当前集' : (loadingParts ? '加载分P信息...' : (hasMultipleParts ? '选择分P下载' : '下载视频')) }}
+                </NButton>
+
+                <NButton
+                  v-if="isBangumi && hasMultipleParts"
+                  :loading="loadingParts"
+                  @click="openPartSelector"
+                >
+                  展开全部 {{ totalEpisodes }} 集
                 </NButton>
               </div>
               
-              <!-- Multi-part indicator -->
-              <div v-if="hasMultipleParts" class="mt-3 flex items-center gap-2">
+              <!-- Multi-part / bangumi indicator -->
+              <div v-if="hasMultipleParts" class="mt-3 flex items-center gap-2 flex-wrap">
                 <NTag type="info" size="small">
                   <template #icon>
                     <ListOutline class="w-3 h-3" />
                   </template>
-                  共 {{ videoInfo.parts.length }} P
+                  {{ isBangumi ? `共 ${totalEpisodes} 集` : `共 ${videoInfo.parts.length} P` }}
                 </NTag>
-                <span class="text-xs text-text-secondary">点击下载按钮选择要下载的分P</span>
+                <span class="text-xs text-text-secondary">
+                  {{ isBangumi ? '默认下载当前集，也可展开整季多选' : '点击下载按钮选择要下载的分P' }}
+                </span>
               </div>
             </div>
           </div>
@@ -405,7 +485,9 @@ function handleKeydown(e: KeyboardEvent) {
       v-model:show="showPartSelector"
       :parts="videoInfo.parts || []"
       :video-title="videoInfo.title"
-      :streams="videoInfo.streams"
+      :streams="videoInfo.streams || []"
+      :is-bangumi="videoInfo.isBangumi"
+      :current-part-index="videoInfo.currentPartIndex"
       v-model:selected-quality="selectedQuality"
       @select="downloadSelectedParts"
     />

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, watch } from 'vue'
+import { ref, computed, watch, h } from 'vue'
 import { 
   NModal, NCard, NDataTable, NButton, NSpace, 
   NCheckbox, NTag, NEmpty, NScrollbar, NSelect, NSpin
@@ -12,8 +12,10 @@ const props = defineProps<{
   show: boolean
   parts: BilibiliPart[]
   videoTitle: string
-  streams?: BilibiliStream[]  // Available quality options from first part
+  streams?: BilibiliStream[]  // Available quality options from first/current part
   selectedQuality?: number    // Currently selected quality
+  isBangumi?: boolean
+  currentPartIndex?: number
 }>()
 
 const emit = defineEmits<{
@@ -30,13 +32,18 @@ const localSelectedQuality = ref<number | null>(null)
 // Reset selection when modal opens
 watch(() => props.show, (newVal) => {
   if (newVal) {
-    selectedParts.value = []
+    const currentIndex = props.currentPartIndex ?? 0
+    selectedParts.value = props.isBangumi && currentIndex >= 0 && currentIndex < props.parts.length
+      ? [currentIndex]
+      : []
     selectAll.value = false
     // Initialize local quality from prop
     if (props.selectedQuality !== undefined) {
       localSelectedQuality.value = props.selectedQuality
     } else if (props.streams && props.streams.length > 0) {
       localSelectedQuality.value = props.streams[0].quality
+    } else {
+      localSelectedQuality.value = null
     }
   }
 })
@@ -64,7 +71,12 @@ watch(selectedParts, (newVal) => {
 
 // Quality options for selector
 const qualityOptions = computed(() => {
-  if (!props.streams || props.streams.length === 0) return []
+  if (!props.streams || props.streams.length === 0) {
+    if (props.isBangumi && props.selectedQuality !== undefined) {
+      return [{ label: '自动/最高可用', value: props.selectedQuality }]
+    }
+    return []
+  }
   return props.streams.map(s => ({
     label: s.qualityName,
     value: s.quality
@@ -72,6 +84,10 @@ const qualityOptions = computed(() => {
 })
 
 const hasSelection = computed(() => selectedParts.value.length > 0)
+const canConfirm = computed(() => hasSelection.value && localSelectedQuality.value !== null)
+const unitLabel = computed(() => props.isBangumi ? '集' : 'P')
+const selectorTitle = computed(() => props.isBangumi ? '选择集数' : '选择分P')
+const allCountLabel = computed(() => props.isBangumi ? `共 ${props.parts.length} 集` : `共 ${props.parts.length} P`)
 
 const totalDuration = computed(() => {
   return selectedParts.value.reduce((sum, index) => {
@@ -145,6 +161,13 @@ function isSelected(index: number) {
   return selectedParts.value.includes(index)
 }
 
+function badgeTagType(badge?: string): 'default' | 'info' | 'success' | 'warning' {
+  if (badge === '会员') return 'warning'
+  if (badge === '限免') return 'success'
+  if (badge === '预告') return 'info'
+  return 'default'
+}
+
 function confirm() {
   emit('select', [...selectedParts.value].sort((a, b) => a - b))
   emit('update:show', false)
@@ -162,17 +185,21 @@ const columns = computed<DataTableColumns<BilibiliPart & { index: number }>>(() 
       disabled: () => false,
     },
     {
-      title: 'P',
+      title: unitLabel.value,
       key: 'page',
-      width: 50,
-      render: (row) => `P${row.page}`
+      width: props.isBangumi ? 60 : 50,
+      render: (row) => props.isBangumi ? `${row.page}` : `P${row.page}`
     },
     {
       title: '标题',
       key: 'partName',
       ellipsis: {
         tooltip: true
-      }
+      },
+      render: (row) => h('div', { class: 'part-title-cell' }, [
+        h('span', row.partName || `${unitLabel.value}${row.page}`),
+        row.badge ? h(NTag, { size: 'tiny', type: badgeTagType(row.badge), class: 'ml-2' }, { default: () => row.badge }) : null
+      ])
     },
     {
       title: '时长',
@@ -221,7 +248,7 @@ const getRowKey = (row: BilibiliPart & { index: number }) => row.index
     :show="show" 
     preset="card"
     style="width: 700px; max-height: 80vh"
-    :title="`选择分P - ${videoTitle}`"
+    :title="`${selectorTitle} - ${videoTitle}`"
     :mask-closable="true"
     @update:show="emit('update:show', $event)"
   >
@@ -230,13 +257,13 @@ const getRowKey = (row: BilibiliPart & { index: number }) => row.index
         <template #icon>
           <ListOutline class="w-3 h-3" />
         </template>
-        共 {{ parts.length }} P
+        {{ allCountLabel }}
       </NTag>
     </template>
 
     <div class="part-selector-content">
       <!-- Empty state -->
-      <NEmpty v-if="parts.length === 0" description="没有可用的分P">
+      <NEmpty v-if="parts.length === 0" :description="isBangumi ? '没有可用的剧集' : '没有可用的分P'">
         <template #icon>
           <ListOutline class="w-12 h-12 text-text-secondary opacity-50" />
         </template>
@@ -265,7 +292,7 @@ const getRowKey = (row: BilibiliPart & { index: number }) => row.index
           
           <!-- Selection summary -->
           <div v-if="hasSelection" class="text-sm text-text-secondary flex items-center gap-2">
-            <span>已选 {{ selectedParts.length }} P</span>
+            <span>已选 {{ selectedParts.length }} {{ unitLabel }}</span>
             <span>·</span>
             <span>总时长 {{ formatDuration(totalDuration) }}</span>
             <template v-if="totalSelectedSize">
@@ -299,7 +326,7 @@ const getRowKey = (row: BilibiliPart & { index: number }) => row.index
           <NButton @click="cancel">取消</NButton>
           <NButton 
             type="primary" 
-            :disabled="!hasSelection"
+            :disabled="!canConfirm"
             @click="confirm"
           >
             <template #icon>
@@ -320,5 +347,18 @@ const getRowKey = (row: BilibiliPart & { index: number }) => row.index
 
 .text-primary {
   color: var(--primary-color, #18a058);
+}
+
+.part-title-cell {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.part-title-cell span:first-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 </style>
