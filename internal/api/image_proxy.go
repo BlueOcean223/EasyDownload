@@ -1,8 +1,10 @@
 package api
 
 import (
+	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -13,16 +15,26 @@ const maxProxyImageSize = 20 * 1024 * 1024
 
 // ImageProxyHandler handles image proxy requests
 type ImageProxyHandler struct {
-	client *http.Client
+	client               *http.Client
+	allowPrivateNetworks bool
 }
 
 // NewImageProxyHandler creates a new image proxy handler
 func NewImageProxyHandler() *ImageProxyHandler {
-	return &ImageProxyHandler{
-		client: &http.Client{
-			Timeout: 30 * time.Second,
+	iph := &ImageProxyHandler{}
+	iph.client = &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			DialContext: iph.safeDialContext,
+		},
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 5 {
+				return fmt.Errorf("too many redirects")
+			}
+			return iph.validateImageURL(req.URL.String())
 		},
 	}
+	return iph
 }
 
 // ProxyImage proxies an external image request and returns the image data
@@ -31,8 +43,8 @@ func (iph *ImageProxyHandler) ProxyImage(imageURL string) ([]byte, string, error
 	if imageURL == "" {
 		return nil, "", fmt.Errorf("image URL is empty")
 	}
-	if !isHTTPURL(imageURL) {
-		return nil, "", fmt.Errorf("unsupported image URL")
+	if err := iph.validateImageURL(imageURL); err != nil {
+		return nil, "", err
 	}
 
 	req, err := http.NewRequest(http.MethodGet, imageURL, nil)
@@ -68,8 +80,122 @@ func (iph *ImageProxyHandler) ProxyImage(imageURL string) ([]byte, string, error
 	if contentType == "" {
 		contentType = "image/jpeg" // Default content type
 	}
+	mediaType := strings.ToLower(strings.TrimSpace(strings.Split(contentType, ";")[0]))
+	if mediaType != "" && !strings.HasPrefix(mediaType, "image/") {
+		return nil, "", fmt.Errorf("proxied resource is not an image")
+	}
 
 	return data, contentType, nil
+}
+
+func (iph *ImageProxyHandler) validateImageURL(raw string) error {
+	if !isHTTPURL(raw) {
+		return fmt.Errorf("unsupported image URL")
+	}
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return fmt.Errorf("invalid image URL: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := iph.lookupSafeIPs(ctx, u.Hostname()); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (iph *ImageProxyHandler) safeDialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, err
+	}
+	ips, err := iph.lookupSafeIPs(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+
+	dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
+	var firstErr error
+	for _, ip := range ips {
+		conn, err := dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+		if err == nil {
+			return conn, nil
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	return nil, fmt.Errorf("no safe IP address found for %s", host)
+}
+
+func (iph *ImageProxyHandler) lookupSafeIPs(ctx context.Context, host string) ([]net.IP, error) {
+	host = strings.TrimSpace(strings.TrimSuffix(host, "."))
+	if host == "" {
+		return nil, fmt.Errorf("empty host")
+	}
+
+	var ips []net.IP
+	if ip := net.ParseIP(host); ip != nil {
+		ips = []net.IP{ip}
+	} else {
+		addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+		if err != nil {
+			return nil, fmt.Errorf("failed to resolve image host: %w", err)
+		}
+		ips = make([]net.IP, 0, len(addrs))
+		for _, addr := range addrs {
+			ips = append(ips, addr.IP)
+		}
+	}
+
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("image host resolved to no addresses")
+	}
+
+	safe := make([]net.IP, 0, len(ips))
+	for _, ip := range ips {
+		if iph.allowPrivateNetworks || !isUnsafeProxyIP(ip) {
+			safe = append(safe, ip)
+			continue
+		}
+		return nil, fmt.Errorf("image host resolves to blocked address: %s", ip.String())
+	}
+	if len(safe) == 0 {
+		return nil, fmt.Errorf("image host has no safe addresses")
+	}
+	return safe, nil
+}
+
+func isUnsafeProxyIP(ip net.IP) bool {
+	if ip == nil {
+		return true
+	}
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsInterfaceLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() {
+		return true
+	}
+	if v4 := ip.To4(); v4 != nil {
+		// Explicit IPv4 checks also cover IPv4-mapped IPv6 addresses.
+		if v4[0] == 10 || v4[0] == 127 || v4[0] == 0 || v4[0] >= 224 {
+			return true
+		}
+		if v4[0] == 172 && v4[1] >= 16 && v4[1] <= 31 {
+			return true
+		}
+		if v4[0] == 192 && v4[1] == 168 {
+			return true
+		}
+		if v4[0] == 169 && v4[1] == 254 {
+			return true
+		}
+		// Carrier-grade NAT (100.64.0.0/10) should not be reachable through the proxy.
+		if v4[0] == 100 && v4[1]&0xc0 == 64 {
+			return true
+		}
+	}
+	return false
 }
 
 // SetRequestHeaders sets appropriate headers for the image request based on the URL
@@ -118,7 +244,8 @@ func isHTTPURL(raw string) bool {
 	if err != nil {
 		return false
 	}
-	return (u.Scheme == "http" || u.Scheme == "https") && u.Hostname() != ""
+	scheme := strings.ToLower(u.Scheme)
+	return (scheme == "http" || scheme == "https") && u.Hostname() != ""
 }
 
 // IsBilibiliURL is exported for testing purposes

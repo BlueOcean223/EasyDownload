@@ -2,6 +2,7 @@ package ffmpeg
 
 import (
 	"EasyDownload/internal/infra/logger"
+	"context"
 	"fmt"
 	"io"
 	"io/fs"
@@ -250,6 +251,15 @@ func (fm *FFmpegManager) ExtractEmbedded() error {
 
 // Merge merges video and audio files into a single output file
 func (fm *FFmpegManager) Merge(videoPath, audioPath, outputPath string) error {
+	return fm.MergeWithContext(context.Background(), videoPath, audioPath, outputPath)
+}
+
+// MergeWithContext merges video and audio files into a single output file and
+// terminates FFmpeg when the context is cancelled.
+func (fm *FFmpegManager) MergeWithContext(ctx context.Context, videoPath, audioPath, outputPath string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	ffmpegPath := fm.GetPath()
 	if ffmpegPath == "" {
 		return fmt.Errorf("FFmpeg not available")
@@ -263,7 +273,7 @@ func (fm *FFmpegManager) Merge(videoPath, audioPath, outputPath string) error {
 
 	logger.Debug("Merging video and audio: %s + %s -> %s", videoPath, audioPath, outputPath)
 
-	cmd := exec.Command(ffmpegPath,
+	cmd := exec.CommandContext(ctx, ffmpegPath,
 		"-i", videoPath,
 		"-i", audioPath,
 		"-c", "copy",
@@ -284,12 +294,21 @@ func (fm *FFmpegManager) Merge(videoPath, audioPath, outputPath string) error {
 
 // MergeWithDecryption merges DRM-protected video and audio files into a single output file.
 func (fm *FFmpegManager) MergeWithDecryption(videoPath, audioPath, outputPath, decryptionKey string) error {
+	return fm.MergeWithDecryptionWithContext(context.Background(), videoPath, audioPath, outputPath, decryptionKey)
+}
+
+// MergeWithDecryptionWithContext merges DRM-protected video and audio files and
+// terminates FFmpeg when the context is cancelled.
+func (fm *FFmpegManager) MergeWithDecryptionWithContext(ctx context.Context, videoPath, audioPath, outputPath, decryptionKey string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	ffmpegPath := fm.GetPath()
 	if ffmpegPath == "" {
 		return fmt.Errorf("FFmpeg not available")
 	}
 	if decryptionKey == "" {
-		return fm.Merge(videoPath, audioPath, outputPath)
+		return fm.MergeWithContext(ctx, videoPath, audioPath, outputPath)
 	}
 
 	// Ensure output directory exists
@@ -300,7 +319,7 @@ func (fm *FFmpegManager) MergeWithDecryption(videoPath, audioPath, outputPath, d
 
 	logger.Debug("Merging DRM video and audio: %s + %s -> %s", videoPath, audioPath, outputPath)
 
-	cmd := exec.Command(ffmpegPath,
+	cmd := exec.CommandContext(ctx, ffmpegPath,
 		"-decryption_key", decryptionKey,
 		"-i", videoPath,
 		"-decryption_key", decryptionKey,

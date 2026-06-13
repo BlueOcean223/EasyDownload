@@ -161,15 +161,19 @@ func (a *App) startup(ctx context.Context) {
 		runtime.EventsEmit(a.ctx, "video:detected", video)
 	})
 
-	// Initialize download manager
+	// Initialize download manager and restore persisted task state.
 	a.downloadManager = downloader.NewDownloadManager(a.downloadDir, 3)
+	a.downloadManager.SetStatePath(filepath.Join(utils.GetAppDataDir(), "downloads.json"))
+	if err := a.downloadManager.LoadState(); err != nil {
+		logger.Error("Failed to load download state: %v", err)
+	}
 	a.downloadManager.SetProgressCallback(func(task *downloader.DownloadTask) {
 		runtime.EventsEmit(a.ctx, "download:progress", task.TaskToJSON())
 	})
 	a.downloadManager.SetCompleteCallback(func(task *downloader.DownloadTask) {
 		runtime.EventsEmit(a.ctx, "download:complete", task.TaskToJSON())
 		// Show notification for download complete
-		if a.trayManager != nil {
+		if a.showNotification && a.trayManager != nil {
 			a.trayManager.ShowNotification("下载完成", task.Title)
 		}
 	})
@@ -197,6 +201,11 @@ func (a *App) startup(ctx context.Context) {
 	a.xhsParser = xiaohongshu.NewParser()
 	a.xhsClient = xiaohongshu.NewClient()
 	a.xhsDownloader = xiaohongshu.NewDownloader()
+
+	// Douyin/XHS custom downloader closures cannot be reconstructed safely from
+	// persisted state alone. Mark unfinished restored tasks as needing re-parse
+	// instead of letting them resume through the generic HTTP downloader.
+	a.markUnresumableRestoredCustomTasks()
 
 	// Initialize FFmpeg manager with embedded FFmpeg
 	a.ffmpegManager = ffmpeg.NewFFmpegManager()
@@ -305,7 +314,7 @@ func (a *App) startup(ctx context.Context) {
 		runtime.EventsEmit(a.ctx, "download:start", task.TaskToJSON())
 
 		// Show notification
-		if a.trayManager != nil {
+		if a.showNotification && a.trayManager != nil {
 			a.trayManager.ShowNotification("开始下载", video.Title)
 		}
 	})
@@ -349,6 +358,12 @@ func (a *App) initTray() {
 
 // shutdown is called when the app is closing
 func (a *App) shutdown(ctx context.Context) {
+	if a.downloadManager != nil {
+		if err := a.downloadManager.SaveState(); err != nil {
+			logger.Warn("Failed to save download state on shutdown: %v", err)
+		}
+	}
+
 	// Stop tray manager
 	if a.trayManager != nil {
 		a.trayManager.Stop()
@@ -483,6 +498,56 @@ func (a *App) RemoveDetectedVideo(id string) {
 
 // ==================== Download Methods ====================
 
+func (a *App) markUnresumableRestoredCustomTasks() {
+	if a.downloadManager == nil {
+		return
+	}
+	changed := false
+	for _, task := range a.downloadManager.GetAllTasks() {
+		status := task.GetStatus()
+		if status == downloader.StatusCompleted || status == downloader.StatusCancelled {
+			continue
+		}
+		source := strings.ToLower(strings.TrimSpace(task.Source))
+		if (source == "douyin" || source == "xiaohongshu") && task.GetCustomDownloader() == nil {
+			task.SetStatus(downloader.StatusFailed)
+			task.SetError("应用重启后需要重新解析后再下载")
+			changed = true
+		}
+	}
+	if changed {
+		if err := a.downloadManager.SaveState(); err != nil {
+			logger.Warn("Failed to save restored custom task state: %v", err)
+		}
+	}
+}
+
+func (a *App) ensureBilibiliTaskDownloader(task *downloader.DownloadTask) error {
+	if task == nil || strings.ToLower(strings.TrimSpace(task.Source)) != "bilibili" || task.GetCustomDownloader() != nil {
+		return nil
+	}
+
+	quality := 80
+	fmt.Sscanf(task.Quality, "%d", &quality)
+
+	partIndex := parseBilibiliTaskPartIndex(task.ID)
+	var video *bilibili.BilibiliVideo
+	var err error
+	if partIndex >= 0 {
+		video, err = a.getBilibiliVideoInfoWithPartsForDownload(task.URL)
+	} else {
+		video, err = a.GetBilibiliVideoInfo(task.URL)
+		if err == nil && video.IsBangumi {
+			partIndex = video.CurrentPartIndex
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("failed to get Bilibili video info: %w", err)
+	}
+	task.SetCustomDownloader(a.createBilibiliDownloader(video, quality, partIndex))
+	return nil
+}
+
 // DownloadVideo adds a video to the download queue
 func (a *App) DownloadVideo(id, url, title, cover, source, quality string) (map[string]interface{}, error) {
 	return a.DownloadVideoWithKey(id, url, title, cover, source, quality, "")
@@ -515,27 +580,16 @@ func (a *App) ResumeDownload(id string) error {
 		return err
 	}
 
-	// For Bilibili tasks, ensure custom downloader is set (may be lost after app restart)
-	if task.Source == "bilibili" && task.GetCustomDownloader() == nil {
-		quality := 80
-		fmt.Sscanf(task.Quality, "%d", &quality)
+	// For Bilibili tasks, ensure custom downloader is set (may be lost after app restart).
+	if err := a.ensureBilibiliTaskDownloader(task); err != nil {
+		return err
+	}
 
-		partIndex := parseBilibiliTaskPartIndex(task.ID)
-		var video *bilibili.BilibiliVideo
-		if partIndex >= 0 {
-			video, err = a.getBilibiliVideoInfoWithPartsForDownload(task.URL)
-		} else {
-			video, err = a.GetBilibiliVideoInfo(task.URL)
-			if err == nil && video.IsBangumi {
-				partIndex = video.CurrentPartIndex
-			}
+	if task.GetCustomDownloader() == nil {
+		source := strings.ToLower(strings.TrimSpace(task.Source))
+		if source == "douyin" || source == "xiaohongshu" {
+			return fmt.Errorf("%s 任务在应用重启后需要重新解析后再下载", task.Source)
 		}
-		if err != nil {
-			return fmt.Errorf("failed to get Bilibili video info: %w", err)
-		}
-
-		// Re-create the custom downloader
-		task.SetCustomDownloader(a.createBilibiliDownloader(video, quality, partIndex))
 	}
 
 	// Use unified resume logic for all sources
@@ -545,6 +599,24 @@ func (a *App) ResumeDownload(id string) error {
 // CancelDownload cancels a download
 func (a *App) CancelDownload(id string) error {
 	return a.downloadManager.CancelTask(id)
+}
+
+// RetryDownload retries a failed download task.
+func (a *App) RetryDownload(id string) error {
+	task, err := a.downloadManager.GetTask(id)
+	if err != nil {
+		return err
+	}
+	if err := a.ensureBilibiliTaskDownloader(task); err != nil {
+		return err
+	}
+	if task.GetCustomDownloader() == nil {
+		source := strings.ToLower(strings.TrimSpace(task.Source))
+		if source == "douyin" || source == "xiaohongshu" {
+			return fmt.Errorf("%s 任务在应用重启后需要重新解析后再下载", task.Source)
+		}
+	}
+	return a.downloadManager.RetryTask(id)
 }
 
 // RemoveDownload removes a download from the list
@@ -1218,14 +1290,23 @@ func (a *App) GetAppInfo() map[string]interface{} {
 	if a.ffmpegManager != nil {
 		ffmpegPath = a.ffmpegManager.GetPath()
 	}
+	apiToken := ""
+	if a.internalAPI != nil {
+		apiToken = a.internalAPI.GetToken()
+	}
+	certPath := ""
+	if a.certManager != nil {
+		certPath = a.certManager.GetCertPath()
+	}
 
 	return map[string]interface{}{
 		"version":              "1.0.0",
 		"proxyPort":            a.proxyPort,
 		"apiPort":              a.apiPort,
+		"apiToken":             apiToken,
 		"downloadDir":          a.downloadDir,
 		"ffmpegPath":           ffmpegPath,
-		"certPath":             a.certManager.GetCertPath(),
+		"certPath":             certPath,
 		"minimizeToTray":       a.minimizeToTray,
 		"showNotification":     a.showNotification,
 		"firstRunComplete":     a.firstRunComplete,

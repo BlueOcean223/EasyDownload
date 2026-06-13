@@ -2,12 +2,16 @@ package api
 
 import (
 	"EasyDownload/internal/infra/logger"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 )
 
 // VideoSpec represents video specification for a specific quality
@@ -43,6 +47,7 @@ type DetectedVideo struct {
 type InternalAPI struct {
 	server *http.Server
 	port   int
+	token  string
 	mu     sync.RWMutex
 
 	// Detected videos storage
@@ -60,9 +65,80 @@ type InternalAPI struct {
 func NewInternalAPI(port int) *InternalAPI {
 	return &InternalAPI{
 		port:           port,
+		token:          generateAPIToken(),
 		detectedVideos: make([]DetectedVideo, 0),
 		imageProxy:     NewImageProxyHandler(),
 	}
+}
+
+func generateAPIToken() string {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err == nil {
+		return hex.EncodeToString(buf)
+	}
+	// Extremely unlikely fallback; still avoids a hard-coded token.
+	return fmt.Sprintf("fallback-%d", time.Now().UnixNano())
+}
+
+// GetToken returns the per-process token required by browser-facing API routes.
+func (api *InternalAPI) GetToken() string {
+	api.mu.RLock()
+	defer api.mu.RUnlock()
+	return api.token
+}
+
+func (api *InternalAPI) isAuthorized(r *http.Request) bool {
+	token := api.GetToken()
+	if token == "" {
+		return true
+	}
+	provided := r.Header.Get("X-EasyDownload-Token")
+	if provided == "" {
+		provided = r.URL.Query().Get("token")
+	}
+	if provided == "" || len(provided) != len(token) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(provided), []byte(token)) == 1
+}
+
+func (api *InternalAPI) authHandler(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !api.isAuthorized(r) {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		h(w, r)
+	}
+}
+
+func (api *InternalAPI) isAllowedOrigin(origin string) bool {
+	origin = strings.TrimSpace(origin)
+	if origin == "" {
+		return false
+	}
+	if origin == "null" {
+		return false
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	scheme := strings.ToLower(u.Scheme)
+	host := strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
+	if scheme == "wails" && (host == "wails.localhost" || host == "localhost") {
+		return true
+	}
+	if scheme == "http" || scheme == "https" {
+		if host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "wails.localhost" || strings.HasSuffix(host, ".localhost") {
+			return true
+		}
+		// Legacy injected scripts post detections from WeChat pages.
+		if host == "channels.weixin.qq.com" {
+			return true
+		}
+	}
+	return false
 }
 
 // SetVideoCallback sets the callback for new detected videos
@@ -77,12 +153,17 @@ func (api *InternalAPI) Start() error {
 
 	mux := http.NewServeMux()
 
-	// CORS middleware
+	// CORS middleware. Do not use '*' here: only the desktop frontend,
+	// localhost development server and the known WeChat origin are allowed.
 	corsHandler := func(h http.HandlerFunc) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Access-Control-Allow-Origin", "*")
+			w.Header().Add("Vary", "Origin")
+			if origin := r.Header.Get("Origin"); api.isAllowedOrigin(origin) {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+			}
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Range")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Range, X-EasyDownload-Token")
+			w.Header().Set("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges")
 
 			if r.Method == "OPTIONS" {
 				w.WriteHeader(http.StatusOK)
@@ -92,22 +173,25 @@ func (api *InternalAPI) Start() error {
 			h(w, r)
 		}
 	}
+	secure := func(h http.HandlerFunc) http.HandlerFunc {
+		return corsHandler(api.authHandler(h))
+	}
 
 	// Routes
-	mux.HandleFunc("/api/detect", corsHandler(api.handleDetect))
-	mux.HandleFunc("/api/videos", corsHandler(api.handleGetVideos))
-	mux.HandleFunc("/api/clear", corsHandler(api.handleClear))
+	mux.HandleFunc("/api/detect", secure(api.handleDetect))
+	mux.HandleFunc("/api/videos", secure(api.handleGetVideos))
+	mux.HandleFunc("/api/clear", secure(api.handleClear))
 	mux.HandleFunc("/api/health", corsHandler(api.handleHealth))
-	mux.HandleFunc("/api/proxy-image", corsHandler(api.handleProxyImage))
-	mux.HandleFunc("/api/proxy-media", corsHandler(api.handleProxyMedia))
+	mux.HandleFunc("/api/proxy-image", secure(api.handleProxyImage))
+	mux.HandleFunc("/api/proxy-media", secure(api.handleProxyMedia))
 
 	api.server = &http.Server{
-		Addr:    fmt.Sprintf(":%d", api.port),
+		Addr:    fmt.Sprintf("127.0.0.1:%d", api.port),
 		Handler: mux,
 	}
 
 	go func() {
-		logger.Debug("Internal API server started on port %d", api.port)
+		logger.Debug("Internal API server started on 127.0.0.1:%d", api.port)
 		if err := api.server.ListenAndServe(); err != http.ErrServerClosed {
 			logger.Error("Internal API server error: %v", err)
 		}
@@ -282,10 +366,14 @@ var allowedMediaDomains = []string{
 // isAllowedMediaDomain checks if the given URL's host is in the allowed domains list.
 func isAllowedMediaDomain(rawURL string) bool {
 	u, err := url.Parse(rawURL)
-	if err != nil || u.Host == "" {
+	if err != nil || u.Hostname() == "" {
 		return false
 	}
-	host := strings.ToLower(u.Host)
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return false
+	}
+	host := strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
 	for _, domain := range allowedMediaDomains {
 		if host == domain || strings.HasSuffix(host, "."+domain) {
 			return true

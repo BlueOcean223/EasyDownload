@@ -33,6 +33,37 @@ func TotalSizeFromContentRange(contentRange string) int64 {
 	return totalSizeFromContentRange(contentRange)
 }
 
+func byteRangeFromContentRange(contentRange string) (start, end, total int64, ok bool) {
+	cr := strings.TrimSpace(contentRange)
+	if cr == "" {
+		return 0, 0, 0, false
+	}
+	parts := strings.Fields(cr)
+	if len(parts) != 2 || strings.ToLower(parts[0]) != "bytes" {
+		return 0, 0, 0, false
+	}
+	rangeAndTotal := parts[1]
+	slash := strings.LastIndex(rangeAndTotal, "/")
+	if slash <= 0 || slash+1 >= len(rangeAndTotal) {
+		return 0, 0, 0, false
+	}
+	rangePart := rangeAndTotal[:slash]
+	dash := strings.Index(rangePart, "-")
+	if dash <= 0 || dash+1 >= len(rangePart) {
+		return 0, 0, 0, false
+	}
+	start, err := strconv.ParseInt(strings.TrimSpace(rangePart[:dash]), 10, 64)
+	if err != nil || start < 0 {
+		return 0, 0, 0, false
+	}
+	end, err = strconv.ParseInt(strings.TrimSpace(rangePart[dash+1:]), 10, 64)
+	if err != nil || end < start {
+		return 0, 0, 0, false
+	}
+	total = totalSizeFromContentRange(contentRange)
+	return start, end, total, true
+}
+
 func shortenForLog(s string, max int) string {
 	if max <= 0 {
 		return ""

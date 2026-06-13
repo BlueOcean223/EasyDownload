@@ -226,6 +226,10 @@ export function ResumeDownload(arg1) {
   return window['go']['main']['App']['ResumeDownload'](arg1);
 }
 
+export function RetryDownload(arg1) {
+  return window['go']['main']['App']['RetryDownload'](arg1);
+}
+
 export function SelectDownloadDir() {
   return window['go']['main']['App']['SelectDownloadDir']();
 }

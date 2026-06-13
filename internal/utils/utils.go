@@ -131,13 +131,19 @@ func padZero(n int) string {
 	return formatInt(int64(n))
 }
 
-// GetInjectScript returns the JavaScript code to inject into WeChat pages
-func GetInjectScript(apiPort int) string {
+// GetInjectScript returns the JavaScript code to inject into WeChat pages.
+// If apiToken is provided, requests include the internal API auth header.
+func GetInjectScript(apiPort int, apiToken ...string) string {
+	token := ""
+	if len(apiToken) > 0 {
+		token = apiToken[0]
+	}
 	return `
 (function() {
 	'use strict';
 	
 	const API_URL = 'http://127.0.0.1:` + formatInt(int64(apiPort)) + `/api/detect';
+	const API_TOKEN = '` + token + `';
 	const sentVideos = new Set();
 	
 	// Send video info to desktop app
@@ -145,9 +151,11 @@ func GetInjectScript(apiPort int) string {
 		if (sentVideos.has(info.url)) return;
 		sentVideos.add(info.url);
 		
+		const headers = { 'Content-Type': 'application/json' };
+		if (API_TOKEN) headers['X-EasyDownload-Token'] = API_TOKEN;
 		fetch(API_URL, {
 			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
+			headers: headers,
 			body: JSON.stringify(info)
 		}).catch(console.error);
 	}

@@ -117,6 +117,8 @@ export function RestoreFromTray():Promise<void>;
 
 export function ResumeDownload(arg1:string):Promise<void>;
 
+export function RetryDownload(arg1:string):Promise<void>;
+
 export function SelectDownloadDir():Promise<string>;
 
 export function SetBilibiliSessData(arg1:string):Promise<void>;

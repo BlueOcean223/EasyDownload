@@ -118,9 +118,19 @@ func (ps *ProxyServer) SetVideoCallback(callback func(VideoInfo)) {
 	ps.onVideoDetected = callback
 }
 
-// SetUpstreamProxy sets the upstream proxy URL for proxy chaining
+// SetUpstreamProxy sets the upstream proxy URL for proxy chaining.
+// When the proxy is already running, the outbound transport is rebuilt so the
+// change takes effect immediately for new upstream requests.
 func (ps *ProxyServer) SetUpstreamProxy(proxyURL string) {
-	ps.upstreamProxy = proxyURL
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
+	ps.upstreamProxy = strings.TrimSpace(proxyURL)
+	if ps.running && ps.proxy != nil && ps.proxy.Tr != nil {
+		// The transport's Proxy func reads ps.upstreamProxy for every new request;
+		// close idle connections so future requests pick up the new routing promptly.
+		ps.proxy.Tr.CloseIdleConnections()
+	}
 }
 
 // SetDebug enables/disables verbose proxy diagnostics logging.
@@ -149,19 +159,33 @@ func (ps *ProxyServer) setupTransport() {
 		MaxIdleConnsPerHost: 10,
 	}
 
-	// Add upstream proxy if configured
+	// The proxy function reads the latest upstream setting per request, allowing
+	// runtime changes without swapping ps.proxy.Tr while requests are in flight.
+	transport.Proxy = ps.upstreamProxyForRequest
 	if ps.upstreamProxy != "" {
-		proxyURL, err := url.Parse(ps.upstreamProxy)
-		if err != nil {
-			logger.Error("Invalid upstream proxy URL: %v", err)
-		} else {
-			transport.Proxy = http.ProxyURL(proxyURL)
-			logger.Info("Using upstream proxy: %s", ps.upstreamProxy)
-		}
+		logger.Info("Using upstream proxy: %s", ps.upstreamProxy)
 	}
 
+	if oldTransport := ps.proxy.Tr; oldTransport != nil {
+		oldTransport.CloseIdleConnections()
+	}
 	ps.proxy.Tr = transport
 	logger.Info("Transport configured: HTTP/2 disabled, connection pooling enabled")
+}
+
+func (ps *ProxyServer) upstreamProxyForRequest(req *http.Request) (*url.URL, error) {
+	ps.mu.RLock()
+	proxyURL := strings.TrimSpace(ps.upstreamProxy)
+	ps.mu.RUnlock()
+	if proxyURL == "" {
+		return nil, nil
+	}
+	parsed, err := url.Parse(proxyURL)
+	if err != nil {
+		logger.Error("Invalid upstream proxy URL: %v", err)
+		return nil, nil
+	}
+	return parsed, nil
 }
 
 // Start starts the proxy server
@@ -206,8 +230,9 @@ func (ps *ProxyServer) Start() error {
 	// Configure optimized transport (always, regardless of upstream proxy)
 	ps.setupTransport()
 
-	// Start listening
-	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", ps.port))
+	// Start listening on localhost only. This proxy is intended for the local
+	// desktop app/system proxy and must not become reachable from the LAN.
+	listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", ps.port))
 	if err != nil {
 		return fmt.Errorf("failed to start listener: %w", err)
 	}
@@ -221,7 +246,7 @@ func (ps *ProxyServer) Start() error {
 		}
 	}()
 
-	logger.Info("Proxy server started on port %d", ps.port)
+	logger.Info("Proxy server started on 127.0.0.1:%d", ps.port)
 	return nil
 }
 
@@ -317,28 +342,34 @@ func PassThroughDomains() []string {
 
 // setupHandlers configures the goproxy request and response handlers
 func (ps *ProxyServer) setupHandlers() {
-	// Use selective MITM: only MITM for domains where we need to inject scripts
-	// Video streaming domains are passed through directly (no MITM) to ensure smooth playback
+	// Use strict selective MITM: only domains listed in MITMDomains are decrypted.
+	// Everything else is passed through as a direct CONNECT tunnel to avoid
+	// breaking unrelated traffic and to keep the privacy boundary narrow.
 	ps.proxy.OnRequest().HandleConnectFunc(func(host string, ctx *goproxy.ProxyCtx) (*goproxy.ConnectAction, string) {
-		// Check if this is a video streaming domain that should pass through
-		for _, domain := range PassThroughDomains() {
-			if hostMatchesDomain(host, domain) {
-				if ps.debug {
-					logger.Info("[proxy-debug] CONNECT pass-through (no MITM): %s", host)
-				}
-				return goproxy.OkConnect, host // Direct tunnel, no MITM
+		if shouldMITMHost(host) {
+			if ps.debug {
+				logger.Info("[proxy-debug] CONNECT MITM: %s", host)
 			}
+			return goproxy.MitmConnect, host
 		}
-		// For all other domains, use MITM
 		if ps.debug {
-			logger.Info("[proxy-debug] CONNECT MITM: %s", host)
+			logger.Info("[proxy-debug] CONNECT pass-through (outside MITM allowlist): %s", host)
 		}
-		return goproxy.MitmConnect, host
+		return goproxy.OkConnect, host
 	})
-	logger.Info("Configured CONNECT handling: selective MITM (video streaming domains pass-through)")
+	logger.Info("Configured CONNECT handling: strict MITM allowlist")
 
 	// Set up WeChat-specific handlers
 	ps.setupWeChatHandlers()
+}
+
+func shouldMITMHost(host string) bool {
+	for _, domain := range MITMDomains() {
+		if hostMatchesDomain(host, domain) {
+			return true
+		}
+	}
+	return false
 }
 
 func hostMatchesDomain(host, domain string) bool {
@@ -683,14 +714,24 @@ func (ps *ProxyServer) handleWeChatHTMLResponse(resp *http.Response, ctx *goprox
 		return resp
 	}
 
-	// Read response body (decode gzip/br if possible)
-	body, decoded, err := readResponseBody(resp)
+	// Read raw bytes first and restore the original body. If the response uses an
+	// unsupported/invalid Content-Encoding, returning resp below still preserves
+	// the original body for pass-through.
+	rawBody, err := readResponseBodyRaw(resp)
 	if err != nil {
 		logger.Error("Failed to read HTML response body: %v", err)
 		return resp
 	}
-	// If Content-Encoding exists but we couldn't decode it, do NOT modify this response
-	if !decoded && strings.TrimSpace(resp.Header.Get("Content-Encoding")) != "" {
+	encoding := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding")))
+	body, decoded, err := decodeBodyBytes(rawBody, encoding)
+	if err != nil {
+		if ps.debug && ctx != nil && ctx.Req != nil {
+			logger.Info("[proxy-debug] SKIP html (decode failed enc=%q): %s", resp.Header.Get("Content-Encoding"), ctx.Req.URL.String())
+		}
+		return resp
+	}
+	// If Content-Encoding exists but we didn't decode it, do NOT modify this response.
+	if !decoded && encoding != "" {
 		if ps.debug && ctx != nil && ctx.Req != nil {
 			logger.Info("[proxy-debug] SKIP html (cannot decode enc=%q): %s", resp.Header.Get("Content-Encoding"), ctx.Req.URL.String())
 		}

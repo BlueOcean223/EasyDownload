@@ -386,30 +386,44 @@ func (bd *BilibiliDownloader) downloadCore(
 
 	// 如果可用，使用 FFmpegManager，否则回退到直接执行
 	if bd.ffmpegManager != nil && stream.DRMKey == "" {
-		if err := bd.ffmpegManager.Merge(videoPath, audioPath, outputPath); err != nil {
+		var err error
+		if ctxMerger, ok := bd.ffmpegManager.(interface {
+			MergeWithContext(context.Context, string, string, string) error
+		}); ok {
+			err = ctxMerger.MergeWithContext(ctx, videoPath, audioPath, outputPath)
+		} else {
+			err = bd.ffmpegManager.Merge(videoPath, audioPath, outputPath)
+		}
+		if err != nil {
+			if ctx.Err() != nil {
+				logger.Info("Merge interrupted, keeping temp files")
+				return "", ctx.Err()
+			}
 			logger.Error("FFmpeg merge failed: %v", err)
 			cleanupTempFiles()
 			return "", fmt.Errorf("failed to merge video and audio: %w", err)
 		}
 	} else if bd.ffmpegManager != nil && stream.DRMKey != "" {
+		var err error
 		if drmMerger, ok := bd.ffmpegManager.(interface {
+			MergeWithDecryptionWithContext(context.Context, string, string, string, string) error
+		}); ok {
+			err = drmMerger.MergeWithDecryptionWithContext(ctx, videoPath, audioPath, outputPath, stream.DRMKey)
+		} else if drmMerger, ok := bd.ffmpegManager.(interface {
 			MergeWithDecryption(videoPath, audioPath, outputPath, decryptionKey string) error
 		}); ok {
-			if err := drmMerger.MergeWithDecryption(videoPath, audioPath, outputPath, stream.DRMKey); err != nil {
-				logger.Error("FFmpeg DRM merge failed: %v", err)
-				cleanupTempFiles()
-				return "", fmt.Errorf("failed to merge DRM video and audio: %w", err)
-			}
+			err = drmMerger.MergeWithDecryption(videoPath, audioPath, outputPath, stream.DRMKey)
 		} else {
-			if err := bd.mergeWithFFmpegCommand(ctx, videoPath, audioPath, outputPath, stream.DRMKey); err != nil {
-				if ctx.Err() != nil {
-					logger.Info("Merge interrupted, keeping temp files")
-					return "", ctx.Err()
-				}
-				logger.Error("FFmpeg DRM merge failed: %v", err)
-				cleanupTempFiles()
-				return "", fmt.Errorf("failed to merge DRM video and audio: %w", err)
+			err = bd.mergeWithFFmpegCommand(ctx, videoPath, audioPath, outputPath, stream.DRMKey)
+		}
+		if err != nil {
+			if ctx.Err() != nil {
+				logger.Info("Merge interrupted, keeping temp files")
+				return "", ctx.Err()
 			}
+			logger.Error("FFmpeg DRM merge failed: %v", err)
+			cleanupTempFiles()
+			return "", fmt.Errorf("failed to merge DRM video and audio: %w", err)
 		}
 	} else {
 		if err := bd.mergeWithFFmpegCommand(ctx, videoPath, audioPath, outputPath, ""); err != nil {

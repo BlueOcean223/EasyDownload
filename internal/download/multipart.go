@@ -124,7 +124,6 @@ func (md *MultipartDownloader) probeByRange(ctx context.Context, url string) (su
 
 // CheckRangeSupport checks if the server supports range requests
 func (md *MultipartDownloader) CheckRangeSupport(ctx context.Context, url string) RangeCheckResult {
-	headSupportsRange := false
 	headContentLength := int64(0)
 	headStatus := 0
 	headAcceptRanges := ""
@@ -139,7 +138,6 @@ func (md *MultipartDownloader) CheckRangeSupport(ctx context.Context, url string
 		if resp, err := md.client.Do(req); err == nil && resp != nil {
 			headStatus = resp.StatusCode
 			headAcceptRanges = resp.Header.Get("Accept-Ranges")
-			headSupportsRange = headAcceptRanges == "bytes"
 			headContentLength = resp.ContentLength
 			_ = resp.Body.Close()
 		}
@@ -148,16 +146,22 @@ func (md *MultipartDownloader) CheckRangeSupport(ctx context.Context, url string
 	// Definitive probe using GET Range, which can provide total length via Content-Range.
 	supportsRange, total, probeErr := md.probeByRange(ctx, url)
 	if probeErr != nil {
-		// If range probe fails, fall back to what we learned from HEAD.
+		// If range probe fails, keep only the size learned from HEAD. Range support
+		// must be proven by a 206 GET response; trusting HEAD alone can corrupt
+		// multipart downloads when servers ignore Range on GET.
 		if headStatus == http.StatusOK && headContentLength > 0 {
-			logger.Debug("Range check fallback to HEAD: status=%d acceptRanges=%q len=%d err=%v", headStatus, headAcceptRanges, headContentLength, probeErr)
-			return RangeCheckResult{SupportsRange: headSupportsRange, ContentLength: headContentLength, Error: nil}
+			logger.Debug("Range check fallback to HEAD size only: status=%d acceptRanges=%q len=%d err=%v", headStatus, headAcceptRanges, headContentLength, probeErr)
+			return RangeCheckResult{SupportsRange: false, ContentLength: headContentLength, Error: nil}
+		}
+		if headContentLength > 0 {
+			return RangeCheckResult{SupportsRange: false, ContentLength: headContentLength, Error: nil}
 		}
 		return RangeCheckResult{Error: probeErr}
 	}
 
-	// Merge: if server honored range, always treat as supports range even if HEAD lied.
-	finalSupports := supportsRange || headSupportsRange
+	// GET Range probe is authoritative. HEAD may claim Accept-Ranges while the
+	// actual body endpoint ignores Range, so never OR it into the final answer.
+	finalSupports := supportsRange
 	finalLen := total
 	if finalLen <= 0 && headContentLength > 0 {
 		finalLen = headContentLength
@@ -427,6 +431,7 @@ func (md *MultipartDownloader) downloadChunk(
 	// Set headers
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, chunk.End))
+	req.Header.Set("Accept-Encoding", "identity")
 
 	for key, value := range md.headers {
 		req.Header.Set(key, value)
@@ -438,8 +443,18 @@ func (md *MultipartDownloader) downloadChunk(
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusPartialContent {
+		return fmt.Errorf("unexpected status code for range chunk: %d", resp.StatusCode)
+	}
+	crStart, crEnd, crTotal, ok := byteRangeFromContentRange(resp.Header.Get("Content-Range"))
+	if !ok {
+		return fmt.Errorf("missing or invalid Content-Range for chunk %d", chunk.Index)
+	}
+	if crStart != start || crEnd != chunk.End {
+		return fmt.Errorf("Content-Range mismatch for chunk %d: got %d-%d, want %d-%d", chunk.Index, crStart, crEnd, start, chunk.End)
+	}
+	if crTotal > 0 && crEnd >= crTotal {
+		return fmt.Errorf("invalid Content-Range total for chunk %d: end=%d total=%d", chunk.Index, crEnd, crTotal)
 	}
 
 	// Open file for writing at correct offset
@@ -492,10 +507,16 @@ func (md *MultipartDownloader) downloadChunk(
 
 		if readErr != nil {
 			if readErr == io.EOF {
+				if remaining > 0 {
+					return io.ErrUnexpectedEOF
+				}
 				break
 			}
 			return readErr
 		}
+	}
+	if remaining > 0 {
+		return io.ErrUnexpectedEOF
 	}
 
 	chunk.Downloaded = chunkDownloaded

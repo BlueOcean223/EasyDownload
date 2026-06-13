@@ -154,14 +154,24 @@ func DownloadFileResumable(ctx context.Context, client *http.Client, rawURL, des
 			return 0, 0, err
 		}
 
-		// Handle 416 Range Not Satisfiable (file already complete)
+		// Handle 416 Range Not Satisfiable. This only means success when the
+		// local file size exactly matches the server's total size; if the local
+		// file is larger or the total is unknown, treating it as complete can
+		// preserve a corrupt file.
 		if resp.StatusCode == http.StatusRequestedRangeNotSatisfiable && downloaded > 0 {
+			serverTotal := TotalSizeFromContentRange(resp.Header.Get("Content-Range"))
+			if serverTotal <= 0 {
+				serverTotal = opts.TotalHint
+			}
 			resp.Body.Close()
 			cancel()
-			if onProgress != nil {
-				onProgress(downloaded, downloaded)
+			if serverTotal > 0 && downloaded == serverTotal {
+				if onProgress != nil {
+					onProgress(downloaded, serverTotal)
+				}
+				return downloaded, serverTotal, nil
 			}
-			return downloaded, downloaded, nil
+			return downloaded, serverTotal, fmt.Errorf("range not satisfiable: local size=%d remote size=%d", downloaded, serverTotal)
 		}
 
 		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {

@@ -87,8 +87,12 @@ type DownloadManager struct {
 	maxConcurrent int
 	// activeTasks tracks the current number of running downloads.
 	activeTasks int
-	// activeTasksMu protects activeTasks counter for concurrent access.
+	// activeTasksMu protects activeTasks and the pending start queue.
 	activeTasksMu sync.Mutex
+	// queuedTasks holds tasks waiting for an available download slot.
+	queuedTasks []*DownloadTask
+	// queuedTaskIDs prevents the same task from being queued more than once.
+	queuedTaskIDs map[string]struct{}
 
 	// Retry configuration
 	// autoRetry enables automatic retry on transient download failures.
@@ -133,6 +137,8 @@ func NewDownloadManager(downloadDir string, maxConcurrent int) *DownloadManager 
 		tasks:         make(map[string]*DownloadTask),
 		downloadDir:   downloadDir,
 		maxConcurrent: maxConcurrent,
+		queuedTasks:   make([]*DownloadTask, 0),
+		queuedTaskIDs: make(map[string]struct{}),
 		autoRetry:     DefaultRetryEnabled,
 		maxRetry:      DefaultMaxRetry,
 		baseDelay:     DefaultBaseDelay,
@@ -167,6 +173,15 @@ func (dm *DownloadManager) SetStatePath(path string) {
 	dm.statePath = path
 }
 
+func (dm *DownloadManager) saveStateBestEffort() {
+	if dm.statePath == "" {
+		return
+	}
+	if err := dm.SaveState(); err != nil {
+		logger.Warn("Failed to save download state: %v", err)
+	}
+}
+
 // SetRetryCallback sets a callback function that is invoked before each retry attempt.
 // The callback receives the task, the current attempt number, and the delay before retry.
 func (dm *DownloadManager) SetRetryCallback(callback func(task *DownloadTask, attempt int, delay time.Duration)) {
@@ -180,6 +195,8 @@ func (dm *DownloadManager) GetMaxRetry() int {
 
 // GetMaxConcurrent returns the maximum number of concurrent downloads allowed.
 func (dm *DownloadManager) GetMaxConcurrent() int {
+	dm.activeTasksMu.Lock()
+	defer dm.activeTasksMu.Unlock()
 	return dm.maxConcurrent
 }
 
@@ -187,9 +204,13 @@ func (dm *DownloadManager) GetMaxConcurrent() int {
 // This only affects future download starts; currently running downloads are not affected.
 // Values <= 0 are ignored.
 func (dm *DownloadManager) SetMaxConcurrent(max int) {
-	if max > 0 {
-		dm.maxConcurrent = max
+	if max <= 0 {
+		return
 	}
+	dm.activeTasksMu.Lock()
+	dm.maxConcurrent = max
+	dm.activeTasksMu.Unlock()
+	dm.dispatchQueued()
 }
 
 // GetActiveTaskCount returns the number of downloads currently in progress.
@@ -270,7 +291,13 @@ func (dm *DownloadManager) AddTask(id, rawURL, title, cover, source, quality str
 //   - The URL fails validation for the specified source
 func (dm *DownloadManager) AddTaskWithDecodeKey(id, rawURL, title, cover, source, quality, decodeKey string) (*DownloadTask, error) {
 	dm.tasksMu.Lock()
-	defer dm.tasksMu.Unlock()
+	added := false
+	defer func() {
+		dm.tasksMu.Unlock()
+		if added {
+			dm.saveStateBestEffort()
+		}
+	}()
 
 	// Prevent duplicate task IDs
 	if _, exists := dm.tasks[id]; exists {
@@ -333,8 +360,9 @@ func (dm *DownloadManager) AddTaskWithDecodeKey(id, rawURL, title, cover, source
 	if baseName == "" {
 		baseName = fmt.Sprintf("video_%d", time.Now().UnixNano())
 	}
-	// Ensure unique filename in the download directory
-	fileName := ensureUniqueFileName(dm.downloadDir, baseName, ".mp4")
+	// Ensure unique filename in the download directory and among tasks that may
+	// not have created their output file yet.
+	fileName := dm.ensureUniqueFileNameLocked(baseName, ".mp4")
 	if usedFallbackName {
 		logger.Info("Filename fallback used: id=%q -> %q", shortenForLog(id, 120), fileName)
 	}
@@ -357,6 +385,7 @@ func (dm *DownloadManager) AddTaskWithDecodeKey(id, rawURL, title, cover, source
 	}
 
 	dm.tasks[id] = task
+	added = true
 	return task, nil
 }
 
@@ -384,14 +413,15 @@ func (dm *DownloadManager) AddTaskWithDownloader(id, url, title, cover, source, 
 }
 
 // StartTask starts downloading a task by its ID.
-// The download runs in a separate goroutine.
+// If all download slots are busy, the task remains pending and is queued until
+// another task finishes. The download runs in a separate goroutine once active.
 //
 // Returns an error if:
 //   - The task ID is not found
-//   - The task is already downloading
-//   - The maximum concurrent download limit has been reached
+//   - The task is already downloading/retrying or in a terminal state
 //
-// The task status transitions from pending to downloading upon success.
+// The task status transitions from pending/paused/failed to downloading when a
+// slot is acquired, or to pending while queued.
 func (dm *DownloadManager) StartTask(id string) error {
 	dm.tasksMu.RLock()
 	task, exists := dm.tasks[id]
@@ -401,26 +431,113 @@ func (dm *DownloadManager) StartTask(id string) error {
 		return fmt.Errorf("task %s not found", id)
 	}
 
-	// Check current status to prevent duplicate starts
-	task.mu.Lock()
-	if task.Status == StatusDownloading {
-		task.mu.Unlock()
-		return fmt.Errorf("task %s is already downloading", id)
-	}
-	task.mu.Unlock()
-
-	// Concurrency control: check and increment active task count atomically
 	dm.activeTasksMu.Lock()
-	if dm.activeTasks >= dm.maxConcurrent {
-		dm.activeTasksMu.Unlock()
-		return fmt.Errorf("maximum concurrent downloads reached")
+	if dm.queuedTaskIDs == nil {
+		dm.queuedTaskIDs = make(map[string]struct{})
 	}
-	dm.activeTasks++
+	if _, queued := dm.queuedTaskIDs[id]; queued {
+		dm.activeTasksMu.Unlock()
+		return nil
+	}
+
+	task.mu.Lock()
+	switch task.Status {
+	case StatusDownloading, StatusRetrying:
+		task.mu.Unlock()
+		dm.activeTasksMu.Unlock()
+		return fmt.Errorf("task %s is already downloading", id)
+	case StatusCompleted, StatusCancelled:
+		status := task.Status
+		task.mu.Unlock()
+		dm.activeTasksMu.Unlock()
+		return fmt.Errorf("task %s is %s", id, status)
+	case StatusPending, StatusPaused, StatusFailed:
+		// eligible
+	default:
+		status := task.Status
+		task.mu.Unlock()
+		dm.activeTasksMu.Unlock()
+		return fmt.Errorf("task %s cannot start from status %s", id, status)
+	}
+
+	if dm.activeTasks < dm.maxConcurrent {
+		dm.activeTasks++
+		task.Status = StatusDownloading
+		task.Error = ""
+		task.LastError = ""
+		task.mu.Unlock()
+		dm.activeTasksMu.Unlock()
+		dm.saveStateBestEffort()
+		go dm.downloadTask(task)
+		return nil
+	}
+
+	// Queue for later dispatch instead of failing the add/start flow.
+	task.Status = StatusPending
+	task.Speed = 0
+	dm.queuedTasks = append(dm.queuedTasks, task)
+	dm.queuedTaskIDs[id] = struct{}{}
+	task.mu.Unlock()
 	dm.activeTasksMu.Unlock()
 
-	// Launch the download in a background goroutine
-	go dm.downloadTask(task)
+	dm.saveStateBestEffort()
+	logger.Info("Queued download task: %s (%s)", task.ID, task.Title)
 	return nil
+}
+
+func (dm *DownloadManager) removeQueuedTaskLocked(id string) {
+	if dm.queuedTaskIDs == nil {
+		return
+	}
+	if _, ok := dm.queuedTaskIDs[id]; !ok {
+		return
+	}
+	delete(dm.queuedTaskIDs, id)
+	for i, task := range dm.queuedTasks {
+		if task != nil && task.ID == id {
+			dm.queuedTasks = append(dm.queuedTasks[:i], dm.queuedTasks[i+1:]...)
+			return
+		}
+	}
+}
+
+func (dm *DownloadManager) dispatchQueued() {
+	for {
+		var taskToStart *DownloadTask
+
+		dm.activeTasksMu.Lock()
+		if dm.queuedTaskIDs == nil {
+			dm.queuedTaskIDs = make(map[string]struct{})
+		}
+		for dm.activeTasks < dm.maxConcurrent && len(dm.queuedTasks) > 0 {
+			task := dm.queuedTasks[0]
+			dm.queuedTasks = dm.queuedTasks[1:]
+			if task == nil {
+				continue
+			}
+			delete(dm.queuedTaskIDs, task.ID)
+
+			task.mu.Lock()
+			if task.Status != StatusPending && task.Status != StatusFailed && task.Status != StatusPaused {
+				task.mu.Unlock()
+				continue
+			}
+			dm.activeTasks++
+			task.Status = StatusDownloading
+			task.Error = ""
+			task.LastError = ""
+			task.mu.Unlock()
+			taskToStart = task
+			break
+		}
+		dm.activeTasksMu.Unlock()
+
+		if taskToStart == nil {
+			return
+		}
+		dm.saveStateBestEffort()
+		go dm.downloadTask(taskToStart)
+	}
 }
 
 // PauseTask pauses a downloading task and preserves its progress.
@@ -459,9 +576,7 @@ func (dm *DownloadManager) PauseTask(id string) error {
 	logger.Info("Task %s paused at %d bytes", id, downloaded)
 
 	// Persist state immediately after pause for recovery
-	if dm.statePath != "" {
-		dm.SaveState()
-	}
+	dm.saveStateBestEffort()
 
 	return nil
 }
@@ -530,6 +645,10 @@ func (dm *DownloadManager) CancelTask(id string) error {
 	if !exists {
 		return fmt.Errorf("task %s not found", id)
 	}
+
+	dm.activeTasksMu.Lock()
+	dm.removeQueuedTaskLocked(id)
+	dm.activeTasksMu.Unlock()
 
 	// Capture fields under lock, then release before file operations
 	// to avoid holding the lock during potentially slow I/O
@@ -654,6 +773,7 @@ func (dm *DownloadManager) CancelTask(id string) error {
 		}
 	}
 
+	dm.saveStateBestEffort()
 	logger.Info("[CancelTask] Task cancelled successfully: id=%s", id)
 	return nil
 }
@@ -665,19 +785,28 @@ func (dm *DownloadManager) CancelTask(id string) error {
 // Returns an error if the task ID is not found.
 func (dm *DownloadManager) RemoveTask(id string) error {
 	dm.tasksMu.Lock()
-	defer dm.tasksMu.Unlock()
-
 	task, exists := dm.tasks[id]
 	if !exists {
+		dm.tasksMu.Unlock()
 		return fmt.Errorf("task %s not found", id)
 	}
 
-	// Stop any active download before removing
+	dm.activeTasksMu.Lock()
+	dm.removeQueuedTaskLocked(id)
+	dm.activeTasksMu.Unlock()
+
+	// Stop any active download before removing and mark the task so a racing
+	// goroutine cannot overwrite it as completed.
+	task.mu.Lock()
 	if task.cancel != nil {
 		task.cancel()
 	}
+	task.Status = StatusCancelled
+	task.mu.Unlock()
 
 	delete(dm.tasks, id)
+	dm.tasksMu.Unlock()
+	dm.saveStateBestEffort()
 	return nil
 }
 
@@ -761,11 +890,15 @@ func waitForRetryDelay(task *DownloadTask, delay time.Duration) bool {
 //
 // This method decrements activeTasks when it exits (via defer).
 func (dm *DownloadManager) downloadTask(task *DownloadTask) {
-	// Ensure we decrement the active task counter when this goroutine exits
+	// Ensure we decrement the active task counter when this goroutine exits,
+	// then dispatch the next queued task if capacity is available.
 	defer func() {
 		dm.activeTasksMu.Lock()
-		dm.activeTasks--
+		if dm.activeTasks > 0 {
+			dm.activeTasks--
+		}
 		dm.activeTasksMu.Unlock()
+		dm.dispatchQueued()
 	}()
 
 	logger.Info("Starting download task: %s (%s)", task.ID, task.Title)
@@ -841,8 +974,13 @@ func (dm *DownloadManager) performDownload(task *DownloadTask) error {
 		task.mu.Unlock()
 	}()
 
-	// Store cancel function and update status under lock
+	// Store cancel function and update status under lock. If the task was
+	// cancelled/paused before this goroutine got scheduled, do not resurrect it.
 	task.mu.Lock()
+	if task.Status == StatusCancelled || task.Status == StatusPaused {
+		task.mu.Unlock()
+		return context.Canceled
+	}
 	task.cancel = cancel
 	task.Status = StatusDownloading
 	customDownloader := task.customDownloader
@@ -863,8 +1001,13 @@ func (dm *DownloadManager) performDownload(task *DownloadTask) error {
 		return err
 	}
 
-	// Download successful - mark task as completed
+	// Download successful - mark task as completed unless the user cancelled or
+	// paused while the lower-level downloader was returning.
 	task.mu.Lock()
+	if task.Status == StatusCancelled || task.Status == StatusPaused {
+		task.mu.Unlock()
+		return context.Canceled
+	}
 	task.Status = StatusCompleted
 	task.Progress = 100
 	task.CompletedAt = time.Now().Unix()
@@ -873,9 +1016,7 @@ func (dm *DownloadManager) performDownload(task *DownloadTask) error {
 	logger.Info("Download completed: %s (%s)", task.Title, task.FilePath)
 
 	// Persist state after successful completion
-	if dm.statePath != "" {
-		dm.SaveState()
-	}
+	dm.saveStateBestEffort()
 
 	// Invoke completion callback
 	if dm.onComplete != nil {
@@ -1133,8 +1274,8 @@ func (dm *DownloadManager) performSequentialHTTPDownload(ctx context.Context, ta
 //  3. Decrypts the file in-place if needed
 //  4. Validates the decrypted result
 //
-// Decryption errors are logged but do not fail the download, allowing the user
-// to retry decryption with a different key if needed.
+// Decryption errors fail the task to avoid presenting encrypted/corrupt files
+// as successfully completed.
 func (dm *DownloadManager) handlePostDownloadDecryption(task *DownloadTask) error {
 	task.mu.RLock()
 	decodeKey := task.DecodeKey
@@ -1152,15 +1293,14 @@ func (dm *DownloadManager) handlePostDownloadDecryption(task *DownloadTask) erro
 			decryptor := wechat.NewVideoDecryptor()
 			if err := decryptor.DecryptFile(taskFilePath, decodeKey); err != nil {
 				logger.Error("Failed to decrypt video file: %v", err)
-				// Keep the original file for potential retry with a different key
-				return nil
+				// Keep the original file for potential retry with a different key.
+				return fmt.Errorf("failed to decrypt video file: %w", err)
 			} else {
 				logger.Info("Video decryption completed: %s", taskFilePath)
-				// Verify the decrypted file is valid
+				// Verify the decrypted file is valid.
 				if !wechat.ValidateVideoFormat(taskFilePath) {
-					logger.Warn("Decrypted file may not be a valid video format: %s", taskFilePath)
-					// Keep file anyway - may be partial/chunk content from upstream
-					return nil
+					logger.Warn("Decrypted file is not a valid video format: %s", taskFilePath)
+					return fmt.Errorf("decrypted file is not a valid video format")
 				}
 			}
 		}
@@ -1179,7 +1319,30 @@ func (dm *DownloadManager) handlePostDownloadDecryption(task *DownloadTask) erro
 //
 // Returns a unique filename (just the name, not full path).
 func ensureUniqueFileName(dir, base, ext string) string {
-	// Sanitize base filename
+	return ensureUniqueFileNameWithReserved(dir, base, ext, nil)
+}
+
+func (dm *DownloadManager) ensureUniqueFileNameLocked(base, ext string) string {
+	reserved := make(map[string]struct{}, len(dm.tasks))
+	for _, task := range dm.tasks {
+		task.mu.RLock()
+		if task.FileName != "" {
+			reserved[task.FileName] = struct{}{}
+		}
+		if task.FilePath != "" {
+			reserved[filepath.Base(task.FilePath)] = struct{}{}
+		}
+		task.mu.RUnlock()
+	}
+	return ensureUniqueFileNameWithReserved(dm.downloadDir, base, ext, reserved)
+}
+
+func ensureUniqueFileNameWithReserved(dir, base, ext string, reserved map[string]struct{}) string {
+	isReserved := func(name string) bool {
+		_, ok := reserved[name]
+		return ok
+	}
+
 	base = utils.SanitizeFileName(base, 100)
 	if base == "" {
 		base = fmt.Sprintf("video_%d", time.Now().UnixNano())
@@ -1189,19 +1352,19 @@ func ensureUniqueFileName(dir, base, ext string) string {
 		ext = ".mp4"
 	}
 
-	// Helper to check if filename exists
 	exists := func(name string) bool {
+		if isReserved(name) {
+			return true
+		}
 		_, err := os.Stat(filepath.Join(dir, name))
 		return err == nil
 	}
 
-	// Try original name first
 	name := utils.SanitizeFileName(base, 100) + ext
 	if !exists(name) {
 		return name
 	}
 
-	// Try with numeric suffixes (_2 through _99)
 	for i := 2; i <= 99; i++ {
 		candidateBase := utils.SanitizeFileName(fmt.Sprintf("%s_%d", base, i), 100)
 		if candidateBase == "" {
@@ -1213,8 +1376,12 @@ func ensureUniqueFileName(dir, base, ext string) string {
 		}
 	}
 
-	// Fallback: use timestamp for guaranteed uniqueness
-	return fmt.Sprintf("%s_%d%s", utils.SanitizeFileName(base, 100), time.Now().UnixNano(), ext)
+	for {
+		candidate := fmt.Sprintf("%s_%d%s", utils.SanitizeFileName(base, 100), time.Now().UnixNano(), ext)
+		if !exists(candidate) {
+			return candidate
+		}
+	}
 }
 
 // handleError handles download errors by updating task status and invoking the error callback.
@@ -1222,16 +1389,19 @@ func ensureUniqueFileName(dir, base, ext string) string {
 func (dm *DownloadManager) handleError(task *DownloadTask, err error) {
 	logger.Error("Download failed for task %s (%s): %v", task.ID, task.Title, err)
 
-	// Update task status to failed
+	// Update task status to failed unless the user paused/cancelled while the
+	// error was being handled.
 	task.mu.Lock()
+	if task.Status == StatusCancelled || task.Status == StatusPaused {
+		task.mu.Unlock()
+		return
+	}
 	task.Status = StatusFailed
 	task.Error = err.Error()
 	task.mu.Unlock()
 
 	// Persist state for potential recovery
-	if dm.statePath != "" {
-		dm.SaveState()
-	}
+	dm.saveStateBestEffort()
 
 	// Notify via callback
 	if dm.onError != nil {
