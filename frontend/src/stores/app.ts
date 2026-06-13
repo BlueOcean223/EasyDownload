@@ -45,6 +45,8 @@ export const useAppStore = defineStore('app', () => {
   const downloadDir = ref('')
   const appInfo = ref<AppInfo | null>(null)
   const loading = ref(false)
+  let listenersReady = false
+  const eventUnsubscribers: Array<() => void> = []
 
   // New state for settings
   const firstRunComplete = ref(false)
@@ -67,11 +69,15 @@ export const useAppStore = defineStore('app', () => {
 
   // Computed
   const pendingDownloads = computed(() =>
-    downloads.value.filter(d => d.status === 'pending' || d.status === 'downloading' || d.status === 'paused')
+    downloads.value.filter(d => d.status === 'pending' || d.status === 'downloading' || d.status === 'retrying' || d.status === 'paused')
   )
 
   const completedDownloads = computed(() =>
     downloads.value.filter(d => d.status === 'completed')
+  )
+
+  const problemDownloads = computed(() =>
+    downloads.value.filter(d => d.status === 'failed' || d.status === 'cancelled')
   )
 
   // Actions
@@ -90,14 +96,14 @@ export const useAppStore = defineStore('app', () => {
 
       // Load settings from appInfo
       if (appInfo.value) {
-        minimizeToTray.value = (appInfo.value as any).minimizeToTray ?? true
-        showNotification.value = (appInfo.value as any).showNotification ?? true
-        theme.value = (appInfo.value as any).theme ?? 'dark'
-        language.value = (appInfo.value as any).language ?? 'zh-CN'
-        useUpstreamProxy.value = (appInfo.value as any).useUpstreamProxy ?? false
-        closeAction.value = (appInfo.value as any).closeAction ?? ''
-        dontAskOnClose.value = (appInfo.value as any).dontAskOnClose ?? false
-        dontRemindCertWizard.value = (appInfo.value as any).dontRemindCertWizard ?? false
+        minimizeToTray.value = appInfo.value.minimizeToTray ?? true
+        showNotification.value = appInfo.value.showNotification ?? true
+        theme.value = appInfo.value.theme ?? 'dark'
+        language.value = appInfo.value.language ?? 'zh-CN'
+        useUpstreamProxy.value = appInfo.value.useUpstreamProxy ?? false
+        closeAction.value = appInfo.value.closeAction ?? ''
+        dontAskOnClose.value = appInfo.value.dontAskOnClose ?? false
+        dontRemindCertWizard.value = appInfo.value.dontRemindCertWizard ?? false
 
         // Apply theme to DOM
         document.documentElement.setAttribute('data-theme', theme.value)
@@ -117,6 +123,13 @@ export const useAppStore = defineStore('app', () => {
   }
 
   function setupEventListeners() {
+    if (listenersReady) return
+    listenersReady = true
+
+    const on = (eventName: string, callback: (...data: any[]) => void) => {
+      eventUnsubscribers.push(EventsOn(eventName, callback))
+    }
+
     function isBadWeChatTitle(t?: string) {
       if (!t) return true
       const s = String(t).trim()
@@ -257,7 +270,7 @@ export const useAppStore = defineStore('app', () => {
     }
 
     // Video detected event
-    EventsOn('video:detected', (video: DetectedVideo) => {
+    on('video:detected', (video: DetectedVideo) => {
       // For WeChat: keep history, but dedupe/update by stable id (pageKey) to avoid spam
       if (video.source === 'wechat') {
         // Ensure only ONE card is marked as "当前"
@@ -293,7 +306,7 @@ export const useAppStore = defineStore('app', () => {
     })
 
     // Download progress event
-    EventsOn('download:progress', (task: DownloadTask) => {
+    on('download:progress', (task: DownloadTask) => {
       const index = downloads.value.findIndex(d => d.id === task.id)
       if (index !== -1) {
         downloads.value[index] = task
@@ -301,7 +314,7 @@ export const useAppStore = defineStore('app', () => {
     })
 
     // Download complete event
-    EventsOn('download:complete', (task: DownloadTask) => {
+    on('download:complete', (task: DownloadTask) => {
       const index = downloads.value.findIndex(d => d.id === task.id)
       if (index !== -1) {
         downloads.value[index] = task
@@ -309,15 +322,20 @@ export const useAppStore = defineStore('app', () => {
     })
 
     // Download error event
-    EventsOn('download:error', (data: { task: DownloadTask; error: string }) => {
-      const index = downloads.value.findIndex(d => d.id === data.task.id)
+    on('download:error', (data: { task?: DownloadTask; error?: string } | string) => {
+      const errorText = typeof data === 'string' ? data : data?.error
+      if (typeof data === 'string' || !data?.task) {
+        console.error(errorText || 'Download error')
+        return
+      }
+      const index = downloads.value.findIndex(d => d.id === data.task!.id)
       if (index !== -1) {
-        downloads.value[index] = { ...data.task, error: data.error }
+        downloads.value[index] = { ...data.task, error: errorText || data.task.error }
       }
     })
 
     // Download start event
-    EventsOn('download:start', (task: DownloadTask) => {
+    on('download:start', (task: DownloadTask) => {
       const exists = downloads.value.some(d => d.id === task.id)
       if (!exists) {
         downloads.value.unshift(task)
@@ -325,7 +343,7 @@ export const useAppStore = defineStore('app', () => {
     })
 
     // FFmpeg ready event
-    EventsOn('ffmpeg:ready', (available: boolean) => {
+    on('ffmpeg:ready', (available: boolean) => {
       if (available) {
         ffmpegAvailable.value = true
       }
@@ -421,7 +439,7 @@ export const useAppStore = defineStore('app', () => {
     await ResumeDownload(id)
     const task = downloads.value.find(d => d.id === id)
     if (task) {
-      task.status = 'downloading'
+      task.status = 'pending'
     }
   }
 
@@ -523,6 +541,7 @@ export const useAppStore = defineStore('app', () => {
     // Computed
     pendingDownloads,
     completedDownloads,
+    problemDownloads,
 
     // Actions
     initApp,

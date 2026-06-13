@@ -15,7 +15,7 @@ import ProxiedImage from '@/components/ProxiedImage.vue'
 
 const props = defineProps<{
   task: DownloadTask
-  mode?: 'downloading' | 'completed'
+  mode?: 'downloading' | 'completed' | 'problem'
 }>()
 
 const emit = defineEmits<{
@@ -26,8 +26,9 @@ const emit = defineEmits<{
   (e: 'remove', task: DownloadTask): void
 }>()
 
-const isDownloading = computed(() => props.mode === 'downloading' || props.task.status === 'downloading' || props.task.status === 'pending' || props.task.status === 'paused')
+const isDownloading = computed(() => props.mode === 'downloading' || props.task.status === 'downloading' || props.task.status === 'retrying' || props.task.status === 'pending' || props.task.status === 'paused')
 const isCompleted = computed(() => props.mode === 'completed' || props.task.status === 'completed')
+const isProblem = computed(() => props.mode === 'problem' || props.task.status === 'failed' || props.task.status === 'cancelled')
 
 function formatBytes(bytes: number) {
   if (bytes === 0) return '0 B'
@@ -68,6 +69,7 @@ const completedSizeText = computed(() => {
 function getStatusType(status: string) {
   switch (status) {
     case 'downloading': return 'info'
+    case 'retrying': return 'warning'
     case 'completed': return 'success'
     case 'failed': return 'error'
     case 'paused': return 'warning'
@@ -79,6 +81,7 @@ function getStatusType(status: string) {
 function getStatusText(status: string) {
   switch (status) {
     case 'downloading': return '下载中'
+    case 'retrying': return '重试中'
     case 'completed': return '已完成'
     case 'failed': return '失败'
     case 'paused': return '已暂停'
@@ -123,7 +126,7 @@ function getStatusText(status: string) {
       <div class="flex-1 min-w-0">
         <div class="flex items-center gap-2 mb-1">
           <span class="text-sm font-medium truncate">{{ task.title }}</span>
-          <NTag v-if="isDownloading" :type="getStatusType(task.status)" size="tiny">
+          <NTag v-if="isDownloading || isProblem" :type="getStatusType(task.status)" size="tiny">
             {{ getStatusText(task.status) }}
           </NTag>
           <NTag v-else type="success" size="tiny">已完成</NTag>
@@ -147,12 +150,19 @@ function getStatusText(status: string) {
           </div>
         </template>
 
-        <!-- Info for completed -->
+        <!-- Info for completed/problem -->
         <template v-else>
           <div class="text-xs text-text-secondary">
-            <span>{{ completedSizeText }}</span>
-            <span class="mx-2">·</span>
-            <span>{{ task.fileName }}</span>
+            <template v-if="isProblem">
+              <span>{{ task.error || task.lastError || (task.status === 'cancelled' ? '任务已取消' : '下载失败') }}</span>
+              <span v-if="task.fileName" class="mx-2">·</span>
+              <span v-if="task.fileName">{{ task.fileName }}</span>
+            </template>
+            <template v-else>
+              <span>{{ completedSizeText }}</span>
+              <span class="mx-2">·</span>
+              <span>{{ task.fileName }}</span>
+            </template>
           </div>
         </template>
       </div>
@@ -188,7 +198,7 @@ function getStatusText(status: string) {
       </div>
       
       <!-- Actions for completed -->
-      <div v-else class="flex items-center gap-1 flex-shrink-0">
+      <div v-else-if="isCompleted" class="flex items-center gap-1 flex-shrink-0">
         <NTooltip>
           <template #trigger>
             <NButton size="tiny" quaternary circle @click="emit('open-file', task)">
@@ -198,6 +208,18 @@ function getStatusText(status: string) {
           打开文件
         </NTooltip>
         
+        <NTooltip>
+          <template #trigger>
+            <NButton size="tiny" quaternary circle @click="emit('remove', task)">
+              <TrashOutline class="w-4 h-4" />
+            </NButton>
+          </template>
+          删除记录
+        </NTooltip>
+      </div>
+
+      <!-- Actions for failed/cancelled -->
+      <div v-else class="flex items-center gap-1 flex-shrink-0">
         <NTooltip>
           <template #trigger>
             <NButton size="tiny" quaternary circle @click="emit('remove', task)">

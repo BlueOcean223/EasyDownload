@@ -30,20 +30,25 @@ function showCenterTip(text: string) {
   }, 1500)
 }
 
-// Get the API port from app info
+// Get the API port/token from app info
 const apiPort = computed(() => {
   return store.appInfo?.apiPort || 18899
 })
+const apiToken = computed(() => store.appInfo?.apiToken || '')
+
+function tokenParam() {
+  return apiToken.value ? `&token=${encodeURIComponent(apiToken.value)}` : ''
+}
 
 function getProxiedUrl(url: string) {
   if (!url) return ''
-  return `http://127.0.0.1:${apiPort.value}/api/proxy-image?url=${encodeURIComponent(url)}`
+  return `http://127.0.0.1:${apiPort.value}/api/proxy-image?url=${encodeURIComponent(url)}${tokenParam()}`
 }
 
 // Get proxied media URL (for videos)
 function getProxiedMediaUrl(url: string) {
   if (!url) return ''
-  return `http://127.0.0.1:${apiPort.value}/api/proxy-media?url=${encodeURIComponent(url)}`
+  return `http://127.0.0.1:${apiPort.value}/api/proxy-media?url=${encodeURIComponent(url)}${tokenParam()}`
 }
 
 watch(() => props.show, (newVal) => {

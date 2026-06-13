@@ -28,7 +28,7 @@ export interface DetectedVideo {
 }
 
 // Download task status
-export type DownloadStatus = 'pending' | 'downloading' | 'paused' | 'completed' | 'failed' | 'cancelled'
+export type DownloadStatus = 'pending' | 'downloading' | 'retrying' | 'paused' | 'completed' | 'failed' | 'cancelled'
 
 // Download task
 export interface DownloadTask {
@@ -46,6 +46,9 @@ export interface DownloadTask {
   speed: number
   status: DownloadStatus
   error: string
+  retryCount?: number
+  maxRetry?: number
+  lastError?: string
   createdAt: number
   completedAt: number
   // Album fields (for Douyin albums)
@@ -134,6 +137,7 @@ export interface AppInfo {
   version: string
   proxyPort: number
   apiPort: number
+  apiToken?: string
   downloadDir: string
   ffmpegPath?: string
   certPath: string
@@ -141,7 +145,13 @@ export interface AppInfo {
   showNotification: boolean
   firstRunComplete: boolean
   dontRemindCertWizard?: boolean
+  theme?: 'dark' | 'light'
+  language?: 'zh-CN' | 'en-US'
+  upstreamProxy?: string
+  useUpstreamProxy?: boolean
   proxyDebug?: boolean
+  closeAction?: '' | 'exit' | 'minimize'
+  dontAskOnClose?: boolean
   wechatNoMITM?: boolean
 }
 

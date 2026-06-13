@@ -30,10 +30,13 @@ const apiPort = computed(() => {
   return store.appInfo?.apiPort || 18899
 })
 
+const apiToken = computed(() => store.appInfo?.apiToken || '')
+
 // Build the proxied image URL
 const proxiedSrc = computed(() => {
   if (!props.src) return ''
-  return `http://127.0.0.1:${apiPort.value}/api/proxy-image?url=${encodeURIComponent(props.src)}`
+  const tokenParam = apiToken.value ? `&token=${encodeURIComponent(apiToken.value)}` : ''
+  return `http://127.0.0.1:${apiPort.value}/api/proxy-image?url=${encodeURIComponent(props.src)}${tokenParam}`
 })
 
 // Initialize state from global cache

@@ -1,13 +1,14 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { useAppStore } from '@/stores/app'
-import { 
-  NButton, NEmpty, NTabs, NTabPane, useMessage 
+import {
+  NButton, NEmpty, NTabs, NTabPane, useMessage
 } from 'naive-ui'
-import { 
+import {
   FolderOpenOutline,
   CheckmarkCircleOutline,
-  CloudDownloadOutline
+  CloudDownloadOutline,
+  AlertCircleOutline
 } from '@vicons/ionicons5'
 import type { DownloadTask } from '@/types'
 import { OpenFile } from '../../wailsjs/go/main/App'
@@ -18,6 +19,7 @@ const message = useMessage()
 
 const activeTab = computed(() => {
   if (store.pendingDownloads.length > 0) return 'downloading'
+  if (store.problemDownloads.length > 0) return 'problems'
   return 'completed'
 })
 
@@ -73,7 +75,7 @@ async function openDownloadFolder() {
     <!-- Header -->
     <div class="header flex items-center justify-between p-4 border-b border-border">
       <h2 class="text-xl font-semibold">下载管理</h2>
-      
+
       <NButton size="small" @click="openDownloadFolder">
         <template #icon>
           <FolderOpenOutline class="w-4 h-4" />
@@ -81,15 +83,15 @@ async function openDownloadFolder() {
         打开下载目录
       </NButton>
     </div>
-    
+
     <!-- Content -->
     <div class="content flex-1 overflow-auto">
       <NTabs type="line" :default-value="activeTab" class="downloads-tabs h-full" pane-class="h-full">
         <!-- Downloading Tab -->
         <NTabPane name="downloading" tab="下载中" class="h-full">
           <div class="p-4 h-full overflow-auto">
-            <NEmpty 
-              v-if="store.pendingDownloads.length === 0" 
+            <NEmpty
+              v-if="store.pendingDownloads.length === 0"
               description="暂无进行中的下载"
               class="h-full flex items-center justify-center"
             >
@@ -97,10 +99,10 @@ async function openDownloadFolder() {
                 <CloudDownloadOutline class="w-12 h-12 text-text-secondary opacity-50" />
               </template>
             </NEmpty>
-            
+
             <div v-else class="space-y-3">
-              <DownloadTaskCard 
-                v-for="task in store.pendingDownloads" 
+              <DownloadTaskCard
+                v-for="task in store.pendingDownloads"
                 :key="task.id"
                 :task="task"
                 mode="downloading"
@@ -111,12 +113,37 @@ async function openDownloadFolder() {
             </div>
           </div>
         </NTabPane>
-        
+
+        <!-- Problems Tab -->
+        <NTabPane name="problems" tab="失败/已取消" class="h-full">
+          <div class="p-4 h-full overflow-auto">
+            <NEmpty
+              v-if="store.problemDownloads.length === 0"
+              description="暂无失败或已取消的下载"
+              class="h-full flex items-center justify-center"
+            >
+              <template #icon>
+                <AlertCircleOutline class="w-12 h-12 text-text-secondary opacity-50" />
+              </template>
+            </NEmpty>
+
+            <div v-else class="space-y-3">
+              <DownloadTaskCard
+                v-for="task in store.problemDownloads"
+                :key="task.id"
+                :task="task"
+                mode="problem"
+                @remove="handleRemove"
+              />
+            </div>
+          </div>
+        </NTabPane>
+
         <!-- Completed Tab -->
         <NTabPane name="completed" tab="已完成" class="h-full">
           <div class="p-4 h-full overflow-auto">
-            <NEmpty 
-              v-if="store.completedDownloads.length === 0" 
+            <NEmpty
+              v-if="store.completedDownloads.length === 0"
               description="暂无已完成的下载"
               class="h-full flex items-center justify-center"
             >
@@ -124,10 +151,10 @@ async function openDownloadFolder() {
                 <CheckmarkCircleOutline class="w-12 h-12 text-text-secondary opacity-50" />
               </template>
             </NEmpty>
-            
+
             <div v-else class="space-y-3">
-              <DownloadTaskCard 
-                v-for="task in store.completedDownloads" 
+              <DownloadTaskCard
+                v-for="task in store.completedDownloads"
                 :key="task.id"
                 :task="task"
                 mode="completed"
