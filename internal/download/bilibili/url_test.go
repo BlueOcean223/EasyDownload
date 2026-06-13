@@ -72,6 +72,61 @@ func TestParseURL(t *testing.T) {
 	}
 }
 
+func TestParseBangumiURL(t *testing.T) {
+	bd := NewBilibiliDownloader()
+
+	tests := []struct {
+		name     string
+		input    string
+		wantKind string
+		wantID   string
+		wantErr  bool
+	}{
+		{
+			name:     "episode url",
+			input:    "https://www.bilibili.com/bangumi/play/ep3854801",
+			wantKind: "ep",
+			wantID:   "3854801",
+		},
+		{
+			name:     "season url",
+			input:    "https://www.bilibili.com/bangumi/play/ss28747?from=search",
+			wantKind: "season",
+			wantID:   "28747",
+		},
+		{
+			name:     "media url",
+			input:    "https://www.bilibili.com/bangumi/media/md28223043",
+			wantKind: "media",
+			wantID:   "28223043",
+		},
+		{
+			name:     "bare ep id",
+			input:    "ep733316",
+			wantKind: "ep",
+			wantID:   "733316",
+		},
+		{
+			name:    "ordinary video",
+			input:   "https://www.bilibili.com/video/BV1xx411c7mD",
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotKind, gotID, err := bd.ParseBangumiURL(tt.input)
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantKind, gotKind)
+			assert.Equal(t, tt.wantID, gotID)
+		})
+	}
+}
+
 func TestParseURLBVProperty(t *testing.T) {
 	properties := newProperties()
 	bvGen := gen.RegexMatch(`BV[a-zA-Z0-9]{10}`)
@@ -118,6 +173,11 @@ func TestIsBilibiliURL(t *testing.T) {
 		{
 			name:  "short link",
 			input: "https://b23.tv/abc123",
+			want:  true,
+		},
+		{
+			name:  "bangumi episode",
+			input: "https://www.bilibili.com/bangumi/play/ep3854801",
 			want:  true,
 		},
 		{

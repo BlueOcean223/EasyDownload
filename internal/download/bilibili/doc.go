@@ -1,8 +1,8 @@
 // Package bilibili provides video downloading functionality for Bilibili.
 //
 // This package implements the Bilibili video parser and downloader, which supports:
-//   - Parsing Bilibili video URLs (BV/AV format)
-//   - Fetching video metadata including multi-part (分P) information
+//   - Parsing Bilibili video URLs (BV/AV format) and PGC/bangumi URLs (ep/ss/md)
+//   - Fetching video metadata including multi-part (分P) information and bangumi episode lists
 //   - QR code login authentication for accessing higher quality streams
 //   - Selecting DASH video streams by codec priority and bandwidth
 //   - Downloading DASH format videos with separate video/audio streams
@@ -14,6 +14,8 @@
 // The downloader interacts with several Bilibili APIs:
 //   - Video info API: /x/web-interface/view - fetches video metadata
 //   - Play URL API: /x/player/playurl - fetches stream URLs with quality options
+//   - Bangumi season API: /pgc/view/web/season - fetches PGC season/episode metadata
+//   - Bangumi play URL API: /pgc/player/web/playurl - fetches PGC DASH streams
 //   - QR Login API: /x/passport-login/web/qrcode/* - handles QR code authentication
 //   - User info API: /x/web-interface/nav - fetches logged-in user information
 //

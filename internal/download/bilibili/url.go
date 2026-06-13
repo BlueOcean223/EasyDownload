@@ -8,8 +8,11 @@ import (
 )
 
 var (
-	bvIDRegex = regexp.MustCompile(`BV[a-zA-Z0-9]+`)
-	avIDRegex = regexp.MustCompile(`av(\d+)`)
+	bvIDRegex           = regexp.MustCompile(`BV[a-zA-Z0-9]+`)
+	avIDRegex           = regexp.MustCompile(`av(\d+)`)
+	bangumiEPRegex      = regexp.MustCompile(`(?:^|/bangumi/play/)ep(\d+)(?:[/?#]|$)`)
+	bangumiSeasonRegex  = regexp.MustCompile(`(?:^|/bangumi/play/)ss(\d+)(?:[/?#]|$)`)
+	bangumiMediaIDRegex = regexp.MustCompile(`(?:^|/bangumi/media/)md(\d+)(?:[/?#]|$)`)
 )
 
 // ParseURL extracts the video ID from a Bilibili URL.
@@ -39,6 +42,30 @@ func (bd *BilibiliDownloader) ParseURLMust(url string) string {
 		return ""
 	}
 	return bvid
+}
+
+// ParseBangumiURL extracts a Bilibili PGC/bangumi identifier from a URL.
+// It supports episode URLs (/bangumi/play/ep{id}), season URLs
+// (/bangumi/play/ss{id}), media URLs (/bangumi/media/md{id}), and bare
+// identifiers (ep{id}, ss{id}, md{id}). The returned kind is one of:
+// "ep", "season", or "media".
+func (bd *BilibiliDownloader) ParseBangumiURL(raw string) (kind string, id string, err error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", "", fmt.Errorf("invalid Bilibili bangumi URL")
+	}
+
+	if matches := bangumiEPRegex.FindStringSubmatch(raw); len(matches) > 1 {
+		return "ep", matches[1], nil
+	}
+	if matches := bangumiSeasonRegex.FindStringSubmatch(raw); len(matches) > 1 {
+		return "season", matches[1], nil
+	}
+	if matches := bangumiMediaIDRegex.FindStringSubmatch(raw); len(matches) > 1 {
+		return "media", matches[1], nil
+	}
+
+	return "", "", fmt.Errorf("invalid Bilibili bangumi URL")
 }
 
 // IsBilibiliURL checks if a URL belongs to a Bilibili or b23 short-link domain.

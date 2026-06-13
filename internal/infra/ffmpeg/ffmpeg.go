@@ -282,6 +282,45 @@ func (fm *FFmpegManager) Merge(videoPath, audioPath, outputPath string) error {
 	return nil
 }
 
+// MergeWithDecryption merges DRM-protected video and audio files into a single output file.
+func (fm *FFmpegManager) MergeWithDecryption(videoPath, audioPath, outputPath, decryptionKey string) error {
+	ffmpegPath := fm.GetPath()
+	if ffmpegPath == "" {
+		return fmt.Errorf("FFmpeg not available")
+	}
+	if decryptionKey == "" {
+		return fm.Merge(videoPath, audioPath, outputPath)
+	}
+
+	// Ensure output directory exists
+	outputDir := filepath.Dir(outputPath)
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		return fmt.Errorf("failed to create output directory: %w", err)
+	}
+
+	logger.Debug("Merging DRM video and audio: %s + %s -> %s", videoPath, audioPath, outputPath)
+
+	cmd := exec.Command(ffmpegPath,
+		"-decryption_key", decryptionKey,
+		"-i", videoPath,
+		"-decryption_key", decryptionKey,
+		"-i", audioPath,
+		"-c", "copy",
+		"-y",
+		outputPath,
+	)
+	applyNoWindow(cmd)
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		logger.Error("FFmpeg DRM merge failed: %v, output: %s", err, string(output))
+		return fmt.Errorf("FFmpeg DRM merge failed: %w", err)
+	}
+
+	logger.Debug("DRM merge completed successfully")
+	return nil
+}
+
 // MergeWithProgress merges video and audio files with progress callback
 func (fm *FFmpegManager) MergeWithProgress(videoPath, audioPath, outputPath string, onProgress func(float64)) error {
 	// For now, just call Merge since FFmpeg progress parsing is complex

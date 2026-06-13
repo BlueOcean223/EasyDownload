@@ -6,26 +6,41 @@ import "EasyDownload/internal/config"
 // It contains metadata like title, author, and cover image, as well as
 // the list of video parts (分P) and available stream qualities.
 type BilibiliVideo struct {
-	BV       string           `json:"bv"`       // BV ID (e.g., "BV1xx411c7mD") - the primary video identifier
-	AV       string           `json:"av"`       // AV ID (e.g., "av170001") - legacy video identifier
-	Title    string           `json:"title"`    // Video title
-	Cover    string           `json:"cover"`    // Cover image URL
-	Author   string           `json:"author"`   // Video uploader's username
-	Duration int              `json:"duration"` // Total video duration in seconds
-	Desc     string           `json:"desc"`     // Video description
-	Parts    []BilibiliPart   `json:"parts"`    // Multi-part video list (分P), at least one part exists
-	Streams  []BilibiliStream `json:"streams"`  // Available streams for the first part (for backward compatibility)
+	BV               string           `json:"bv"`                   // BV ID (e.g., "BV1xx411c7mD") - the primary video identifier/current episode BV for bangumi
+	AV               string           `json:"av"`                   // AV ID (e.g., "av170001") - legacy video identifier/current episode AV for bangumi
+	Title            string           `json:"title"`                // Video title or bangumi season title
+	Cover            string           `json:"cover"`                // Cover image URL
+	Author           string           `json:"author"`               // Video uploader's username, or content source for bangumi
+	Duration         int              `json:"duration"`             // Total/current video duration in seconds
+	Desc             string           `json:"desc"`                 // Video description
+	Parts            []BilibiliPart   `json:"parts"`                // Multi-part video list (分P) or bangumi episodes, at least one part exists
+	Streams          []BilibiliStream `json:"streams"`              // Available streams for the first/current part (for backward compatibility)
+	SeasonID         int              `json:"seasonId,omitempty"`   // Bangumi season_id
+	MediaID          int              `json:"mediaId,omitempty"`    // Bangumi media_id
+	EpID             int64            `json:"epId,omitempty"`       // Current bangumi episode id
+	Badge            string           `json:"badge,omitempty"`      // Current episode badge: "" | "限免" | "会员" | "预告"
+	SeasonType       int              `json:"seasonType,omitempty"` // 1=番剧 2=电影 3=纪录片 4=国创 5=电视剧 7=综艺
+	IsBangumi        bool             `json:"isBangumi"`            // Whether this video uses PGC/bangumi APIs
+	TotalEps         int              `json:"totalEps,omitempty"`   // Total episode count returned by season API
+	CurrentPartIndex int              `json:"currentPartIndex"`     // 0-based current part/episode index
 }
 
 // BilibiliPart represents a single part (分P) of a Bilibili video.
 // Bilibili videos can have multiple parts, each with its own CID and stream URLs.
 // Each part is essentially an independent video segment that can be downloaded separately.
 type BilibiliPart struct {
-	CID      int64            `json:"cid"`               // Content ID - unique identifier for this part's media content
-	Page     int              `json:"page"`              // Part number (1-indexed)
-	PartName string           `json:"partName"`          // Part title/name
-	Duration int              `json:"duration"`          // Part duration in seconds
-	Streams  []BilibiliStream `json:"streams,omitempty"` // Available streams for this part (lazy-loaded on demand)
+	CID         int64            `json:"cid"`                   // Content ID - unique identifier for this part's media content
+	Page        int              `json:"page"`                  // Part/episode number (1-indexed)
+	PartName    string           `json:"partName"`              // Part title/name
+	Duration    int              `json:"duration"`              // Part duration in seconds
+	Streams     []BilibiliStream `json:"streams,omitempty"`     // Available streams for this part (lazy-loaded on demand)
+	BV          string           `json:"bv,omitempty"`          // Bangumi episode BV ID (episodes can have different BVs)
+	AID         int64            `json:"aid,omitempty"`         // Bangumi episode AV/AID
+	EpID        int64            `json:"epId,omitempty"`        // Bangumi episode id
+	Badge       string           `json:"badge,omitempty"`       // "" | "限免" | "会员" | "预告"
+	BadgeType   int              `json:"badgeType,omitempty"`   // 0=free, 1=limited free, 3=VIP
+	SectionType int              `json:"sectionType,omitempty"` // 0=formal, 1=preview, 2=extra/SP
+	Cover       string           `json:"cover,omitempty"`       // Episode cover image URL
 }
 
 // BilibiliStream represents an available video stream quality option.
@@ -45,20 +60,24 @@ type BilibiliPart struct {
 //   - 32:  480P Standard Definition
 //   - 16:  360P Low Definition
 type BilibiliStream struct {
-	Quality         int      `json:"quality"`         // Quality ID (qn value), higher means better quality
-	QualityName     string   `json:"qualityName"`     // Human-readable quality name (e.g., "1080P", "4K")
-	Format          string   `json:"format"`          // Stream format, typically "dash" for modern videos
-	Size            int64    `json:"size"`            // Estimated file size in bytes (video + audio)
-	VideoURL        string   `json:"videoUrl"`        // Direct URL to video stream (m4s format for DASH)
-	AudioURL        string   `json:"audioUrl"`        // Direct URL to audio stream (m4s format for DASH)
-	Width           int      `json:"width"`           // Video width in pixels
-	Height          int      `json:"height"`          // Video height in pixels
-	FrameRate       string   `json:"frameRate"`       // Frame rate, e.g. "30.000", "29.412"
-	Codecs          string   `json:"codecs"`          // Codec string, e.g. "avc1.640033", "hev1.1.6.L120.90"
-	CodecID         int      `json:"codecId"`         // Codec ID: 7=H.264, 12=HEVC, 13=AV1
-	MimeType        string   `json:"mimeType"`        // MIME type, e.g. "video/mp4"
-	BackupURLs      []string `json:"backupUrls"`      // Fallback CDN URLs for video stream
-	AudioBackupURLs []string `json:"audioBackupUrls"` // Fallback CDN URLs for audio stream
+	Quality         int      `json:"quality"`               // Quality ID (qn value), higher means better quality
+	QualityName     string   `json:"qualityName"`           // Human-readable quality name (e.g., "1080P", "4K")
+	Format          string   `json:"format"`                // Stream format, typically "dash" for modern videos
+	Size            int64    `json:"size"`                  // Estimated file size in bytes (video + audio)
+	VideoURL        string   `json:"videoUrl"`              // Direct URL to video stream (m4s format for DASH)
+	AudioURL        string   `json:"audioUrl"`              // Direct URL to audio stream (m4s format for DASH)
+	Width           int      `json:"width"`                 // Video width in pixels
+	Height          int      `json:"height"`                // Video height in pixels
+	FrameRate       string   `json:"frameRate"`             // Frame rate, e.g. "30.000", "29.412"
+	Codecs          string   `json:"codecs"`                // Codec string, e.g. "avc1.640033", "hev1.1.6.L120.90"
+	CodecID         int      `json:"codecId"`               // Codec ID: 7=H.264, 12=HEVC, 13=AV1
+	MimeType        string   `json:"mimeType"`              // MIME type, e.g. "video/mp4"
+	BackupURLs      []string `json:"backupUrls"`            // Fallback CDN URLs for video stream
+	AudioBackupURLs []string `json:"audioBackupUrls"`       // Fallback CDN URLs for audio stream
+	DRMKey          string   `json:"drmKey,omitempty"`      // Decryption key for DRM streams when available
+	DRMTechType     int      `json:"drmTechType,omitempty"` // 0=none, 2=Bilibili DRM
+	KID             string   `json:"kid,omitempty"`         // DRM key id extracted from stream metadata
+	BiliDRMURI      string   `json:"biliDrmUri,omitempty"`  // Raw bilidrm URI from API when present
 }
 
 // FFmpegManagerInterface defines the interface for FFmpeg management.

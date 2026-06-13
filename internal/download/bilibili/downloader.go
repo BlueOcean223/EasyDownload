@@ -279,6 +279,10 @@ func (bd *BilibiliDownloader) downloadCore(
 		logger.Error("No available stream for video: %s", video.Title)
 		return "", fmt.Errorf("no available stream")
 	}
+	if (stream.BiliDRMURI != "" || stream.DRMTechType == 2) && stream.DRMKey == "" {
+		logger.Error("DRM stream detected without decryption key for video: %s", video.Title)
+		return "", fmt.Errorf("this stream is DRM-protected and cannot be downloaded yet")
+	}
 
 	// 校验 outputPath 必须以 .mp4 结尾
 	if !strings.HasSuffix(outputPath, ".mp4") {
@@ -381,22 +385,34 @@ func (bd *BilibiliDownloader) downloadCore(
 	tracker.SetMergeProgress(0)
 
 	// 如果可用，使用 FFmpegManager，否则回退到直接执行
-	if bd.ffmpegManager != nil {
+	if bd.ffmpegManager != nil && stream.DRMKey == "" {
 		if err := bd.ffmpegManager.Merge(videoPath, audioPath, outputPath); err != nil {
 			logger.Error("FFmpeg merge failed: %v", err)
 			cleanupTempFiles()
 			return "", fmt.Errorf("failed to merge video and audio: %w", err)
 		}
+	} else if bd.ffmpegManager != nil && stream.DRMKey != "" {
+		if drmMerger, ok := bd.ffmpegManager.(interface {
+			MergeWithDecryption(videoPath, audioPath, outputPath, decryptionKey string) error
+		}); ok {
+			if err := drmMerger.MergeWithDecryption(videoPath, audioPath, outputPath, stream.DRMKey); err != nil {
+				logger.Error("FFmpeg DRM merge failed: %v", err)
+				cleanupTempFiles()
+				return "", fmt.Errorf("failed to merge DRM video and audio: %w", err)
+			}
+		} else {
+			if err := bd.mergeWithFFmpegCommand(ctx, videoPath, audioPath, outputPath, stream.DRMKey); err != nil {
+				if ctx.Err() != nil {
+					logger.Info("Merge interrupted, keeping temp files")
+					return "", ctx.Err()
+				}
+				logger.Error("FFmpeg DRM merge failed: %v", err)
+				cleanupTempFiles()
+				return "", fmt.Errorf("failed to merge DRM video and audio: %w", err)
+			}
+		}
 	} else {
-		cmd := exec.CommandContext(ctx, bd.GetFFmpegPath(),
-			"-i", videoPath,
-			"-i", audioPath,
-			"-c", "copy",
-			"-y",
-			outputPath,
-		)
-
-		if err := cmd.Run(); err != nil {
+		if err := bd.mergeWithFFmpegCommand(ctx, videoPath, audioPath, outputPath, ""); err != nil {
 			// 如果在合并期间上下文被取消，保留临时文件
 			if ctx.Err() != nil {
 				logger.Info("Merge interrupted, keeping temp files")
@@ -415,6 +431,26 @@ func (bd *BilibiliDownloader) downloadCore(
 
 	logger.Info("Download completed: %s", outputPath)
 	return outputPath, nil
+}
+
+func (bd *BilibiliDownloader) mergeWithFFmpegCommand(ctx context.Context, videoPath, audioPath, outputPath, decryptionKey string) error {
+	args := make([]string, 0, 10)
+	if decryptionKey != "" {
+		args = append(args, "-decryption_key", decryptionKey)
+	}
+	args = append(args, "-i", videoPath)
+	if decryptionKey != "" {
+		args = append(args, "-decryption_key", decryptionKey)
+	}
+	args = append(args,
+		"-i", audioPath,
+		"-c", "copy",
+		"-y",
+		outputPath,
+	)
+
+	cmd := exec.CommandContext(ctx, bd.GetFFmpegPath(), args...)
+	return cmd.Run()
 }
 
 // Download downloads the first part of a Bilibili video (for single-part videos).
