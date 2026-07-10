@@ -131,7 +131,7 @@ DASH 视频会被拆成两个临时文件：
 ffmpeg -i video.m4s -i audio.m4s -c copy -y output.mp4
 ```
 
-合并使用 context-aware 调用：如果用户在合并阶段暂停或取消，FFmpeg 进程会随 context 终止，临时文件保留供恢复或清理。合并成功后删除临时文件和 multipart 状态文件。
+合并使用 context-aware 调用：如果用户在合并阶段暂停或取消，FFmpeg 进程会随 task context 终止。暂停由 manager 保留临时文件供恢复；取消或删除则必须先等待 worker 退出，再由 adapter cleanup 删除任务专属临时文件和 sidecar。合并成功后清理中间 `.m4s` 文件。
 
 ### 5.2 备用 URL 重试
 
@@ -158,11 +158,16 @@ ffmpeg -i video.m4s -i audio.m4s -c copy -y output.mp4
 实际文件下载复用通用下载能力：
 
 - 已有临时文件时尝试断点续传
-- 大文件且服务端通过 `GET Range` 证实支持 Range 时使用 multipart 下载
-- multipart chunk 必须返回 `206 Partial Content`，并校验 `Content-Range` 起止范围
-- chunk 提前 EOF 会失败，避免生成损坏文件
-- 不适合 multipart 时回退到顺序下载
-- 暂停或取消时保留临时文件，便于后续恢复
+- 视频、音频 `.m4s` 文件都通过 `internal/download/fetch` 下载
+- 主 URL 和 B站声明为同一 DASH 字节实体的备用 CDN 作为 `EquivalentMirrorURLs` 交给 Fetch；Fetch 继续校验 validator/size，不能把不同清晰度当成镜像
+- Fetch 负责 Range 续传、Range 被忽略时完整重下、短重试和字节级进度
+- 暂停保留临时文件；取消/删除在 join 后清理，shutdown 保留以便重启恢复
+
+### 5.5 API context、媒体 Cookie 与最终发布
+
+分 P 和 playurl 请求使用注入的 `HTTPDoer` 并传播 task context，pause/cancel 能中止尚未返回的 API 请求；默认 API request timeout 为 30 秒。playurl 的 HTTP 状态和 B站业务码会映射为稳定的 `bilibili.auth_required`、`bilibili.risk_control` 或 `bilibili.resource_expired`，前端不解析错误字符串。SESSDATA 只用于 B站 API/auth 和权限判断，不发送给媒体 CDN Fetch 请求；QR poll 成功后在后端保存 Cookie，但公开 status DTO 明确省略 `sessData`。
+
+Adapter 始终把媒体写到任务专属临时路径，FFmpeg 合并结果仍是临时产物；只有 `PublishFinal` 能按 manager 预留的路径执行 no-replace 发布。主 final artifact 与 `completed` 在同一 revision 持久化；重启看到已经发布的可信主产物时直接认领，不重复请求 API 或执行 adapter。
 
 ## 6. 番剧交互和权限处理
 
@@ -175,7 +180,9 @@ ffmpeg -i video.m4s -i audio.m4s -c copy -y output.mp4
 
 - 高画质通常依赖有效登录态 `SESSDATA`，番剧会员集还可能需要大会员权限。
 - DASH 下载依赖 FFmpeg；没有 FFmpeg 时无法合并视频和音频。
-- App 重启后，B站任务会在继续/重试时重新解析流信息并绑定下载函数，因为 CDN URL 具有时效性。
+- 创建下载任务时会把 B站稳定的 BV/CID、分 P/剧集索引和用户选择的清晰度序列化为 `platformData`；为兼容现有 schema，其中可能仍带有展示阶段取得的 `Streams`，但执行端不信任这些短期 CDN 直链。普通视频使用的历史 `partIndex=-1` 在执行时映射到首个分段。每次实际执行（包括重启恢复、暂停后继续和排队后启动）都会用 BV/CID 重新请求 playurl，再按用户清晰度选择新流，避免复用已经过期的签名 URL。App 重启后由 B站平台适配器恢复执行，不再依赖不可持久化的下载函数。Adapter 在解码前要求当前 `PlatformDataVersion`，未知版本直接拒绝恢复。
+- 取消或删除任务时，临时 `.m4s` 文件和状态文件按最终输出路径派生清理，不再从展示标题里推断清理前缀。
+- 新任务保存在 `downloads.v2.json`；旧 `downloads.json` 不导入且保持原样。pause/cancel/remove 先返回 accepted receipt，终态由 revisioned lifecycle event 通知前端。
 - 当前编码选择偏向更高压缩效率和规格，不额外按设备兼容性降级到 H.264。
 - 备用 CDN 只在下载或获取内容长度失败时使用，不改变用户在前端看到的清晰度列表。
 - 如果 PGC 流返回 `bilidrm_uri` 且没有可用解密 key，当前会提示 DRM 保护内容暂不支持下载。

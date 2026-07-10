@@ -11,7 +11,7 @@ A simple and easy-to-use desktop video downloader that supports downloading cont
 - **Xiaohongshu Download**: Supports downloading videos and image notes from Xiaohongshu
 - **Douyin Download**: Supports Douyin video download, including slideshow preview and download
 - **Visual Interface**: Netflix-style video card display with clear download progress
-- **Reliable Downloads**: Built-in queueing, resume support, state persistence, and failed/cancelled grouping
+- **Reliable Downloads**: Built-in queueing, resume support, state persistence, and failed/canceled grouping
 - **Local Security Boundary**: Internal API and proxy bind to `127.0.0.1` by default, with token checks for browser-facing routes
 - **Zero Configuration**: Automated certificate installation and proxy setup for easy onboarding
 
@@ -79,7 +79,7 @@ A simple and easy-to-use desktop video downloader that supports downloading cont
 ## Download and Security Notes
 
 - Download tasks are handled by a shared queue; tasks above the concurrency limit stay pending instead of being dropped.
-- Task state is persisted under the app data directory and restored on restart. Bilibili tasks rebind their downloader on resume/retry; unfinished Douyin/Xiaohongshu tasks need to be parsed again after restart.
+- New task state is stored as `downloads.v2.json` under the app data directory. Ordinary URL, WeChat, Bilibili, Douyin, and Xiaohongshu tasks can all recover from persisted `PlatformData`. The legacy `downloads.json` is not imported or modified; the Downloads page shows a one-time preservation and rollback notice.
 - The image proxy blocks localhost, private, link-local, metadata-style and other unsafe addresses to avoid internal network probing.
 - See [Security Boundary and Download Reliability](docs/security-and-download-reliability.md) for implementation details.
 
@@ -87,14 +87,14 @@ A simple and easy-to-use desktop video downloader that supports downloading cont
 
 ### Requirements
 
-- Go 1.21+
-- Node.js 18+
-- Wails CLI v2
+- Go 1.23+
+- Node.js 20+
+- Wails CLI v2.11.0
 
 ### Install Wails CLI
 
 ```bash
-go install github.com/wailsapp/wails/v2/cmd/wails@latest
+go install github.com/wailsapp/wails/v2/cmd/wails@v2.11.0
 ```
 
 ### Development Mode
@@ -110,6 +110,19 @@ wails build
 ```
 
 Build output is located in the `build/bin/` directory.
+
+### Settings / Wails binding contract
+
+User settings are read and written only through `GetSettings` / `UpdateSettings`; `GetAppInfo` returns runtime metadata only. After changing backend bindings, run:
+
+```bash
+go run github.com/wailsapp/wails/v2/cmd/wails@v2.11.0 generate module -nocolour
+git diff --exit-code -- frontend/wailsjs
+```
+
+Do not hand-edit `frontend/wailsjs/`. `frontend/settings-bindings.denylist.txt` and the frontend tests prevent removed field-level settings bindings from being reintroduced.
+
+`UpdateSettings` is transactional: critical runtime effects are rolled back when commit fails; changing the port of a running proxy returns `restartRequirements(scope=proxy)` so the proxy can be stopped and started explicitly; best-effort synchronization failures do not undo durable settings and are returned through `warnings`. Frontend callers must surface both `warnings` and `restartRequirements`.
 
 ## Project Structure
 

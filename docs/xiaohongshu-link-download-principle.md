@@ -218,16 +218,16 @@
 1. 按前端传入的 `quality` 选流
 2. 如果没匹配上，就回退到第一个可用流
 3. 先尝试 `masterUrl`
-4. 如果主 URL 失败，依次尝试 `backupUrls` 里的备用 CDN
-5. 调用通用可续传下载逻辑
-6. 传入 `User-Agent` 和 `Referer`
-7. 支持断点续传和 Range；multipart 只在 `GET Range` 返回 `206 Partial Content` 且 `Content-Range` 校验通过时启用
-8. 持续回调字节级进度
+4. 把明确属于同一媒体字节实体的 `backupUrls` 作为 `EquivalentMirrorURLs`；不同清晰度的选择仍由 adapter 负责
+5. 调用通用 Fetch 文件传输模块
+6. 传入 `User-Agent`、`Referer`、同字节实体的 equivalent mirror URL、大小上限、no-progress timeout 和断点续传策略
+7. 支持 validator/sidecar 约束的断点续传、Range 被忽略时安全重下、no-progress timeout、短重试、progress reset 和字节级进度
+8. Adapter 校验临时文件后调用 `PublishFinal`，由 manager no-replace 发布最终产物
 
-下载器额外带了两层保护：
+文件传输额外带了两层保护：
 
 - 视频大小上限，默认 2GiB
-- 无进度超时，默认 2 分钟
+- Downloader 将可配置的 `noProgressTimeout` 显式传给 Fetch，默认 2 分钟；收到新字节会刷新 watchdog，超时仍包装为平台兼容的 `ErrNoProgressTimeout`
 
 这样可以避免异常响应、假死连接或超大文件把下载任务长期卡住。
 
@@ -238,8 +238,8 @@
 1. 校验用户选择的图片索引
 2. 创建图集临时目录和状态文件
 3. 检查历史已完成项是否还存在（Live Photo 会同时检查静态图和视频副本）
-4. 顺序下载每一张图，主图片 URL 失败时尝试备用 URL
-5. 如果图片包含 Live Photo，继续下载对应视频副本
+4. 顺序下载每一张图，主图片 URL 失败时通过 Fetch 尝试备用 URL
+5. 如果图片包含 Live Photo，继续通过 Fetch 下载对应视频副本
 6. 每完成一批就保存状态
 7. 全部完成后打成 ZIP
 8. 清理临时目录
@@ -284,7 +284,8 @@
 
 - 它不重新解析原始输入
 - 它直接接收前端传回来的 `XHSItem`
-- 视频和图文都通过统一的 `BuildDownloadFunc` 进入下载管理器
+- 创建任务时会把 `XHSItem`、图片选择和清晰度序列化为 `platformData`
+- 视频和图文都由 `PlatformID=xiaohongshu` 的适配器执行
 
 ### 7.3 下载管理器集成
 
@@ -297,7 +298,9 @@
 - 失败事件
 - 文件命名和输出路径
 
-但是小红书这一侧在进入下载器之前，信息对象已经完整结构化了，因此下载时少了一次重新抓详情的开销。App 重启后，小红书自定义下载闭包不会被持久化，未完成任务会标记为失败并提示重新解析后再下载。
+但是小红书这一侧在进入下载器之前，信息对象已经完整结构化了，因此下载时少了一次重新抓详情的开销。App 重启后，未完成任务通过持久化的 `platformData` 还原执行输入，不需要重新绑定下载闭包。
+
+新任务写入 `downloads.v2.json`，旧 `downloads.json` 原样保留且不自动导入。pause/shutdown 保留图集状态和 partial；cancel/remove 在 worker join 后清理。最终 ZIP/MP4 路径由 `OutputPathAllocator` 预留并使用 `auto_rename`，同名任务和外部文件不能互相覆盖；Wails stop 先返回 accepted receipt，终态由 revisioned lifecycle event 发布。
 
 ## 8. 常见失败点
 
@@ -330,7 +333,7 @@
 - 主 URL 和备用 CDN URL 都下载失败
 - 视频体积超过限制
 - 下载过程中长时间无进度被主动中断
-- 服务端 Range/`Content-Range` 行为异常，通用 multipart 校验失败
+- 服务端 Range/`Content-Range`、validator 或镜像身份异常，且 Fetch 无法安全降级为完整重下
 - 某张图片主地址和备用地址都返回异常状态码
 - Live Photo 视频副本下载失败或超过大小限制
 - ZIP 打包或临时目录写入失败
@@ -345,5 +348,6 @@
 - 对压缩格式、页面脚本和异常页做了较多兼容
 - 图文下载重视稳定性和恢复，而不是极限吞吐
 - 下载时直接使用前端已经解析好的结构化对象
+- v2 恢复在解码小红书 `PlatformData` 前校验版本，未知版本 fail-closed
 
 如果后续要扩展小红书搜索、登录态或更复杂的页面交互，建议在现有“分享链接解析下载”链路之外，单独增加新的浏览器态抓取模块，而不是把这些职责继续堆到当前 `Parser/Client` 上。

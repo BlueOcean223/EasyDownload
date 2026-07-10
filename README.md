@@ -79,7 +79,7 @@
 ## 下载与安全说明
 
 - 下载任务会进入统一队列；超过并发上限时保持等待，不会因为“并发已满”直接丢失。
-- 应用会把任务状态保存到本地数据目录，重启后可恢复任务列表；B站任务继续/重试时会重新绑定下载逻辑，抖音/小红书未完成任务重启后需要重新解析。
+- 新任务状态保存在本地数据目录的 `downloads.v2.json`，普通 URL、微信、B站、抖音和小红书任务都可凭持久化的 `PlatformData` 恢复；旧版 `downloads.json` 不自动导入且保持原样，任务页会显示一次保留/回滚提示。
 - 图片代理会阻止 localhost、私网、link-local、metadata 等地址，避免被用于内网探测。
 - 更多实现细节见 [安全边界与下载可靠性说明](docs/security-and-download-reliability.md)。
 
@@ -87,14 +87,14 @@
 
 ### 环境要求
 
-- Go 1.21+
-- Node.js 18+
-- Wails CLI v2
+- Go 1.23+
+- Node.js 20+
+- Wails CLI v2.11.0
 
 ### 安装 Wails CLI
 
 ```bash
-go install github.com/wailsapp/wails/v2/cmd/wails@latest
+go install github.com/wailsapp/wails/v2/cmd/wails@v2.11.0
 ```
 
 ### 开发模式
@@ -110,6 +110,19 @@ wails build
 ```
 
 构建产物位于 `build/bin/` 目录。
+
+### Settings / Wails 绑定约定
+
+用户设置只通过 `GetSettings` / `UpdateSettings` 读写；`GetAppInfo` 仅返回运行时元数据。修改后端绑定后运行：
+
+```bash
+go run github.com/wailsapp/wails/v2/cmd/wails@v2.11.0 generate module -nocolour
+git diff --exit-code -- frontend/wailsjs
+```
+
+生成的 `frontend/wailsjs/` 不得手工编辑。旧字段级设置绑定由 `frontend/settings-bindings.denylist.txt` 和前端测试阻止重新引入。
+
+`UpdateSettings` 是事务接口：critical 运行态副作用在提交失败时回滚；运行中的代理端口变更通过 `restartRequirements(scope=proxy)` 明确提示停止并重启代理；best-effort 同步失败不会推翻已落盘设置，而是通过 `warnings` 返回。前端调用者必须展示并处理 `warnings` 与 `restartRequirements`。
 
 ## 项目结构
 
