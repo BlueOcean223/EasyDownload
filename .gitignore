@@ -13,14 +13,10 @@ build/bin/
 # =========================
 frontend/node_modules/
 frontend/dist/
-frontend/package-lock.json
 
 # =========================
 # Go
 # =========================
-# Go module cache
-go.sum
-
 # Test binary
 *.test
 
@@ -109,3 +105,4 @@ certs/
 # Reference folder (if you don't want to track it)
 reference/
 .ace-tool/
+.agent/
