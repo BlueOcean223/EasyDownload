@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -15,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-	"EasyDownload/internal/download"
+	"EasyDownload/internal/download/fetch"
 	"EasyDownload/internal/infra/logger"
 	"EasyDownload/internal/utils"
 )
@@ -46,8 +45,9 @@ var (
 // and concurrent image downloads for albums with ZIP packaging.
 type Downloader struct {
 	httpClient *http.Client // HTTP client for download requests
-	userAgent  string       // User-Agent header for requests
-	referer    string       // Referer header for requests
+	fetcher    fetch.Fetcher
+	userAgent  string // User-Agent header for requests
+	referer    string // Referer header for requests
 }
 
 // NewDownloader creates a new Downloader with default settings.
@@ -83,46 +83,11 @@ func (d *Downloader) downloadVideoWithContext(ctx context.Context, item *DouyinI
 		return ErrStreamNotFound
 	}
 
-	headers := d.effectiveHeaders()
-	client := d.getHTTPClient()
-
-	// Ensure the destination directory exists.
-	if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+	result, err := d.downloadVideoURLWithFetcher(ctx, d.fetcher, stream.URL, destPath, stream.Size, progressFn, bytesFn)
+	if err != nil {
 		return err
 	}
-
-	// Try multi-part download for large files (faster for big videos).
-	md := downloader.NewMultipartDownloader()
-	md.SetHeaders(headers)
-
-	checkResult := md.CheckRangeSupport(ctx, stream.URL)
-	totalSize := checkResult.ContentLength
-	supportsRange := checkResult.Error == nil && checkResult.SupportsRange
-
-	// Use multi-part download if server supports range requests and file is large enough.
-	if supportsRange && totalSize > downloader.MinSizeForMultipart {
-		result := md.Download(ctx, stream.URL, destPath, totalSize, func(downloaded, total int64) {
-			if bytesFn != nil {
-				bytesFn(downloaded, total)
-			}
-			if progressFn != nil && total > 0 {
-				progressFn(float64(downloaded) / float64(total) * 100)
-			}
-		})
-		if result.Error == nil {
-			if progressFn != nil {
-				progressFn(100)
-			}
-			if bytesFn != nil && totalSize > 0 {
-				bytesFn(totalSize, totalSize)
-			}
-			return nil
-		}
-		// Fallback to sequential download if multi-part fails.
-	}
-
-	// Use sequential download for small files or when range requests aren't supported.
-	return d.downloadVideoSequential(ctx, client, stream.URL, destPath, headers, totalSize, progressFn, bytesFn)
+	return removeFetchResumeState(result.ResumeStatePath)
 }
 
 // DownloadAlbum downloads all images from an album and packages them into a ZIP file.
@@ -134,7 +99,11 @@ func (d *Downloader) DownloadAlbum(item *DouyinItem, destPath string, progressFn
 
 // downloadAlbumWithContext downloads all album images with context support.
 func (d *Downloader) downloadAlbumWithContext(ctx context.Context, item *DouyinItem, destPath string, progressFn func(float64), bytesFn func(downloaded, total int64)) error {
-	return d.downloadImagesCore(ctx, item, nil, destPath, progressFn, bytesFn)
+	return d.downloadImagesCore(ctx, d.fetcher, item, nil, destPath, progressFn, bytesFn)
+}
+
+func (d *Downloader) downloadAlbumWithFetcher(ctx context.Context, fetcher fetch.Fetcher, item *DouyinItem, destPath string, progressFn func(float64), bytesFn func(downloaded, total int64)) error {
+	return d.downloadImagesCore(ctx, fetcher, item, nil, destPath, progressFn, bytesFn)
 }
 
 // downloadImagesCore is the unified core method for downloading album images.
@@ -151,6 +120,7 @@ func (d *Downloader) downloadAlbumWithContext(ctx context.Context, item *DouyinI
 // after interruption without re-downloading completed images.
 func (d *Downloader) downloadImagesCore(
 	ctx context.Context,
+	fetcher fetch.Fetcher,
 	item *DouyinItem,
 	indices []int,
 	destPath string,
@@ -168,6 +138,9 @@ func (d *Downloader) downloadImagesCore(
 	}
 	if indices != nil && len(indices) == 0 {
 		return fmt.Errorf("empty indices")
+	}
+	if fetcher == nil {
+		return fmt.Errorf("fetcher is required")
 	}
 
 	// Determine which indices to download.
@@ -187,7 +160,6 @@ func (d *Downloader) downloadImagesCore(
 		}
 	}
 
-	client := d.getHTTPClient()
 	if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
 		return err
 	}
@@ -332,10 +304,8 @@ func (d *Downloader) downloadImagesCore(
 
 			// Determine download URL: prefer VideoURL for video items, otherwise use image URL.
 			downloadURL := strings.TrimSpace(img.URL)
-			isVideo := false
 			if v := strings.TrimSpace(img.VideoURL); v != "" {
 				downloadURL = v
-				isVideo = true
 			}
 			if downloadURL == "" {
 				setErr(fmt.Errorf("empty album media url: index %d", idx))
@@ -345,28 +315,18 @@ func (d *Downloader) downloadImagesCore(
 			tempPath := utils.AlbumImageTempPath(tempDir, idx)
 			var dataSize int64
 
-			if isVideo {
-				// Download video using sequential downloader (handles large files better).
-				headers := d.effectiveHeaders()
-				if err := d.downloadVideoSequential(ctx, client, downloadURL, tempPath, headers, 0, nil, nil); err != nil {
-					setErr(err)
-					return
-				}
-				if fi, err := os.Stat(tempPath); err == nil {
-					dataSize = fi.Size()
-				}
-			} else {
-				// Download image with retry.
-				data, err := d.downloadImageWithRetry(ctx, client, downloadURL)
-				if err != nil {
-					setErr(err)
-					return
-				}
-				dataSize = int64(len(data))
-				if err := os.WriteFile(tempPath, data, 0644); err != nil {
-					setErr(err)
-					return
-				}
+			headers := d.effectiveHeaders()
+			result, err := d.downloadMediaFile(ctx, fetcher, downloadURL, tempPath, headers, 0, nil)
+			if err != nil {
+				setErr(err)
+				return
+			}
+			if err := removeFetchResumeState(result.ResumeStatePath); err != nil {
+				setErr(err)
+				return
+			}
+			if fi, err := os.Stat(tempPath); err == nil {
+				dataSize = fi.Size()
 			}
 
 			// Update state under lock, but defer IO outside lock.
@@ -467,6 +427,10 @@ func (d *Downloader) DownloadAlbumPartialWithContext(ctx context.Context, item *
 
 // DownloadAlbumPartialWithBytes is the full variant with both percentage and byte-level progress.
 func (d *Downloader) DownloadAlbumPartialWithBytes(ctx context.Context, item *DouyinItem, indices []int, destPath string, progressFn func(float64), bytesFn func(downloaded, total int64)) error {
+	return d.downloadAlbumPartialWithFetcher(ctx, d.fetcher, item, indices, destPath, progressFn, bytesFn)
+}
+
+func (d *Downloader) downloadAlbumPartialWithFetcher(ctx context.Context, fetcher fetch.Fetcher, item *DouyinItem, indices []int, destPath string, progressFn func(float64), bytesFn func(downloaded, total int64)) error {
 	if item == nil {
 		return fmt.Errorf("nil douyin item")
 	}
@@ -497,106 +461,7 @@ func (d *Downloader) DownloadAlbumPartialWithBytes(ctx context.Context, item *Do
 		return fmt.Errorf("empty indices")
 	}
 
-	return d.downloadImagesCore(ctx, item, normalized, destPath, progressFn, bytesFn)
-}
-
-// BuildDownloadFunc creates a download function for use with DownloadManager.
-// This integrates the Douyin downloader with the generic download manager system.
-// It automatically detects whether to download a video or album based on item type.
-func (d *Downloader) BuildDownloadFunc(item *DouyinItem, qualityKey string, outputDir string) downloader.DownloadFunc {
-	return func(ctx context.Context, task *downloader.DownloadTask, onProgress func(downloaded, total int64), onComplete func(outputPath string)) error {
-		isAlbum := strings.ToLower(strings.TrimSpace(item.Type)) == "album" || len(item.Images) > 0
-		ext := ".mp4"
-		if isAlbum {
-			ext = ".zip"
-		}
-
-		baseName := douyinFileBase(item)
-		destPath := filepath.Join(outputDir, baseName+ext)
-
-		if task != nil && task.FilePath != "" {
-			destPath = task.FilePath
-			if filepath.Ext(destPath) == "" {
-				destPath = destPath + ext
-			}
-		}
-
-		if isAlbum {
-			total := len(item.Images)
-			progressFn := func(p float64) {
-				if task != nil && total > 0 {
-					completed := int(p/100*float64(total) + 0.5)
-					if completed > total {
-						completed = total
-					}
-					task.AlbumCompleted = completed
-					task.Progress = p // Update progress percentage
-				}
-			}
-			if err := d.downloadAlbumWithContext(ctx, item, destPath, progressFn, onProgress); err != nil {
-				return err
-			}
-			if task != nil {
-				task.AlbumCompleted = total
-				task.Progress = 100
-			}
-		} else {
-			if err := d.downloadVideoWithContext(ctx, item, qualityKey, destPath, nil, onProgress); err != nil {
-				return err
-			}
-		}
-
-		if onComplete != nil {
-			onComplete(destPath)
-		}
-		return nil
-	}
-}
-
-// downloadImageWithRetry downloads a single image with exponential backoff retry.
-// Returns the image data as bytes on success.
-func (d *Downloader) downloadImageWithRetry(ctx context.Context, client *http.Client, rawURL string) ([]byte, error) {
-	var lastErr error
-	for attempt := 1; attempt <= albumMaxRetry; attempt++ {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		data, err := d.downloadImage(ctx, client, rawURL)
-		if err == nil {
-			return data, nil
-		}
-		lastErr = err
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(time.Duration(attempt*100) * time.Millisecond):
-		}
-	}
-	return nil, fmt.Errorf("failed to download image after %d attempts: %w", albumMaxRetry, lastErr)
-}
-
-// downloadImage downloads a single image and returns its bytes.
-func (d *Downloader) downloadImage(ctx context.Context, client *http.Client, rawURL string) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
-	if err != nil {
-		return nil, err
-	}
-	d.applyHeaders(req)
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests {
-		return nil, fmt.Errorf("douyin image download forbidden: status %d", resp.StatusCode)
-	}
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return nil, fmt.Errorf("unexpected douyin image status: %d", resp.StatusCode)
-	}
-
-	return io.ReadAll(resp.Body)
+	return d.downloadImagesCore(ctx, fetcher, item, normalized, destPath, progressFn, bytesFn)
 }
 
 // getHTTPClient returns the configured HTTP client or a default one.
@@ -776,44 +641,82 @@ func (d *Downloader) effectiveHeaders() map[string]string {
 	}
 }
 
-// downloadVideoSequential downloads a video using sequential requests.
-// Supports resumable downloads via Range headers.
-// Used when multi-part download fails or isn't supported.
-func (d *Downloader) downloadVideoSequential(ctx context.Context, client *http.Client, url string, destPath string, headers map[string]string, totalHint int64, progressFn func(float64), bytesFn func(downloaded, total int64)) error {
-	progress := func(downloaded, total int64) {
+// downloadVideoURLWithFetcher downloads one already-selected stream. Stream and
+// quality fallback stay in the adapter; this method only transfers one byte
+// entity through the composition-root Fetcher.
+func (d *Downloader) downloadVideoURLWithFetcher(ctx context.Context, fetcher fetch.Fetcher, rawURL string, temporaryPath string, totalHint int64, progressFn func(float64), bytesFn func(downloaded, total int64)) (fetch.FetchResult, error) {
+	result, err := d.downloadMediaFile(ctx, fetcher, rawURL, temporaryPath, d.effectiveHeaders(), totalHint, func(downloaded, total int64) {
 		if bytesFn != nil {
 			bytesFn(downloaded, total)
 		}
 		if progressFn != nil && total > 0 {
 			progressFn(float64(downloaded) / float64(total) * 100)
 		}
-	}
-
-	downloaded, total, err := downloader.DownloadFileResumable(ctx, client, url, destPath, downloader.ResumableDownloadOptions{
-		Headers:         headers,
-		TotalHint:       totalHint,
-		MaxRangeRetries: 3,
-	}, progress)
+	})
 	if err != nil {
-		var statusErr *downloader.HTTPStatusError
-		if errors.As(err, &statusErr) {
-			if statusErr.StatusCode == http.StatusForbidden || statusErr.StatusCode == http.StatusTooManyRequests {
-				return fmt.Errorf("douyin download forbidden: status %d", statusErr.StatusCode)
-			}
-			return fmt.Errorf("unexpected douyin response: %d", statusErr.StatusCode)
-		}
-		return err
+		return fetch.FetchResult{}, err
 	}
-
 	if progressFn != nil {
 		progressFn(100)
 	}
-	if bytesFn != nil {
-		if total <= 0 {
-			bytesFn(downloaded, downloaded)
-		} else {
-			bytesFn(downloaded, total)
+	return result, nil
+}
+
+func (d *Downloader) downloadMediaFile(ctx context.Context, fetcher fetch.Fetcher, rawURL string, temporaryPath string, headers map[string]string, totalHint int64, progress func(downloaded, total int64)) (fetch.FetchResult, error) {
+	if fetcher == nil {
+		return fetch.FetchResult{}, errors.New("fetcher is required")
+	}
+	var reporter fetch.ProgressReporter
+	if progress != nil {
+		reporter = func(p fetch.Progress) {
+			progress(p.Downloaded, p.Total)
 		}
+	}
+	result, err := fetcher.Download(ctx, fetch.Request{
+		URL:     rawURL,
+		Headers: headers,
+		Identity: fetch.ResourceIdentity{
+			ExpectedSize: totalHint,
+		},
+		ResumePolicy: fetch.ResumePolicy{
+			Enabled:                 true,
+			RestartWhenRangeIgnored: true,
+		},
+		RetryPolicy: fetch.RetryPolicy{
+			MaxAttempts:    3,
+			InitialBackoff: 200 * time.Millisecond,
+			MaxBackoff:     2 * time.Second,
+		},
+	}, fetch.Destination{
+		TemporaryPath:   temporaryPath,
+		ResumeStatePath: temporaryPath + ".resume.json",
+	}, reporter)
+	if err != nil {
+		var fetchErr *fetch.Error
+		if errors.As(err, &fetchErr) && fetchErr.Kind == fetch.ErrorStatusCode {
+			if fetchErr.StatusCode == http.StatusForbidden || fetchErr.StatusCode == http.StatusTooManyRequests {
+				return fetch.FetchResult{}, fmt.Errorf("douyin download forbidden: status %d: %w", fetchErr.StatusCode, err)
+			}
+			return fetch.FetchResult{}, fmt.Errorf("unexpected douyin response: %d: %w", fetchErr.StatusCode, err)
+		}
+		return fetch.FetchResult{}, err
+	}
+	if progress != nil {
+		total := result.Total
+		if total <= 0 {
+			total = result.Downloaded
+		}
+		progress(result.Downloaded, total)
+	}
+	return result, nil
+}
+
+func removeFetchResumeState(path string) error {
+	if strings.TrimSpace(path) == "" {
+		return nil
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove douyin resume state: %w", err)
 	}
 	return nil
 }

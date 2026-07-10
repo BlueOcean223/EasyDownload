@@ -2,7 +2,12 @@ package downloader
 
 import (
 	"context"
+	"encoding/json"
+	"path/filepath"
+	"strings"
 	"sync"
+
+	downloadtask "EasyDownload/internal/download/task"
 )
 
 // DownloadTask represents a single download task with all its metadata and state.
@@ -11,28 +16,24 @@ import (
 // A task progresses through various states (see DownloadStatus) and tracks
 // download progress, speed, and error information.
 type DownloadTask struct {
+	PlatformID          string                                   `json:"platformId"`
+	PlatformDataVersion int                                      `json:"platformDataVersion"`
+	PlatformData        json.RawMessage                          `json:"platformData,omitempty"`
+	PlatformCheckpoint  *downloadtask.PlatformCheckpointEnvelope `json:"platformCheckpoint,omitempty"`
+	PublishIntent       *downloadtask.PublishIntent              `json:"publishIntent,omitempty"`
+	OutputPolicy        downloadtask.OutputPolicy                `json:"outputPolicy"`
 	// ID is a unique identifier for this download task.
 	ID string `json:"id"`
-	// URL is the download URL (may include quality parameters for WeChat).
-	URL string `json:"url"`
 	// Title is the display name for this download.
 	Title string `json:"title"`
 	// Cover is the URL of the cover/thumbnail image.
 	Cover string `json:"cover"`
-	// Source identifies the content source (e.g., "wechat", "bilibili", "douyin").
-	Source string `json:"source"`
-	// Quality contains quality-specific metadata (e.g., WeChat fileFormat value).
-	Quality string `json:"quality"`
-	// FilePath is the absolute path where the file will be saved.
-	FilePath string `json:"filePath"`
-	// FileName is just the filename portion of FilePath.
-	FileName string `json:"fileName"`
-	// FileSize is the total size of the file in bytes (0 if unknown).
-	FileSize int64 `json:"fileSize"`
-	// Downloaded is the number of bytes downloaded so far.
-	Downloaded int64 `json:"downloaded"`
-	// Progress is the download progress as a percentage (0-100).
-	Progress float64 `json:"progress"`
+	// DisplaySource is presentation-only; execution identity is PlatformID.
+	DisplaySource string `json:"displaySource"`
+	// ProgressSummary is the structured progress view owned by DownloadManager.
+	ProgressSummary downloadtask.TaskProgressSummary `json:"progressSummary"`
+	// Artifacts records final and temporary outputs produced by the task.
+	Artifacts []downloadtask.TaskArtifact `json:"artifacts,omitempty"`
 	// Speed is the current download speed in bytes per second.
 	Speed int64 `json:"speed"`
 	// Status is the current state of this download task.
@@ -44,86 +45,185 @@ type DownloadTask struct {
 	// CompletedAt is the Unix timestamp when this task completed (0 if not completed).
 	CompletedAt int64 `json:"completedAt"`
 
-	// Retry configuration fields
-	// RetryCount tracks the number of retry attempts made for this task.
-	RetryCount int `json:"retryCount"`
-	// MaxRetry is the maximum number of retry attempts allowed.
-	MaxRetry int `json:"maxRetry"`
 	// LastError stores the error message from the most recent failed attempt.
 	LastError string `json:"lastError"`
-
-	// Decryption fields (for WeChat videos)
-	// DecodeKey is the Base64-encoded decryption key for encrypted WeChat videos.
-	DecodeKey string `json:"decodeKey"`
-
-	// Album fields (for Douyin albums)
-	// IsAlbum indicates whether this task is a Douyin album download.
-	IsAlbum bool `json:"isAlbum"`
-	// AlbumTotal is the total number of images in the album.
-	AlbumTotal int `json:"albumTotal"`
-	// AlbumCompleted is the number of images that have been downloaded.
-	AlbumCompleted int `json:"albumCompleted"`
-
-	// customDownloader is an optional function for sources requiring special download logic.
-	// When set, this function is used instead of the default HTTP download.
-	customDownloader DownloadFunc
+	// LastErrorDetail stores the structured task error used across module boundaries.
+	LastErrorDetail *downloadtask.TaskError `json:"lastErrorDetail,omitempty"`
 
 	// cancel is the context cancellation function for stopping this download.
 	cancel context.CancelFunc
+	// generationCounter is monotonically increasing for this process. execution
+	// and all mutation gates are protected by mu.
+	generationCounter uint64
+	// queuedGeneration is reserved when a start is durably queued. Public
+	// snapshots expose it before automatic dispatch so expected-generation
+	// commands remain valid across the queue -> running transition.
+	queuedGeneration uint64
+	// eventInstance identifies this in-memory task object within one manager
+	// session. Unlike generationCounter it changes when a removed ID is reused,
+	// allowing the UI to distinguish a genuinely new task from late events for
+	// the deleted object. It is intentionally not persisted: the frontend and
+	// manager session restart together.
+	eventInstance uint64
+	execution     *taskExecution
 	// mu protects all fields of this struct for concurrent access.
 	mu sync.RWMutex
 }
 
-// SetCustomDownloader sets a custom downloader function for the task.
-// This allows changing the download method after task creation.
-// Thread-safe.
-func (t *DownloadTask) SetCustomDownloader(downloadFunc DownloadFunc) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.customDownloader = downloadFunc
+// PublicOutputPolicy is the output policy exposed to the UI. ReservationKey is
+// deliberately absent: it is an internal allocator capability, not public task
+// state.
+type PublicOutputPolicy struct {
+	Directory        string                        `json:"directory"`
+	PlannedFilename  string                        `json:"plannedFilename"`
+	PlannedFinalPath string                        `json:"plannedFinalPath"`
+	ConflictStrategy downloadtask.ConflictStrategy `json:"conflictStrategy"`
 }
 
-// GetCustomDownloader returns the custom downloader function for the task, if any.
-// Returns nil if no custom downloader is set.
-// Thread-safe.
-func (t *DownloadTask) GetCustomDownloader() DownloadFunc {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	return t.customDownloader
+// PublicTaskArtifact intentionally omits adapter-owned Metadata. The sanitized
+// CleanupFailed bit keeps post-publish leftovers observable without exposing
+// raw filesystem errors. Artifact paths are local output paths only; remote
+// resource URLs remain in PlatformData.
+type PublicTaskArtifact struct {
+	ID            string                        `json:"id,omitempty"`
+	Kind          downloadtask.TaskArtifactKind `json:"kind"`
+	Path          string                        `json:"path"`
+	FileName      string                        `json:"fileName,omitempty"`
+	MediaType     string                        `json:"mediaType,omitempty"`
+	Size          int64                         `json:"size,omitempty"`
+	Primary       bool                          `json:"primary,omitempty"`
+	CreatedAt     int64                         `json:"createdAt,omitempty"`
+	CleanupFailed bool                          `json:"cleanupFailed,omitempty"`
 }
 
-// TaskToJSON returns a map representation of the task suitable for JSON serialization.
-// This provides a snapshot of all task fields for API responses or persistence.
-// Thread-safe.
-func (t *DownloadTask) TaskToJSON() map[string]interface{} {
+// PublicDownloadTask is the secret-free task projection used by API responses
+// and Wails events. Execution inputs and recovery internals (PlatformData,
+// PlatformCheckpoint, PublishIntent, DecodeKey, and the output reservation key)
+// only belong in the persisted TaskSnapshot and adapter-facing contract.
+type PublicDownloadTask struct {
+	ID              string                           `json:"id"`
+	Instance        uint64                           `json:"instance"`
+	Generation      uint64                           `json:"generation"`
+	Revision        uint64                           `json:"revision"`
+	PlatformID      string                           `json:"platformId,omitempty"`
+	Title           string                           `json:"title"`
+	Cover           string                           `json:"cover"`
+	DisplaySource   string                           `json:"displaySource,omitempty"`
+	OutputPolicy    PublicOutputPolicy               `json:"outputPolicy"`
+	ProgressSummary downloadtask.TaskProgressSummary `json:"progressSummary"`
+	Artifacts       []PublicTaskArtifact             `json:"artifacts,omitempty"`
+	Speed           int64                            `json:"speed"`
+	Status          DownloadStatus                   `json:"status"`
+	Error           string                           `json:"error"`
+	CreatedAt       int64                            `json:"createdAt"`
+	CompletedAt     int64                            `json:"completedAt"`
+	LastError       string                           `json:"lastError"`
+	LastErrorDetail *downloadtask.TaskError          `json:"lastErrorDetail,omitempty"`
+	ExecutionState  string                           `json:"executionState,omitempty"`
+}
+
+// PublicSnapshot returns an immutable, secret-free task view suitable for
+// crossing the backend/frontend boundary. Thread-safe.
+func (t *DownloadTask) PublicSnapshot() PublicDownloadTask {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
+	return t.publicSnapshotLocked()
+}
 
-	return map[string]interface{}{
-		"id":             t.ID,
-		"url":            t.URL,
-		"title":          t.Title,
-		"cover":          t.Cover,
-		"source":         t.Source,
-		"quality":        t.Quality,
-		"filePath":       t.FilePath,
-		"fileName":       t.FileName,
-		"fileSize":       t.FileSize,
-		"downloaded":     t.Downloaded,
-		"progress":       t.Progress,
-		"speed":          t.Speed,
-		"status":         t.Status,
-		"error":          t.Error,
-		"createdAt":      t.CreatedAt,
-		"completedAt":    t.CompletedAt,
-		"retryCount":     t.RetryCount,
-		"maxRetry":       t.MaxRetry,
-		"lastError":      t.LastError,
-		"decodeKey":      t.DecodeKey,
-		"isAlbum":        t.IsAlbum,
-		"albumTotal":     t.AlbumTotal,
-		"albumCompleted": t.AlbumCompleted,
+func (t *DownloadTask) publicSnapshotLocked() PublicDownloadTask {
+	artifacts := make([]PublicTaskArtifact, 0, len(t.Artifacts))
+	for _, artifact := range t.Artifacts {
+		path := strings.TrimSpace(artifact.Path)
+		if path == "" || !filepath.IsAbs(path) {
+			continue
+		}
+		artifacts = append(artifacts, PublicTaskArtifact{
+			ID:            artifact.ID,
+			Kind:          artifact.Kind,
+			Path:          path,
+			FileName:      artifact.FileName,
+			MediaType:     artifact.MediaType,
+			Size:          artifact.Size,
+			Primary:       artifact.Primary,
+			CreatedAt:     artifact.CreatedAt,
+			CleanupFailed: strings.TrimSpace(artifact.Metadata["cleanupError"]) != "",
+		})
 	}
+	lastError := publicTaskError(t.LastErrorDetail)
+	publicErrorMessage := ""
+	if lastError != nil {
+		publicErrorMessage = lastError.Message
+	}
+	executionState := ""
+	generation := t.generationCounter
+	if t.execution != nil {
+		executionState = string(t.execution.phase)
+		generation = t.execution.generation
+	}
+	return PublicDownloadTask{
+		ID:            t.ID,
+		Instance:      t.eventInstance,
+		Generation:    generation,
+		PlatformID:    t.PlatformID,
+		Title:         t.Title,
+		Cover:         t.Cover,
+		DisplaySource: t.DisplaySource,
+		OutputPolicy: PublicOutputPolicy{
+			Directory:        t.OutputPolicy.Directory,
+			PlannedFilename:  t.OutputPolicy.PlannedFilename,
+			PlannedFinalPath: t.OutputPolicy.PlannedFinalPath,
+			ConflictStrategy: t.OutputPolicy.ConflictStrategy,
+		},
+		ProgressSummary: t.ProgressSummary,
+		Artifacts:       artifacts,
+		Speed:           t.Speed,
+		Status:          t.Status,
+		Error:           publicErrorMessage,
+		CreatedAt:       t.CreatedAt,
+		CompletedAt:     t.CompletedAt,
+		LastError:       publicErrorMessage,
+		LastErrorDetail: lastError,
+		ExecutionState:  executionState,
+	}
+}
+
+// PublicTaskSnapshot stamps a task projection with manager-session ordering.
+// Instance changes when an ID is removed and reused, Generation changes for a
+// retry/resume execution, and Revision orders snapshots within that pair.
+func (dm *DownloadManager) PublicTaskSnapshot(task *DownloadTask) PublicDownloadTask {
+	if task == nil {
+		return PublicDownloadTask{}
+	}
+	task.mu.Lock()
+	defer task.mu.Unlock()
+	if dm != nil {
+		if task.eventInstance == 0 {
+			task.eventInstance = dm.taskInstance.Add(1)
+		}
+	}
+	snapshot := task.publicSnapshotLocked()
+	if dm != nil {
+		snapshot.Revision = dm.eventRevision.Add(1)
+	}
+	return snapshot
+}
+
+// GetPublicTaskSnapshots captures membership and each task's versioned public
+// payload under one tasks-map read lock. A concurrent remove/create must occur
+// after this capture and therefore receives a later task-event fence, so an
+// initial RPC response cannot resurrect a removed object when buffered events
+// are replayed.
+func (dm *DownloadManager) GetPublicTaskSnapshots() []PublicDownloadTask {
+	if dm == nil {
+		return nil
+	}
+	dm.tasksMu.RLock()
+	defer dm.tasksMu.RUnlock()
+	result := make([]PublicDownloadTask, 0, len(dm.tasks))
+	for _, task := range dm.tasks {
+		result = append(result, dm.PublicTaskSnapshot(task))
+	}
+	return result
 }
 
 // Thread-safe getter/setter methods for DownloadTask
@@ -158,7 +258,7 @@ func (t *DownloadTask) SetStatus(status DownloadStatus) {
 func (t *DownloadTask) GetProgress() float64 {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	return t.Progress
+	return t.ProgressSummary.Percent
 }
 
 // SetProgress updates the download progress percentage.
@@ -166,7 +266,7 @@ func (t *DownloadTask) GetProgress() float64 {
 func (t *DownloadTask) SetProgress(progress float64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.Progress = progress
+	t.ProgressSummary.Percent = progress
 }
 
 // GetFileSize returns the total file size in bytes.
@@ -174,7 +274,7 @@ func (t *DownloadTask) SetProgress(progress float64) {
 func (t *DownloadTask) GetFileSize() int64 {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	return t.FileSize
+	return t.ProgressSummary.BytesTotal
 }
 
 // SetFileSize updates the total file size in bytes.
@@ -182,7 +282,7 @@ func (t *DownloadTask) GetFileSize() int64 {
 func (t *DownloadTask) SetFileSize(size int64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.FileSize = size
+	t.ProgressSummary.BytesTotal = size
 }
 
 // GetDownloaded returns the number of bytes downloaded so far.
@@ -190,7 +290,7 @@ func (t *DownloadTask) SetFileSize(size int64) {
 func (t *DownloadTask) GetDownloaded() int64 {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	return t.Downloaded
+	return t.ProgressSummary.BytesLoaded
 }
 
 // SetDownloaded updates the number of bytes downloaded.
@@ -198,7 +298,7 @@ func (t *DownloadTask) GetDownloaded() int64 {
 func (t *DownloadTask) SetDownloaded(downloaded int64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.Downloaded = downloaded
+	t.ProgressSummary.BytesLoaded = downloaded
 }
 
 // GetSpeed returns the current download speed in bytes per second.
@@ -223,15 +323,6 @@ func (t *DownloadTask) SetError(err string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.Error = err
-}
-
-// SetFilePath updates the output file path.
-// This may be called by custom downloaders that determine the final path.
-// Thread-safe.
-func (t *DownloadTask) SetFilePath(path string) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.FilePath = path
 }
 
 // SetCompletedAt sets the Unix timestamp when the download completed.

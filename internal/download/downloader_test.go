@@ -2,14 +2,19 @@ package downloader
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	downloadtask "EasyDownload/internal/download/task"
 	"EasyDownload/internal/utils"
 
 	"github.com/leanovate/gopter"
@@ -118,13 +123,14 @@ func TestDownloadManagerDefaultConcurrent(t *testing.T) {
 	}
 }
 
-// TestAddTask tests adding download tasks
-func TestAddTask(t *testing.T) {
+// TestCreateTask tests strict task creation with an explicitly registered adapter.
+func TestCreateTask(t *testing.T) {
 	dm := NewDownloadManager(os.TempDir(), 3)
+	requireNoError(t, registerInertTestAdapter(dm, "test"))
 
-	task, err := dm.AddTask("test-id", "http://example.com/video.mp4", "Test Video", "", "test", "720p")
+	task, err := createStrictTestTask(dm, "test-id", "http://example.com/video.mp4", "Test Video", "test")
 	if err != nil {
-		t.Fatalf("AddTask failed: %v", err)
+		t.Fatalf("CreateTask failed: %v", err)
 	}
 
 	if task.ID != "test-id" {
@@ -133,21 +139,22 @@ func TestAddTask(t *testing.T) {
 	if task.Status != StatusPending {
 		t.Errorf("task.Status = %s, want pending", task.Status)
 	}
-	if task.FileName != "Test_Video.mp4" {
-		t.Errorf("task.FileName = %s, want Test_Video.mp4", task.FileName)
+	if task.OutputPolicy.PlannedFilename != "Test_Video.mp4" {
+		t.Errorf("planned filename = %s, want Test_Video.mp4", task.OutputPolicy.PlannedFilename)
 	}
 }
 
 // TestAddDuplicateTask tests that duplicate tasks are rejected
 func TestAddDuplicateTask(t *testing.T) {
 	dm := NewDownloadManager(os.TempDir(), 3)
+	requireNoError(t, registerInertTestAdapter(dm, "test"))
 
-	_, err := dm.AddTask("test-id", "http://example.com/video.mp4", "Test Video", "", "test", "720p")
+	_, err := createStrictTestTask(dm, "test-id", "http://example.com/video.mp4", "Test Video", "test")
 	if err != nil {
-		t.Fatalf("First AddTask failed: %v", err)
+		t.Fatalf("First CreateTask failed: %v", err)
 	}
 
-	_, err = dm.AddTask("test-id", "http://example.com/video2.mp4", "Test Video 2", "", "test", "720p")
+	_, err = createStrictTestTask(dm, "test-id", "http://example.com/video2.mp4", "Test Video 2", "test")
 	if err == nil {
 		t.Error("Expected error for duplicate task ID, got nil")
 	}
@@ -156,10 +163,11 @@ func TestAddDuplicateTask(t *testing.T) {
 // TestGetTask tests retrieving tasks
 func TestGetTask(t *testing.T) {
 	dm := NewDownloadManager(os.TempDir(), 3)
+	requireNoError(t, registerInertTestAdapter(dm, "test"))
 
-	_, err := dm.AddTask("test-id", "http://example.com/video.mp4", "Test Video", "", "test", "720p")
+	_, err := createStrictTestTask(dm, "test-id", "http://example.com/video.mp4", "Test Video", "test")
 	if err != nil {
-		t.Fatalf("AddTask failed: %v", err)
+		t.Fatalf("CreateTask failed: %v", err)
 	}
 
 	task, err := dm.GetTask("test-id")
@@ -179,10 +187,11 @@ func TestGetTask(t *testing.T) {
 // TestRemoveTask tests removing tasks
 func TestRemoveTask(t *testing.T) {
 	dm := NewDownloadManager(os.TempDir(), 3)
+	requireNoError(t, registerInertTestAdapter(dm, "test"))
 
-	_, err := dm.AddTask("test-id", "http://example.com/video.mp4", "Test Video", "", "test", "720p")
+	_, err := createStrictTestTask(dm, "test-id", "http://example.com/video.mp4", "Test Video", "test")
 	if err != nil {
-		t.Fatalf("AddTask failed: %v", err)
+		t.Fatalf("CreateTask failed: %v", err)
 	}
 
 	err = dm.RemoveTask("test-id")
@@ -190,19 +199,30 @@ func TestRemoveTask(t *testing.T) {
 		t.Fatalf("RemoveTask failed: %v", err)
 	}
 
-	_, err = dm.GetTask("test-id")
-	if err == nil {
-		t.Error("Expected error after removing task, got nil")
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err = dm.GetTask("test-id"); err != nil {
+			return
+		}
+		time.Sleep(time.Millisecond)
 	}
+	t.Error("task was not removed after accepted asynchronous operation")
 }
 
 // TestGetAllTasks tests retrieving all tasks
 func TestGetAllTasks(t *testing.T) {
 	dm := NewDownloadManager(os.TempDir(), 3)
+	requireNoError(t, registerInertTestAdapter(dm, "test"))
 
-	dm.AddTask("id1", "http://example.com/1.mp4", "Video 1", "", "test", "720p")
-	dm.AddTask("id2", "http://example.com/2.mp4", "Video 2", "", "test", "720p")
-	dm.AddTask("id3", "http://example.com/3.mp4", "Video 3", "", "test", "720p")
+	for _, input := range []struct{ id, url, title string }{
+		{"id1", "http://example.com/1.mp4", "Video 1"},
+		{"id2", "http://example.com/2.mp4", "Video 2"},
+		{"id3", "http://example.com/3.mp4", "Video 3"},
+	} {
+		if _, err := createStrictTestTask(dm, input.id, input.url, input.title, "test"); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	tasks := dm.GetAllTasks()
 	if len(tasks) != 3 {
@@ -232,93 +252,127 @@ func TestSetDownloadDir(t *testing.T) {
 	}
 }
 
-// TestTaskToJSON tests task JSON serialization
-func TestTaskToJSON(t *testing.T) {
+// TestTaskPublicSnapshot tests the typed public task projection.
+func TestTaskPublicSnapshot(t *testing.T) {
 	task := &DownloadTask{
-		ID:       "test-id",
-		URL:      "http://example.com/video.mp4",
-		Title:    "Test Video",
-		Status:   StatusPending,
-		Progress: 50.5,
+		ID:              "test-id",
+		Title:           "Test Video",
+		Status:          StatusPending,
+		ProgressSummary: downloadtask.TaskProgressSummary{Percent: 50.5},
 	}
 
-	jsonMap := task.TaskToJSON()
+	public := task.PublicSnapshot()
 
-	if jsonMap["id"] != "test-id" {
-		t.Errorf("jsonMap[id] = %v, want test-id", jsonMap["id"])
+	if public.ID != "test-id" {
+		t.Errorf("public.ID = %v, want test-id", public.ID)
 	}
-	if jsonMap["progress"] != 50.5 {
-		t.Errorf("jsonMap[progress] = %v, want 50.5", jsonMap["progress"])
+	if public.ProgressSummary.Percent != 50.5 {
+		t.Errorf("public.ProgressSummary.Percent = %v, want 50.5", public.ProgressSummary.Percent)
 	}
-	if jsonMap["status"] != StatusPending {
-		t.Errorf("jsonMap[status] = %v, want pending", jsonMap["status"])
+	if public.Status != StatusPending {
+		t.Errorf("public.Status = %v, want pending", public.Status)
 	}
 }
 
-// **Feature: easydownload-improvements, Property 4: 重试次数限制**
-// **Validates: Requirements 4.1**
-// For any download task, automatic retry count should not exceed the configured maximum
-func TestRetryCountLimitProperty(t *testing.T) {
-	parameters := gopter.DefaultTestParameters()
-	parameters.MinSuccessfulTests = 100
-	properties := gopter.NewProperties(parameters)
+func TestPublicTaskSnapshotDistinguishesSameIDTaskInstances(t *testing.T) {
+	dm := NewDownloadManager(t.TempDir(), 1)
+	first := &DownloadTask{ID: "reused-id", Status: StatusDownloading, generationCounter: 1}
+	second := &DownloadTask{ID: "reused-id", Status: StatusDownloading, generationCounter: 1}
 
-	properties.Property("retry count never exceeds max retry", prop.ForAll(
-		func(maxRetry int, retryAttempts int) bool {
-			// Ensure maxRetry is positive
-			if maxRetry < 1 {
-				maxRetry = 1
+	firstSnapshot := dm.PublicTaskSnapshot(first)
+	firstAgain := dm.PublicTaskSnapshot(first)
+	secondSnapshot := dm.PublicTaskSnapshot(second)
+
+	if firstSnapshot.Instance == 0 {
+		t.Fatal("first task instance must be non-zero")
+	}
+	if firstAgain.Instance != firstSnapshot.Instance {
+		t.Fatalf("same task instance changed: first=%d again=%d", firstSnapshot.Instance, firstAgain.Instance)
+	}
+	if secondSnapshot.Instance <= firstSnapshot.Instance {
+		t.Fatalf("same-ID replacement instance=%d, want greater than removed instance=%d", secondSnapshot.Instance, firstSnapshot.Instance)
+	}
+	if secondSnapshot.Generation != firstSnapshot.Generation {
+		t.Fatalf("test requires per-task generations to collide, first=%d second=%d", firstSnapshot.Generation, secondSnapshot.Generation)
+	}
+	if !(firstSnapshot.Revision < firstAgain.Revision && firstAgain.Revision < secondSnapshot.Revision) {
+		t.Fatalf("event revisions are not monotonic: %d, %d, %d", firstSnapshot.Revision, firstAgain.Revision, secondSnapshot.Revision)
+	}
+}
+
+func TestPublicTaskSnapshotRevisionNeverRegressesConcurrentPayload(t *testing.T) {
+	dm := NewDownloadManager(t.TempDir(), 1)
+	task := &DownloadTask{ID: "task-1", Status: StatusDownloading}
+	const readers = 8
+	const snapshotsPerReader = 500
+	results := make(chan PublicDownloadTask, readers*snapshotsPerReader)
+	start := make(chan struct{})
+	var wait sync.WaitGroup
+	for reader := 0; reader < readers; reader++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			<-start
+			for index := 0; index < snapshotsPerReader; index++ {
+				results <- dm.PublicTaskSnapshot(task)
 			}
-			if maxRetry > 10 {
-				maxRetry = 10
-			}
+		}()
+	}
+	wait.Add(1)
+	go func() {
+		defer wait.Done()
+		<-start
+		for progress := 1; progress <= snapshotsPerReader; progress++ {
+			task.SetProgress(float64(progress))
+		}
+	}()
+	close(start)
+	wait.Wait()
+	close(results)
 
-			dm := NewDownloadManager(os.TempDir(), 3)
-			dm.SetRetryConfig(true, maxRetry, time.Millisecond, time.Millisecond*10)
+	snapshots := make([]PublicDownloadTask, 0, readers*snapshotsPerReader)
+	for snapshot := range results {
+		snapshots = append(snapshots, snapshot)
+	}
+	sort.Slice(snapshots, func(i, j int) bool { return snapshots[i].Revision < snapshots[j].Revision })
+	lastProgress := -1.0
+	for _, snapshot := range snapshots {
+		if snapshot.ProgressSummary.Percent < lastProgress {
+			t.Fatalf("newer revision %d regressed progress from %.0f to %.0f", snapshot.Revision, lastProgress, snapshot.ProgressSummary.Percent)
+		}
+		lastProgress = snapshot.ProgressSummary.Percent
+	}
+}
 
-			task := &DownloadTask{
-				ID:         "test-retry",
-				MaxRetry:   maxRetry,
-				RetryCount: 0,
-			}
+func TestDownloadManagerDoesNotAutoRetryPlatformFailures(t *testing.T) {
+	dm := NewDownloadManager(t.TempDir(), 1)
+	var attempts atomic.Int32
+	requireNoError(t, dm.RegisterPlatformAdapter(failingTaskAdapter{
+		id:       "fail-once",
+		attempts: &attempts,
+	}))
 
-			// Simulate retry attempts
-			for i := 0; i < retryAttempts; i++ {
-				if task.RetryCount < task.MaxRetry {
-					task.RetryCount++
-				}
-			}
+	task, err := createStrictTestTask(dm, "test-id", "http://example.com/video.mp4", "Test", "fail-once")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dm.StartTask(task.ID); err != nil {
+		t.Fatal(err)
+	}
 
-			// Verify retry count never exceeds max
-			return task.RetryCount <= task.MaxRetry
-		},
-		gen.IntRange(1, 10),
-		gen.IntRange(0, 20),
-	))
-
-	properties.Property("task max retry is set from manager config", prop.ForAll(
-		func(maxRetry int) bool {
-			if maxRetry < 1 {
-				maxRetry = 1
-			}
-			if maxRetry > 10 {
-				maxRetry = 10
-			}
-
-			dm := NewDownloadManager(os.TempDir(), 3)
-			dm.SetRetryConfig(true, maxRetry, time.Millisecond, time.Millisecond*10)
-
-			task, err := dm.AddTask("test-id", "http://example.com/video.mp4", "Test", "", "test", "720p")
-			if err != nil {
-				return false
-			}
-
-			return task.MaxRetry == maxRetry
-		},
-		gen.IntRange(1, 10),
-	))
-
-	properties.TestingRun(t)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if dm.GetActiveTaskCount() == 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("attempts=%d, want 1", got)
+	}
+	if got := task.GetStatus(); got != StatusFailed {
+		t.Fatalf("status=%s, want failed", got)
+	}
 }
 
 // **Feature: easydownload-improvements, Property 5: 下载状态持久化往返**
@@ -350,26 +404,27 @@ func TestDownloadStatePersistenceRoundTripProperty(t *testing.T) {
 				progress = 100
 			}
 
-			tempDir := filepath.Join(os.TempDir(), "easydownload_test_state")
-			os.MkdirAll(tempDir, 0755)
-			defer os.RemoveAll(tempDir)
+			tempDir := t.TempDir()
 
 			statePath := filepath.Join(tempDir, "downloads.json")
 
-			// Create manager and add task
+			// Create manager and persist a task through the strict v2 contract.
 			dm1 := NewDownloadManager(tempDir, 3)
 			dm1.SetStatePath(statePath)
+			if err := registerInertTestAdapter(dm1, "test"); err != nil {
+				return false
+			}
 
-			task, err := dm1.AddTask(taskID, "http://example.com/video.mp4", title, "", "test", "720p")
+			task, err := createStrictTestTask(dm1, taskID, "http://example.com/video.mp4", title, "test")
 			if err != nil {
 				return false
 			}
 
 			// Set task state
 			task.mu.Lock()
-			task.Downloaded = downloaded
-			task.FileSize = fileSize
-			task.Progress = progress
+			task.ProgressSummary.BytesLoaded = downloaded
+			task.ProgressSummary.BytesTotal = fileSize
+			task.ProgressSummary.Percent = progress
 			task.Status = StatusPaused
 			task.mu.Unlock()
 
@@ -381,6 +436,9 @@ func TestDownloadStatePersistenceRoundTripProperty(t *testing.T) {
 			// Create new manager and load state
 			dm2 := NewDownloadManager(tempDir, 3)
 			dm2.SetStatePath(statePath)
+			if err := registerInertTestAdapter(dm2, "test"); err != nil {
+				return false
+			}
 
 			if err := dm2.LoadState(); err != nil {
 				return false
@@ -397,9 +455,9 @@ func TestDownloadStatePersistenceRoundTripProperty(t *testing.T) {
 
 			return loadedTask.ID == taskID &&
 				loadedTask.Title == title &&
-				loadedTask.Downloaded == downloaded &&
-				loadedTask.FileSize == fileSize &&
-				loadedTask.Progress == progress
+				loadedTask.ProgressSummary.BytesLoaded == downloaded &&
+				loadedTask.ProgressSummary.BytesTotal == fileSize &&
+				loadedTask.ProgressSummary.Percent == progress
 		},
 		gen.AlphaString().SuchThat(func(s string) bool { return len(s) > 0 && len(s) < 50 }),
 		gen.AlphaString().SuchThat(func(s string) bool { return len(s) < 100 }),
@@ -429,43 +487,29 @@ func TestResumeProgressPreservationProperty(t *testing.T) {
 				fileSize = downloaded + 1000
 			}
 
-			tempDir := filepath.Join(os.TempDir(), "easydownload_test_resume")
-			os.MkdirAll(tempDir, 0755)
-			defer os.RemoveAll(tempDir)
+			tempDir := t.TempDir()
 
 			dm := NewDownloadManager(tempDir, 3)
+			if err := registerInertTestAdapter(dm, "test"); err != nil {
+				return false
+			}
 
-			task, err := dm.AddTask("test-resume", "http://example.com/video.mp4", "Test Video", "", "test", "720p")
+			task, err := createStrictTestTask(dm, "test-resume", "http://example.com/video.mp4", "Test Video", "test")
 			if err != nil {
 				return false
 			}
 
 			// Simulate partial download
 			task.mu.Lock()
-			task.Downloaded = downloaded
-			task.FileSize = fileSize
-			task.Progress = float64(downloaded) / float64(fileSize) * 100
+			task.ProgressSummary.BytesLoaded = downloaded
+			task.ProgressSummary.BytesTotal = fileSize
+			task.ProgressSummary.Percent = float64(downloaded) / float64(fileSize) * 100
 			task.Status = StatusPaused
 			task.mu.Unlock()
 
-			// Create a partial file to match the downloaded bytes
-			partialFile := task.FilePath
-			os.MkdirAll(filepath.Dir(partialFile), 0755)
-			f, err := os.Create(partialFile)
-			if err != nil {
-				return false
-			}
-			// Write dummy data matching downloaded size
-			if downloaded > 0 {
-				dummyData := make([]byte, downloaded)
-				f.Write(dummyData)
-			}
-			f.Close()
-			defer os.Remove(partialFile)
-
 			// Get downloaded before resume attempt
 			task.mu.RLock()
-			downloadedBefore := task.Downloaded
+			downloadedBefore := task.ProgressSummary.BytesLoaded
 			task.mu.RUnlock()
 
 			// Attempt resume (this will fail to actually download but should preserve progress)
@@ -475,7 +519,7 @@ func TestResumeProgressPreservationProperty(t *testing.T) {
 			task.mu.Unlock()
 
 			task.mu.RLock()
-			downloadedAfter := task.Downloaded
+			downloadedAfter := task.ProgressSummary.BytesLoaded
 			task.mu.RUnlock()
 
 			// Downloaded bytes should not decrease
@@ -558,68 +602,139 @@ func TestConcurrentDownloadLimitProperty(t *testing.T) {
 	properties.TestingRun(t)
 }
 
-// TestRetryTaskResetCount tests that manual retry resets the retry count
-func TestRetryTaskResetCount(t *testing.T) {
-	dm := NewDownloadManager(os.TempDir(), 3)
+// TestRetryTaskClearsErrorState tests that manual retry clears failed-task error state.
+func TestRetryTaskClearsErrorState(t *testing.T) {
+	dm := NewDownloadManager(t.TempDir(), 3)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	requireNoError(t, dm.RegisterPlatformAdapter(&blockingTaskAdapter{
+		id:        "retry-reset",
+		startedCh: started,
+		releases:  map[string]<-chan struct{}{"test-retry-reset": release},
+	}))
 
-	task, err := dm.AddTask("test-retry-reset", "http://example.com/video.mp4", "Test", "", "test", "720p")
+	task, err := createStrictTestTask(dm, "test-retry-reset", "http://example.com/video.mp4", "Test", "retry-reset")
 	if err != nil {
-		t.Fatalf("AddTask failed: %v", err)
+		t.Fatalf("CreateTask failed: %v", err)
 	}
 
-	// Simulate failed task with retries
+	// Simulate failed task.
 	task.mu.Lock()
 	task.Status = StatusFailed
-	task.RetryCount = 3
 	task.Error = "test error"
 	task.LastError = "test error"
+	task.LastErrorDetail = &downloadtask.TaskError{
+		Code:      "task.unexpected_error",
+		Category:  downloadtask.TaskErrorCategoryUnexpected,
+		Message:   "test error",
+		Retryable: true,
+	}
 	task.mu.Unlock()
 
-	// Manual retry should reset count
-	// Note: This will fail to start because URL is fake, but we can check the state was reset
-	_ = dm.RetryTask("test-retry-reset")
-
-	// Give a moment for the goroutine to start
-	time.Sleep(10 * time.Millisecond)
+	// Manual retry should clear error state before the new run.
+	if err := dm.RetryTask("test-retry-reset"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("retry task did not start")
+	}
 
 	task.mu.RLock()
-	retryCount := task.RetryCount
+	taskError := task.Error
 	lastError := task.LastError
+	lastErrorDetail := task.LastErrorDetail
 	task.mu.RUnlock()
 
-	// After retry, the retry count should have been reset to 0 (or incremented from 0)
-	// and lastError should be cleared initially
-	if retryCount > 1 {
-		t.Errorf("Expected retry count to be reset, got %d", retryCount)
+	if taskError != "" {
+		t.Errorf("Expected task error to be cleared, got %q", taskError)
 	}
-	_ = lastError // Used to verify it was cleared
+	if lastError != "" {
+		t.Errorf("Expected lastError to be cleared, got %q", lastError)
+	}
+	if lastErrorDetail != nil {
+		t.Errorf("Expected lastErrorDetail to be cleared, got %#v", lastErrorDetail)
+	}
+	close(release)
+}
+
+func TestRetryTaskRejectsNonRetryableFailureWithoutStarting(t *testing.T) {
+	dm := NewDownloadManager(t.TempDir(), 1)
+	var started atomic.Int32
+	startedCh := make(chan struct{})
+	requireNoError(t, dm.RegisterPlatformAdapter(&blockingTaskAdapter{
+		id:        "non-retryable-retry",
+		started:   &started,
+		startedCh: startedCh,
+	}))
+	task, err := createStrictTestTask(dm, "non-retryable", "https://example.com/video.mp4", "Video", "non-retryable-retry")
+	if err != nil {
+		t.Fatal(err)
+	}
+	task.mu.Lock()
+	task.Status = StatusFailed
+	task.Error = "authentication required"
+	task.LastError = "authentication required"
+	task.LastErrorDetail = &downloadtask.TaskError{
+		Code:       "platform.authentication_required",
+		Category:   downloadtask.TaskErrorCategoryPlatform,
+		Message:    "authentication required",
+		Retryable:  false,
+		UserAction: "log in and create a new task",
+	}
+	task.mu.Unlock()
+
+	err = dm.RetryTask(task.ID)
+	if err == nil || !strings.Contains(err.Error(), "not retryable") {
+		t.Fatalf("RetryTask error=%v, want non-retryable rejection", err)
+	}
+	select {
+	case <-startedCh:
+		t.Fatal("non-retryable task started a new execution")
+	case <-time.After(25 * time.Millisecond):
+	}
+	if calls := started.Load(); calls != 0 {
+		t.Fatalf("adapter run calls=%d, want 0", calls)
+	}
+	if active := dm.GetActiveTaskCount(); active != 0 {
+		t.Fatalf("active task count=%d, want 0", active)
+	}
+	task.mu.RLock()
+	status := task.Status
+	execution := task.execution
+	errorDetail := task.LastErrorDetail
+	task.mu.RUnlock()
+	if status != StatusFailed || execution != nil || errorDetail == nil || errorDetail.Retryable {
+		t.Fatalf("rejected retry mutated task: status=%s execution=%p error=%#v", status, execution, errorDetail)
+	}
 }
 
 // TestStatePersistenceWithMultipleTasks tests saving and loading multiple tasks
 func TestStatePersistenceWithMultipleTasks(t *testing.T) {
-	tempDir := filepath.Join(os.TempDir(), "easydownload_test_multi")
-	os.MkdirAll(tempDir, 0755)
-	defer os.RemoveAll(tempDir)
+	tempDir := t.TempDir()
 
 	statePath := filepath.Join(tempDir, "downloads.json")
 
 	// Create manager and add multiple tasks
 	dm1 := NewDownloadManager(tempDir, 3)
 	dm1.SetStatePath(statePath)
+	requireNoError(t, registerInertTestAdapter(dm1, "test"))
 
 	for i := 0; i < 5; i++ {
-		task, err := dm1.AddTask(
+		task, err := createStrictTestTask(
+			dm1,
 			fmt.Sprintf("task-%d", i),
 			fmt.Sprintf("http://example.com/video%d.mp4", i),
 			fmt.Sprintf("Video %d", i),
-			"", "test", "720p",
+			"test",
 		)
 		if err != nil {
-			t.Fatalf("AddTask failed: %v", err)
+			t.Fatalf("CreateTask failed: %v", err)
 		}
 
 		task.mu.Lock()
-		task.Downloaded = int64(i * 1000)
+		task.ProgressSummary.BytesLoaded = int64(i * 1000)
 		task.Status = StatusPaused
 		task.mu.Unlock()
 	}
@@ -632,6 +747,7 @@ func TestStatePersistenceWithMultipleTasks(t *testing.T) {
 	// Load in new manager
 	dm2 := NewDownloadManager(tempDir, 3)
 	dm2.SetStatePath(statePath)
+	requireNoError(t, registerInertTestAdapter(dm2, "test"))
 
 	if err := dm2.LoadState(); err != nil {
 		t.Fatalf("LoadState failed: %v", err)
@@ -644,73 +760,254 @@ func TestStatePersistenceWithMultipleTasks(t *testing.T) {
 	}
 }
 
-// TestAddTaskWithDecodeKey tests adding a task with a decryption key
-func TestAddTaskWithDecodeKey(t *testing.T) {
+func TestLoadStatePreservesLegacySchemaAndEmitsOneShotNotice(t *testing.T) {
+	tempDir := t.TempDir()
+	statePath := filepath.Join(tempDir, "downloads.json")
+	oldState := `{"tasks":[{"id":"old","url":"http://example.com/video.mp4","source":"douyin","status":"paused"}]}`
+	if err := os.WriteFile(statePath, []byte(oldState), 0644); err != nil {
+		t.Fatalf("write old state: %v", err)
+	}
+
+	dm := NewDownloadManager(tempDir, 3)
+	dm.SetStatePath(statePath)
+	requireNoError(t, registerInertTestAdapter(dm, "test"))
+	if err := dm.LoadState(); err != nil {
+		t.Fatalf("LoadState failed: %v", err)
+	}
+	if _, err := dm.GetTask("old"); err == nil {
+		t.Fatal("old schema task should not be loaded")
+	}
+	legacyAfterLoad, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(legacyAfterLoad) != oldState {
+		t.Fatalf("legacy bytes changed: %q", legacyAfterLoad)
+	}
+	notice := dm.TakeLegacyStateNotice()
+	if notice == nil || notice.Imported || !notice.Preserved || !notice.RollbackAvailable || notice.LegacyPath != statePath || notice.V2Path != filepath.Join(tempDir, "downloads.v2.json") {
+		t.Fatalf("unexpected legacy state notice: %#v", notice)
+	}
+	if second := dm.TakeLegacyStateNotice(); second != nil {
+		t.Fatalf("legacy state notice was emitted more than once: %#v", second)
+	}
+	if _, err := createStrictTestTask(dm, "v2", "https://example.com/video.mp4", "Video", "test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := dm.SaveState(); err != nil {
+		t.Fatal(err)
+	}
+	restarted := NewDownloadManager(tempDir, 3)
+	restarted.SetStatePath(statePath)
+	requireNoError(t, registerInertTestAdapter(restarted, "test"))
+	if err := restarted.LoadState(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := restarted.GetTask("v2"); err != nil {
+		t.Fatalf("re-upgrade did not load v2 state: %v", err)
+	}
+	legacyAfterRestart, err := os.ReadFile(statePath)
+	if err != nil || string(legacyAfterRestart) != oldState {
+		t.Fatalf("legacy bytes changed after re-upgrade: %q err=%v", legacyAfterRestart, err)
+	}
+}
+
+// TestCreateTaskPreservesPrivateDecodeKey verifies adapter-owned task data is retained.
+func TestCreateTaskPreservesPrivateDecodeKey(t *testing.T) {
 	dm := NewDownloadManager(os.TempDir(), 3)
+	requireNoError(t, registerInertTestAdapter(dm, downloadtask.PlatformWeChat))
 
 	decodeKey := "AAAAAAAAAAAAAAAAAAAAAA==" // Valid base64 encoded key
+	platformData := json.RawMessage(fmt.Sprintf(`{"url":"http://example.com/video.mp4","decodeKey":%q,"fileFormat":"720p"}`, decodeKey))
 
-	task, err := dm.AddTaskWithDecodeKey("test-decrypt", "http://example.com/video.mp4", "Test Video", "", "wechat", "720p", decodeKey)
+	task, err := createStrictTestTask(dm, "test-decrypt", "http://example.com/video.mp4", "Test Video", downloadtask.PlatformWeChat, platformData)
 	if err != nil {
-		t.Fatalf("AddTaskWithDecodeKey failed: %v", err)
+		t.Fatalf("CreateTask failed: %v", err)
 	}
 
-	if task.DecodeKey != decodeKey {
-		t.Errorf("task.DecodeKey = %s, want %s", task.DecodeKey, decodeKey)
+	var privateData map[string]interface{}
+	if err := json.Unmarshal(task.PlatformData, &privateData); err != nil {
+		t.Fatal(err)
 	}
-	if task.Source != "wechat" {
-		t.Errorf("task.Source = %s, want wechat", task.Source)
+	if privateData["decodeKey"] != decodeKey {
+		t.Errorf("private platform decodeKey = %v, want %s", privateData["decodeKey"], decodeKey)
+	}
+	if task.DisplaySource != "wechat" {
+		t.Errorf("task.DisplaySource = %s, want wechat", task.DisplaySource)
 	}
 }
 
-// TestAddTaskWithoutDecodeKey tests that AddTask works without a decode key
-func TestAddTaskWithoutDecodeKey(t *testing.T) {
+// TestCreateTaskWithoutDecodeKey verifies generic adapter data omits absent secrets.
+func TestCreateTaskWithoutDecodeKey(t *testing.T) {
 	dm := NewDownloadManager(os.TempDir(), 3)
+	requireNoError(t, registerInertTestAdapter(dm, downloadtask.PlatformBilibili))
 
-	task, err := dm.AddTask("test-no-decrypt", "http://example.com/video.mp4", "Test Video", "", "bilibili", "720p")
+	task, err := createStrictTestTask(dm, "test-no-decrypt", "http://example.com/video.mp4", "Test Video", downloadtask.PlatformBilibili)
 	if err != nil {
-		t.Fatalf("AddTask failed: %v", err)
+		t.Fatalf("CreateTask failed: %v", err)
 	}
 
-	if task.DecodeKey != "" {
-		t.Errorf("task.DecodeKey should be empty, got %s", task.DecodeKey)
+	if strings.Contains(string(task.PlatformData), "decodeKey") {
+		t.Errorf("platform data should omit empty decodeKey: %s", task.PlatformData)
 	}
 }
 
-// TestTaskToJSONIncludesDecodeKey tests that TaskToJSON includes the decodeKey field
-func TestTaskToJSONIncludesDecodeKey(t *testing.T) {
-	decodeKey := "AAAAAAAAAAAAAAAAAAAAAA=="
+func TestTaskPublicProjectionExcludesExecutionSecrets(t *testing.T) {
+	platformSecret := "https://private.example/video?token=platform-secret"
+	checkpointSecret := "checkpoint-secret"
+	decodeKey := "decode-key-secret"
+	reservationKey := "reservation-key-secret"
+	publishTemp := filepath.Join(t.TempDir(), "publish-secret.part")
+	localArtifact := filepath.Join(t.TempDir(), "artifact.mp4")
 	task := &DownloadTask{
-		ID:        "test-id",
-		URL:       "http://example.com/video.mp4",
+		ID:                  "test-id",
+		PlatformID:          string(downloadtask.PlatformWeChat),
+		PlatformDataVersion: 2,
+		PlatformData:        json.RawMessage(fmt.Sprintf(`{"url":%q,"decodeKey":%q,"headers":{"Authorization":"Bearer platform-secret"}}`, platformSecret, decodeKey)),
+		PlatformCheckpoint: &downloadtask.PlatformCheckpointEnvelope{
+			Version: 1,
+			Data:    json.RawMessage(fmt.Sprintf(`{"token":%q}`, checkpointSecret)),
+		},
+		PublishIntent: &downloadtask.PublishIntent{
+			Generation:       7,
+			TemporaryPath:    publishTemp,
+			PlannedFinalPath: filepath.Join(t.TempDir(), "video.mp4"),
+			Draft: downloadtask.TaskArtifactDraft{
+				ID:      "primary",
+				SHA256:  "publish-secret-sha",
+				Primary: true,
+			},
+		},
+		OutputPolicy: downloadtask.OutputPolicy{
+			Directory:        t.TempDir(),
+			PlannedFilename:  "video.mp4",
+			PlannedFinalPath: filepath.Join(t.TempDir(), "video.mp4"),
+			ReservationKey:   reservationKey,
+			ConflictStrategy: downloadtask.ConflictStrategyAutoRename,
+		},
+		Artifacts: []downloadtask.TaskArtifact{
+			{
+				Kind: downloadtask.TaskArtifactTemporary,
+				Path: localArtifact,
+				Metadata: map[string]string{
+					"Authorization": "Bearer artifact-secret",
+					"sourceURL":     platformSecret,
+				},
+			},
+			{
+				Kind: downloadtask.TaskArtifactTemporary,
+				Path: platformSecret,
+			},
+		},
+		LastErrorDetail: &downloadtask.TaskError{
+			Code:     "fetch.network",
+			Category: downloadtask.TaskErrorCategoryTransport,
+			Message:  "下载请求失败",
+			Cause:    "GET " + platformSecret + " Authorization: Bearer error-secret-key",
+			Metadata: map[string]string{
+				"url":           platformSecret,
+				"Authorization": "Bearer error-secret-key",
+			},
+		},
+		Error:     "GET " + platformSecret,
+		LastError: "Bearer error-secret-key",
 		Title:     "Test Video",
 		Status:    StatusPending,
-		DecodeKey: decodeKey,
 	}
 
-	jsonMap := task.TaskToJSON()
+	publicJSON, err := json.Marshal(task.PublicSnapshot())
+	if err != nil {
+		t.Fatalf("marshal public task: %v", err)
+	}
 
-	if jsonMap["decodeKey"] != decodeKey {
-		t.Errorf("jsonMap[decodeKey] = %v, want %s", jsonMap["decodeKey"], decodeKey)
+	for _, serialized := range [][]byte{publicJSON} {
+		var projection map[string]interface{}
+		if err := json.Unmarshal(serialized, &projection); err != nil {
+			t.Fatalf("decode public task: %v", err)
+		}
+		for _, denied := range []string{
+			"platformData",
+			"platformCheckpoint",
+			"publishIntent",
+			"decodeKey",
+			"platformDataVersion",
+			"schemaVersion",
+			"quality",
+			"filePath",
+			"fileName",
+			"fileSize",
+			"downloaded",
+			"progress",
+			"isAlbum",
+			"albumTotal",
+			"albumCompleted",
+		} {
+			if _, exists := projection[denied]; exists {
+				t.Errorf("public task unexpectedly exposes %q: %s", denied, serialized)
+			}
+		}
+		output, ok := projection["outputPolicy"].(map[string]interface{})
+		if !ok {
+			t.Fatalf("public outputPolicy has type %T", projection["outputPolicy"])
+		}
+		if _, exists := output["reservationKey"]; exists {
+			t.Errorf("public output policy exposes reservationKey: %s", serialized)
+		}
+		for _, secret := range []string{
+			platformSecret,
+			"platform-secret",
+			checkpointSecret,
+			decodeKey,
+			reservationKey,
+			filepath.Base(publishTemp),
+			"publish-secret-sha",
+			"artifact-secret",
+			"error-secret-key",
+		} {
+			if strings.Contains(string(serialized), secret) {
+				t.Errorf("public task contains secret %q: %s", secret, serialized)
+			}
+		}
+		artifacts, ok := projection["artifacts"].([]interface{})
+		if !ok || len(artifacts) != 1 {
+			t.Fatalf("public artifacts=%#v, want one local artifact", projection["artifacts"])
+		}
+		artifact, ok := artifacts[0].(map[string]interface{})
+		if !ok {
+			t.Fatalf("public artifact has type %T", artifacts[0])
+		}
+		if _, exists := artifact["metadata"]; exists {
+			t.Errorf("public artifact exposes private metadata: %s", serialized)
+		}
+	}
+
+	persistedJSON, err := json.Marshal(taskSnapshot(task))
+	if err != nil {
+		t.Fatalf("marshal persisted task snapshot: %v", err)
+	}
+	for _, expected := range []string{platformSecret, checkpointSecret, decodeKey, reservationKey, filepath.Base(publishTemp), "artifact-secret", "error-secret-key"} {
+		if !strings.Contains(string(persistedJSON), expected) {
+			t.Errorf("persisted task snapshot lost private execution data %q: %s", expected, persistedJSON)
+		}
 	}
 }
 
 // TestDecodeKeyStatePersistence tests that decodeKey is persisted and restored correctly
 func TestDecodeKeyStatePersistence(t *testing.T) {
-	tempDir := filepath.Join(os.TempDir(), "easydownload_test_decodekey")
-	os.MkdirAll(tempDir, 0755)
-	defer os.RemoveAll(tempDir)
+	tempDir := t.TempDir()
 
 	statePath := filepath.Join(tempDir, "downloads.json")
 	decodeKey := "AAAAAAAAAAAAAAAAAAAAAA=="
 
-	// Create manager and add task with decode key
+	// Create manager and create a task with private adapter-owned data.
 	dm1 := NewDownloadManager(tempDir, 3)
 	dm1.SetStatePath(statePath)
+	requireNoError(t, registerInertTestAdapter(dm1, downloadtask.PlatformWeChat))
+	platformData := json.RawMessage(fmt.Sprintf(`{"url":"http://example.com/video.mp4","decodeKey":%q,"fileFormat":"720p"}`, decodeKey))
 
-	task, err := dm1.AddTaskWithDecodeKey("test-persist", "http://example.com/video.mp4", "Test Video", "", "wechat", "720p", decodeKey)
+	task, err := createStrictTestTask(dm1, "test-persist", "http://example.com/video.mp4", "Test Video", downloadtask.PlatformWeChat, platformData)
 	if err != nil {
-		t.Fatalf("AddTaskWithDecodeKey failed: %v", err)
+		t.Fatalf("CreateTask failed: %v", err)
 	}
 
 	task.mu.Lock()
@@ -725,6 +1022,7 @@ func TestDecodeKeyStatePersistence(t *testing.T) {
 	// Load in new manager
 	dm2 := NewDownloadManager(tempDir, 3)
 	dm2.SetStatePath(statePath)
+	requireNoError(t, registerInertTestAdapter(dm2, downloadtask.PlatformWeChat))
 
 	if err := dm2.LoadState(); err != nil {
 		t.Fatalf("LoadState failed: %v", err)
@@ -737,11 +1035,60 @@ func TestDecodeKeyStatePersistence(t *testing.T) {
 	}
 
 	loadedTask.mu.RLock()
-	loadedDecodeKey := loadedTask.DecodeKey
+	loadedPlatformData := append(json.RawMessage(nil), loadedTask.PlatformData...)
+	loadedTask.mu.RUnlock()
+	var privateData map[string]interface{}
+	if err := json.Unmarshal(loadedPlatformData, &privateData); err != nil {
+		t.Fatal(err)
+	}
+	if privateData["decodeKey"] != decodeKey {
+		t.Errorf("loaded private platform decodeKey = %v, want %s", privateData["decodeKey"], decodeKey)
+	}
+}
+
+func TestPlatformDataStatePersistence(t *testing.T) {
+	tempDir := t.TempDir()
+	statePath := filepath.Join(tempDir, "downloads.json")
+	platformData := json.RawMessage(`{"item":{"id":"note123"},"quality":"hd"}`)
+
+	dm1 := NewDownloadManager(tempDir, 3)
+	dm1.SetStatePath(statePath)
+	requireNoError(t, registerInertTestAdapter(dm1, downloadtask.PlatformXiaohongshu))
+	task, err := createStrictTestTask(dm1, "platform-persist", "note123", "Test Note", downloadtask.PlatformXiaohongshu, platformData)
+	if err != nil {
+		t.Fatalf("CreateTask failed: %v", err)
+	}
+	task.mu.Lock()
+	task.Status = StatusPaused
+	task.mu.Unlock()
+
+	if err := dm1.SaveState(); err != nil {
+		t.Fatalf("SaveState failed: %v", err)
+	}
+
+	dm2 := NewDownloadManager(tempDir, 3)
+	dm2.SetStatePath(statePath)
+	requireNoError(t, registerInertTestAdapter(dm2, downloadtask.PlatformXiaohongshu))
+	if err := dm2.LoadState(); err != nil {
+		t.Fatalf("LoadState failed: %v", err)
+	}
+	loadedTask, err := dm2.GetTask("platform-persist")
+	if err != nil {
+		t.Fatalf("GetTask failed: %v", err)
+	}
+	loadedTask.mu.RLock()
+	loadedPlatformData := append(json.RawMessage(nil), loadedTask.PlatformData...)
 	loadedTask.mu.RUnlock()
 
-	if loadedDecodeKey != decodeKey {
-		t.Errorf("Loaded decodeKey = %s, want %s", loadedDecodeKey, decodeKey)
+	var gotData, wantData map[string]any
+	if err := json.Unmarshal(loadedPlatformData, &gotData); err != nil {
+		t.Fatalf("loaded PlatformData is not JSON: %v", err)
+	}
+	if err := json.Unmarshal(platformData, &wantData); err != nil {
+		t.Fatalf("expected PlatformData is not JSON: %v", err)
+	}
+	if !reflect.DeepEqual(gotData, wantData) {
+		t.Fatalf("PlatformData = %s, want %s", loadedPlatformData, platformData)
 	}
 }
 
@@ -757,21 +1104,82 @@ func waitForAtomicInt32(t *testing.T, value *atomic.Int32, want int32) {
 	t.Fatalf("value=%d, want %d", value.Load(), want)
 }
 
+func requireNoError(t *testing.T, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+type blockingTaskAdapter struct {
+	id            downloadtask.PlatformID
+	started       *atomic.Int32
+	releases      map[string]<-chan struct{}
+	startedCh     chan struct{}
+	startedOnce   sync.Once
+	ignoreContext bool
+}
+
+func (a *blockingTaskAdapter) ID() downloadtask.PlatformID { return a.id }
+func (a *blockingTaskAdapter) ValidateTask(downloadtask.TaskSnapshot) error {
+	return nil
+}
+func (a *blockingTaskAdapter) RunTask(ctx context.Context, task downloadtask.TaskSnapshot, execution downloadtask.TaskExecutionContext) error {
+	if a.started != nil {
+		a.started.Add(1)
+	}
+	if a.startedCh != nil {
+		a.startedOnce.Do(func() { close(a.startedCh) })
+	}
+	release := a.releases[task.ID]
+	if release == nil {
+		return nil
+	}
+	if a.ignoreContext {
+		<-release
+		return nil
+	}
+	select {
+	case <-release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+func (a *blockingTaskAdapter) CleanupTask(context.Context, downloadtask.TaskSnapshot, downloadtask.StopReason) error {
+	return nil
+}
+
+type failingTaskAdapter struct {
+	id       downloadtask.PlatformID
+	attempts *atomic.Int32
+}
+
+func (a failingTaskAdapter) ID() downloadtask.PlatformID { return a.id }
+func (a failingTaskAdapter) ValidateTask(downloadtask.TaskSnapshot) error {
+	return nil
+}
+func (a failingTaskAdapter) RunTask(context.Context, downloadtask.TaskSnapshot, downloadtask.TaskExecutionContext) error {
+	if a.attempts != nil {
+		a.attempts.Add(1)
+	}
+	return fmt.Errorf("adapter failed")
+}
+func (a failingTaskAdapter) CleanupTask(context.Context, downloadtask.TaskSnapshot, downloadtask.StopReason) error {
+	return nil
+}
+
 func TestStartTaskConcurrentSameIDStartsOnce(t *testing.T) {
 	dm := NewDownloadManager(t.TempDir(), 2)
 	var started atomic.Int32
 	release := make(chan struct{})
-	downloadFunc := func(ctx context.Context, task *DownloadTask, onProgress func(downloaded, total int64), onComplete func(outputPath string)) error {
-		started.Add(1)
-		select {
-		case <-release:
-			return nil
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
+	requireNoError(t, dm.RegisterPlatformAdapter(&blockingTaskAdapter{
+		id:       "test",
+		started:  &started,
+		releases: map[string]<-chan struct{}{"same": release},
+	}))
 
-	_, err := dm.AddTaskWithDownloader("same", "http://example.com/video.mp4", "Same", "", "test", "", downloadFunc)
+	_, err := createStrictTestTask(dm, "same", "http://example.com/video.mp4", "Same", "test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -796,22 +1204,19 @@ func TestStartTaskQueuesWhenMaxConcurrentReached(t *testing.T) {
 	firstRelease := make(chan struct{})
 	secondRelease := make(chan struct{})
 
-	makeFunc := func(release <-chan struct{}) DownloadFunc {
-		return func(ctx context.Context, task *DownloadTask, onProgress func(downloaded, total int64), onComplete func(outputPath string)) error {
-			started.Add(1)
-			select {
-			case <-release:
-				return nil
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		}
-	}
+	requireNoError(t, dm.RegisterPlatformAdapter(&blockingTaskAdapter{
+		id:      "test",
+		started: &started,
+		releases: map[string]<-chan struct{}{
+			"t1": firstRelease,
+			"t2": secondRelease,
+		},
+	}))
 
-	if _, err := dm.AddTaskWithDownloader("t1", "http://example.com/1.mp4", "One", "", "test", "", makeFunc(firstRelease)); err != nil {
+	if _, err := createStrictTestTask(dm, "t1", "http://example.com/1.mp4", "One", "test"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := dm.AddTaskWithDownloader("t2", "http://example.com/2.mp4", "Two", "", "test", "", makeFunc(secondRelease)); err != nil {
+	if _, err := createStrictTestTask(dm, "t2", "http://example.com/2.mp4", "Two", "test"); err != nil {
 		t.Fatal(err)
 	}
 	if err := dm.StartTask("t1"); err != nil {
@@ -834,18 +1239,19 @@ func TestStartTaskQueuesWhenMaxConcurrentReached(t *testing.T) {
 	close(secondRelease)
 }
 
-func TestAddTaskReservesFilenamesAcrossTasks(t *testing.T) {
+func TestCreateTaskReservesFilenamesAcrossTasks(t *testing.T) {
 	dm := NewDownloadManager(t.TempDir(), 3)
-	first, err := dm.AddTask("a", "http://example.com/a.mp4", "Same Title", "", "test", "")
+	requireNoError(t, registerInertTestAdapter(dm, "test"))
+	first, err := createStrictTestTask(dm, "a", "http://example.com/a.mp4", "Same Title", "test")
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := dm.AddTask("b", "http://example.com/b.mp4", "Same Title", "", "test", "")
+	second, err := createStrictTestTask(dm, "b", "http://example.com/b.mp4", "Same Title", "test")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first.FileName == second.FileName {
-		t.Fatalf("duplicate file names reserved: %s", first.FileName)
+	if first.OutputPolicy.PlannedFilename == second.OutputPolicy.PlannedFilename {
+		t.Fatalf("duplicate file names reserved: %s", first.OutputPolicy.PlannedFilename)
 	}
 }
 
@@ -853,13 +1259,14 @@ func TestCancelDoesNotBecomeCompletedWhenDownloaderIgnoresContext(t *testing.T) 
 	dm := NewDownloadManager(t.TempDir(), 1)
 	started := make(chan struct{})
 	release := make(chan struct{})
-	downloadFunc := func(ctx context.Context, task *DownloadTask, onProgress func(downloaded, total int64), onComplete func(outputPath string)) error {
-		close(started)
-		<-release
-		return nil
-	}
+	requireNoError(t, dm.RegisterPlatformAdapter(&blockingTaskAdapter{
+		id:            "test",
+		releases:      map[string]<-chan struct{}{"cancel-race": release},
+		startedCh:     started,
+		ignoreContext: true,
+	}))
 
-	_, err := dm.AddTaskWithDownloader("cancel-race", "http://example.com/video.mp4", "Race", "", "test", "", downloadFunc)
+	_, err := createStrictTestTask(dm, "cancel-race", "http://example.com/video.mp4", "Race", "test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -884,6 +1291,6 @@ func TestCancelDoesNotBecomeCompletedWhenDownloaderIgnoresContext(t *testing.T) 
 		t.Fatal(err)
 	}
 	if got := task.GetStatus(); got != StatusCancelled {
-		t.Fatalf("status=%s, want cancelled", got)
+		t.Fatalf("status=%s, want canceled", got)
 	}
 }

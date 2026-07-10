@@ -40,9 +40,11 @@ func main() {
 				return false
 			}
 
+			settings := app.currentSettings()
+
 			// If user chose "don't ask again" with a specific action, perform it directly
-			if app.IsDontAskOnClose() && app.GetCloseAction() != "" {
-				if app.GetCloseAction() == "minimize" {
+			if settings.DontAskOnClose && settings.CloseAction != "" {
+				if settings.CloseAction == "minimize" {
 					app.applyMinimizeToTray(ctx)
 					return true // Prevent close
 				}

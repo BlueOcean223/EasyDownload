@@ -20,116 +20,33 @@ const message = useMessage()
 const searchQuery = ref('')
 const downloading = ref<Set<string>>(new Set())
 
-// Selected quality for each video (videoId -> format)
+// Selected quality for each video (videoId -> opaque candidate ID)
 const selectedQualities = reactive<Record<string, string>>({})
 
-// Standard quality levels based on height
-const qualityLevels = [
-  { height: 2160, label: '4K' },
-  { height: 1440, label: '2K' },
-  { height: 1080, label: '1080P' },
-  { height: 720, label: '720P' },
-  { height: 540, label: '540P' },
-  { height: 480, label: '480P' },
-  { height: 360, label: '360P' },
-  { height: 240, label: '240P' },
-]
-
-// Get friendly quality name based on video height
-function getQualityLabel(height: number): string {
-  for (const level of qualityLevels) {
-    if (height >= level.height) {
-      return level.label
-    }
-  }
-  return `${height}P`
-}
-
-// Generate quality options based on specs data (preferred) or fileFormats fallback
-// IMPORTANT: WeChat video URLs without X-snsvideoflag parameter return the HIGHEST quality
-// Adding X-snsvideoflag parameter requests a SPECIFIC (usually lower) quality
 function getQualityOptions(video: DetectedVideo) {
-  const options: { label: string; value: string }[] = []
-  const seenLabels = new Set<string>()
-  
-  // Always add "Original" option first - this downloads the highest quality
-  // by NOT adding X-snsvideoflag parameter to the URL
-  options.push({
-    label: '原始画质',
-    value: ''  // Empty value means use original URL without X-snsvideoflag
-  })
-  
-  // Use specs data if available (contains actual resolution info)
-  if (video.specs && video.specs.length > 0) {
-    // Sort specs by height descending (highest quality first)
-    const sortedSpecs = [...video.specs].sort((a, b) => b.height - a.height)
-    
-    for (const spec of sortedSpecs) {
-      if (!spec.fileFormat) continue
-      
-      const label = getQualityLabel(spec.height)
-      
-      // Deduplicate by label
-      if (seenLabels.has(label)) continue
-      seenLabels.add(label)
-      
-      options.push({
-        label,
-        value: spec.fileFormat
-      })
-    }
-    
-    return options
-  }
-  
-  // Fallback: use fileFormats with estimated quality levels
-  if (!video.fileFormats || video.fileFormats.length === 0) {
-    return options  // Return with just "原始画质" option
-  }
-  
-  const videoHeight = video.height || 720
-  const formatCount = video.fileFormats.length
-  
-  // Find available quality levels up to the video's resolution
-  const availableLevels = qualityLevels.filter(level => level.height <= videoHeight)
-  const levelsToUse = availableLevels.slice(0, formatCount)
-  
-  // Map formats to quality levels
-  for (let i = 0; i < formatCount; i++) {
-    const format = video.fileFormats[i]
-    let label: string
-    
-    if (i < levelsToUse.length) {
-      label = levelsToUse[i].label
-    } else {
-      const estimatedHeight = Math.round(videoHeight * (formatCount - i) / formatCount)
-      label = getQualityLabel(estimatedHeight)
-    }
-    
-    // Deduplicate by label
-    if (seenLabels.has(label)) continue
-    seenLabels.add(label)
-    
-    options.push({ label, value: format })
-  }
-  
-  return options
+  return video.candidates.map(candidate => ({
+    label: candidate.label,
+    value: candidate.id
+  }))
 }
 
-// Get default (highest) quality for a video
-// Returns empty string to use original URL (highest quality)
 function getDefaultQuality(video: DetectedVideo): string {
-  // Always default to empty string (original quality / highest quality)
-  // The original URL without X-snsvideoflag returns the highest quality
-  return ''
+  return video.candidates.find(candidate => candidate.default)?.id || video.candidates[0]?.id || ''
 }
 
-// Get selected quality for a video, or default to highest
 function getSelectedQuality(video: DetectedVideo): string {
-  if (selectedQualities[video.id]) {
-    return selectedQualities[video.id]
+  const selectedId = selectedQualities[video.id]
+  if (selectedId !== undefined && video.candidates.some(candidate => candidate.id === selectedId)) {
+    return selectedId
   }
   return getDefaultQuality(video)
+}
+
+function getSelectedCandidate(video: DetectedVideo) {
+  const selectedId = getSelectedQuality(video)
+  return video.candidates.find(candidate => candidate.id === selectedId)
+    || video.candidates.find(candidate => candidate.default)
+    || video.candidates[0]
 }
 
 // Keep list order as stored (WeChat newest first); only filter by search query
@@ -148,7 +65,21 @@ const filteredVideos = computed(() => {
 
 // Check if a video is the current one
 function isCurrentVideo(video: DetectedVideo) {
-  return !!video.isCurrentVideo
+  return !!video.isCurrent
+}
+
+function platformLabel(video: DetectedVideo) {
+  if (video.platform === 'wechat') return '视频号'
+  if (video.platform === 'bilibili') return 'B站'
+  return video.platform || video.source
+}
+
+function platformTagType(video: DetectedVideo) {
+  return video.platform === 'wechat' ? 'success' : 'info'
+}
+
+function detectedFileSize(video: DetectedVideo) {
+  return getSelectedCandidate(video)?.sizeBytes || 0
 }
 
 async function downloadVideo(video: DetectedVideo) {
@@ -156,24 +87,13 @@ async function downloadVideo(video: DetectedVideo) {
   
   downloading.value.add(video.id)
   try {
-    // Get selected quality format
-    const selectedFormat = getSelectedQuality(video)
-    // Pass the selected quality to download
-    await store.downloadDetectedVideo(video, selectedFormat)
+    await store.downloadDetectedVideo(video, getSelectedQuality(video))
     message.success('已添加到下载队列')
   } catch (error: any) {
     message.error(error.message || '下载失败')
   } finally {
     downloading.value.delete(video.id)
   }
-}
-
-function formatTime(timestamp: number) {
-  const date = new Date(timestamp)
-  return date.toLocaleTimeString('zh-CN', { 
-    hour: '2-digit', 
-    minute: '2-digit' 
-  })
 }
 
 function formatFileSize(bytes?: number) {
@@ -284,8 +204,8 @@ function clearAll() {
           <!-- Thumbnail -->
           <div class="relative aspect-video bg-tertiary overflow-hidden rounded-t-lg">
             <ProxiedImage
-              v-if="video.cover"
-              :src="video.cover"
+              v-if="video.coverUrl"
+              :src="video.coverUrl"
               :alt="video.title"
               class="w-full h-full"
             />
@@ -296,10 +216,10 @@ function clearAll() {
             <!-- Source Badge -->
             <div class="absolute top-2 left-2 flex gap-1">
               <NTag 
-                :type="video.source === 'wechat' ? 'success' : 'info'" 
+                :type="platformTagType(video)"
                 size="tiny"
               >
-                {{ video.source === 'wechat' ? '视频号' : 'B站' }}
+                {{ platformLabel(video) }}
               </NTag>
               <!-- Current Video Badge -->
               <NTooltip v-if="isCurrentVideo(video)">
@@ -314,7 +234,7 @@ function clearAll() {
                 当前正在播放的视频
               </NTooltip>
               <!-- Encrypted Badge -->
-              <NTooltip v-if="video.decodeKey">
+              <NTooltip v-if="getSelectedCandidate(video)?.encrypted">
                 <template #trigger>
                   <NTag type="warning" size="tiny">
                     <template #icon>
@@ -328,9 +248,9 @@ function clearAll() {
             </div>
             
             <!-- Duration Badge -->
-            <div v-if="video.duration" class="absolute bottom-2 left-2">
+            <div v-if="video.durationMs" class="absolute bottom-2 left-2">
               <span class="text-xs bg-black/70 text-white px-2 py-1 rounded">
-                {{ formatDuration(video.duration) }}
+                {{ formatDuration(video.durationMs) }}
               </span>
             </div>
           
@@ -350,15 +270,15 @@ function clearAll() {
                 <span v-if="video.width && video.height" class="text-xs text-text-secondary opacity-80">
                   {{ video.width }}×{{ video.height }}
                 </span>
-                <span v-if="video.fileSize" class="text-xs text-text-secondary opacity-80">
-                  {{ formatFileSize(video.fileSize) }}
+                <span v-if="detectedFileSize(video)" class="text-xs text-text-secondary opacity-80">
+                  {{ formatFileSize(detectedFileSize(video)) }}
                 </span>
               </div>
             </div>
             
             <div class="flex items-center justify-between">
               <!-- Quality selector for videos with multiple formats (more than just "原始画质") -->
-              <div v-if="getQualityOptions(video).length > 2" class="flex items-center gap-1">
+              <div v-if="getQualityOptions(video).length > 1" class="flex items-center gap-1">
                 <span class="text-xs text-text-secondary">画质:</span>
                 <NSelect 
                   :value="getSelectedQuality(video)"
@@ -369,7 +289,7 @@ function clearAll() {
                 />
               </div>
               <div v-else class="flex items-center">
-                <NTag size="tiny" type="info">原始画质</NTag>
+                <NTag size="tiny" type="info">{{ getQualityOptions(video)[0]?.label || '无可用资源' }}</NTag>
               </div>
               
               <NButton 

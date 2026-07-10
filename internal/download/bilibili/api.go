@@ -2,6 +2,7 @@ package bilibili
 
 import (
 	"EasyDownload/internal/infra/logger"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -64,13 +65,14 @@ func (bd *BilibiliDownloader) GetVideoInfoWithParts(bvid string) (*BilibiliVideo
 	}
 
 	bd.setHeaders(req)
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	resp, err := bd.do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return nil, &bilibiliAPIError{StatusCode: resp.StatusCode}
+	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -242,13 +244,14 @@ func (bd *BilibiliDownloader) fetchBangumiSeason(params url.Values) (*bangumiSea
 		return nil, err
 	}
 	bd.setHeaders(req)
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	resp, err := bd.do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return nil, &bilibiliAPIError{StatusCode: resp.StatusCode}
+	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -276,9 +279,7 @@ func (bd *BilibiliDownloader) resolveBangumiMediaSeasonID(mediaID string) (int, 
 		return 0, err
 	}
 	bd.setHeaders(req)
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	resp, err := bd.do(req)
 	if err != nil {
 		return 0, err
 	}
@@ -452,10 +453,14 @@ func firstNonZeroInt64(values ...int64) int64 {
 // pgc/player/web/playurl endpoint. The ordinary x/player/playurl endpoint often
 // returns empty DASH data for PGC content.
 func (bd *BilibiliDownloader) GetBangumiPlayInfo(bvid string, cid int64, quality int) ([]BilibiliStream, error) {
-	return bd.getBangumiStreamInfo(bvid, cid, quality, 0)
+	return bd.getBangumiStreamInfoContext(context.Background(), bvid, cid, quality, 0)
 }
 
 func (bd *BilibiliDownloader) getBangumiStreamInfo(bvid string, cid int64, quality int, duration int) ([]BilibiliStream, error) {
+	return bd.getBangumiStreamInfoContext(context.Background(), bvid, cid, quality, duration)
+}
+
+func (bd *BilibiliDownloader) getBangumiStreamInfoContext(ctx context.Context, bvid string, cid int64, quality int, duration int) ([]BilibiliStream, error) {
 	if quality <= 0 {
 		quality = defaultBangumiQuality
 	}
@@ -472,18 +477,19 @@ func (bd *BilibiliDownloader) getBangumiStreamInfo(bvid string, cid int64, quali
 	query.Set("platform", "web")
 	apiURL := "https://api.bilibili.com/pgc/player/web/playurl?" + query.Encode()
 
-	req, err := http.NewRequest("GET", apiURL, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
 	if err != nil {
 		return nil, err
 	}
 	bd.setHeaders(req)
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	resp, err := bd.do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return nil, &bilibiliAPIError{StatusCode: resp.StatusCode}
+	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -500,7 +506,7 @@ func (bd *BilibiliDownloader) getBangumiStreamInfo(bvid string, cid int64, quali
 		return nil, err
 	}
 	if result.Code != 0 {
-		return nil, fmt.Errorf("failed to get bangumi stream info: %s", result.Message)
+		return nil, &bilibiliAPIError{Code: result.Code, Message: result.Message}
 	}
 
 	data := result.Data
@@ -832,21 +838,26 @@ func streamsFromPlayURLData(data playURLData, duration int) []BilibiliStream {
 //
 // API: GET https://api.bilibili.com/x/player/playurl
 func (bd *BilibiliDownloader) getStreamInfo(bvid string, _ int64, cid int64, duration int) ([]BilibiliStream, error) {
+	return bd.getStreamInfoContext(context.Background(), bvid, cid, duration)
+}
+
+func (bd *BilibiliDownloader) getStreamInfoContext(ctx context.Context, bvid string, cid int64, duration int) ([]BilibiliStream, error) {
 	apiURL := fmt.Sprintf("https://api.bilibili.com/x/player/playurl?bvid=%s&cid=%d&fnval=4048&fnver=0&fourk=1", bvid, cid)
 
-	req, err := http.NewRequest("GET", apiURL, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
 	if err != nil {
 		return nil, err
 	}
 
 	bd.setHeaders(req)
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	resp, err := bd.do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return nil, &bilibiliAPIError{StatusCode: resp.StatusCode}
+	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -864,7 +875,7 @@ func (bd *BilibiliDownloader) getStreamInfo(bvid string, _ int64, cid int64, dur
 	}
 
 	if result.Code != 0 {
-		return nil, fmt.Errorf("failed to get stream info: %s", result.Message)
+		return nil, &bilibiliAPIError{Code: result.Code, Message: result.Message}
 	}
 
 	return streamsFromPlayURLData(result.Data, duration), nil
@@ -874,6 +885,13 @@ func (bd *BilibiliDownloader) getStreamInfo(bvid string, _ int64, cid int64, dur
 // The partIndex is 0-based (0 for first part, 1 for second, etc.).
 // Returns a list of available stream qualities with their URLs and estimated sizes.
 func (bd *BilibiliDownloader) GetPartStreams(video *BilibiliVideo, partIndex int) ([]BilibiliStream, error) {
+	return bd.GetPartStreamsContext(context.Background(), video, partIndex)
+}
+
+// GetPartStreamsContext is the task-execution variant of GetPartStreams. The
+// context is carried through the playurl API request so pause, cancel and
+// shutdown can interrupt a stalled platform request before media transfer.
+func (bd *BilibiliDownloader) GetPartStreamsContext(ctx context.Context, video *BilibiliVideo, partIndex int) ([]BilibiliStream, error) {
 	if partIndex < 0 || partIndex >= len(video.Parts) {
 		return nil, fmt.Errorf("invalid part index: %d (total parts: %d)", partIndex, len(video.Parts))
 	}
@@ -884,13 +902,13 @@ func (bd *BilibiliDownloader) GetPartStreams(video *BilibiliVideo, partIndex int
 		if bvid == "" {
 			return nil, fmt.Errorf("bangumi episode missing bvid")
 		}
-		return bd.getBangumiStreamInfo(bvid, part.CID, defaultBangumiQuality, part.Duration)
+		return bd.getBangumiStreamInfoContext(ctx, bvid, part.CID, defaultBangumiQuality, part.Duration)
 	}
 
 	aid := int64(0)
 	fmt.Sscanf(video.AV, "av%d", &aid)
 
-	return bd.getStreamInfo(video.BV, aid, part.CID, part.Duration)
+	return bd.getStreamInfoContext(ctx, video.BV, part.CID, part.Duration)
 }
 
 // GetAllPartsStreams fetches stream information for all parts of a video concurrently.

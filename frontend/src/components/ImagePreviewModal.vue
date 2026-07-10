@@ -30,7 +30,8 @@ function showCenterTip(text: string) {
   }, 1500)
 }
 
-// Get the API port/token from app info
+// Both values describe the currently running internal API. A newly committed
+// settings port is not effective until the application restarts.
 const apiPort = computed(() => {
   return store.appInfo?.apiPort || 18899
 })

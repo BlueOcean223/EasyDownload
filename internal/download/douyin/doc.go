@@ -6,9 +6,9 @@
 //   - Probing ratio-based video streams when bit_rate data is unavailable
 //   - Downloading videos with quality selection (720p, 1080p, etc.)
 //   - Downloading image albums with concurrent image fetching
-//   - Resumable downloads with state persistence for recovery
+//   - Validator/sidecar-gated resume and no-progress timeout through shared Fetch
 //   - ZIP packaging for album downloads
-//   - Integration with DownloadManager for unified task management
+//   - Platform adapter integration for unified task management
 //
 // Supported Content Types:
 //   - Single videos: downloaded as .mp4 files with selected quality
@@ -18,9 +18,15 @@
 // Album Download Features:
 //   - Concurrent image downloads (configurable concurrency)
 //   - Partial download support (select specific images by index)
-//   - Automatic retry with exponential backoff on failure
+//   - Fetch-owned short retry with exponential backoff; HTTP 429 is opt-in
 //   - State persistence via temp directory for resume support
-//   - Atomic ZIP creation with temp file and rename
+//   - Temporary ZIP creation followed by manager-owned PublishFinal
+//
+// TaskData persists the parsed item, quality, and selected album indices in the
+// v2 snapshot. RunTask selects semantic media candidates, uses only the injected
+// Fetcher for bytes, and publishes through the reserved no-replace output path.
+// The adapter rejects an unknown PlatformDataVersion before decoding TaskData.
+// Pause/shutdown preserve resumable state; cancel/removal clean after worker join.
 //
 // Usage with DownloadManager:
 //
@@ -36,7 +42,13 @@
 //	    return err
 //	}
 //
-//	downloader := douyin.NewDownloader()
-//	downloadFunc := downloader.BuildDownloadFunc(item, "1080p", outputDir)
-//	manager.AddTaskWithDownloader(id, shareText, item.Title, item.Cover, "douyin", "1080p", downloadFunc)
+//	platformDownloader := douyin.NewDownloader()
+//	adapter := douyin.NewAdapter(platformDownloader)
+//	manager.RegisterPlatformAdapter(adapter)
+//	data, err := douyin.MarshalTaskData(item, "1080p", nil, false)
+//	manager.CreateTask(downloader.TaskCreationInput{
+//	    ID: id, PlatformID: adapter.ID(), Title: item.Title, Cover: item.Cover,
+//	    DisplaySource: "douyin", SuggestedFilename: item.Title,
+//	    SuggestedExtension: ".mp4", PlatformDataVersion: 1, PlatformData: data,
+//	})
 package douyin

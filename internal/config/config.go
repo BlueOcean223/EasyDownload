@@ -2,6 +2,7 @@ package config
 
 import (
 	"EasyDownload/internal/infra/logger"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -18,8 +19,6 @@ type Config struct {
 	// Download settings
 	DownloadDir   string `json:"downloadDir"`
 	MaxConcurrent int    `json:"maxConcurrent"`
-	AutoRetry     bool   `json:"autoRetry"`
-	MaxRetryCount int    `json:"maxRetryCount"`
 
 	// Bilibili settings - SESSDATA moved to secure credential storage
 	// BilibiliSessData is no longer stored in config file for security
@@ -62,8 +61,6 @@ func DefaultConfig() *Config {
 		APIPort:              18899,
 		DownloadDir:          defaultDownloadDir,
 		MaxConcurrent:        3,
-		AutoRetry:            true,
-		MaxRetryCount:        3,
 		MinimizeToTray:       true,
 		ShowNotification:     true,
 		FirstRunComplete:     false,
@@ -85,14 +82,26 @@ func DefaultConfig() *Config {
 type ConfigManager struct {
 	config     *Config
 	configPath string
+	persister  Persister
 	mu         sync.RWMutex
 }
 
 // NewConfigManager creates a new ConfigManager
 func NewConfigManager(configPath string) *ConfigManager {
+	return NewConfigManagerWithPersister(configPath, nil)
+}
+
+// NewConfigManagerWithPersister creates a manager with an injectable durable
+// persistence boundary. A nil persister uses the production atomic-file
+// implementation.
+func NewConfigManagerWithPersister(configPath string, persister Persister) *ConfigManager {
+	if persister == nil {
+		persister = newAtomicFilePersister()
+	}
 	return &ConfigManager{
 		config:     DefaultConfig(),
 		configPath: configPath,
+		persister:  persister,
 	}
 }
 
@@ -144,9 +153,6 @@ func (cm *ConfigManager) mergeWithDefaults(loaded *Config) *Config {
 	if loaded.MaxConcurrent == 0 {
 		loaded.MaxConcurrent = defaults.MaxConcurrent
 	}
-	if loaded.MaxRetryCount == 0 {
-		loaded.MaxRetryCount = defaults.MaxRetryCount
-	}
 	if loaded.Version == "" {
 		loaded.Version = defaults.Version
 	}
@@ -169,22 +175,17 @@ func (cm *ConfigManager) Save() error {
 
 // saveInternal saves config without locking (must be called with lock held)
 func (cm *ConfigManager) saveInternal() error {
-	// Ensure directory exists with secure permissions (only owner can access)
-	dir := filepath.Dir(cm.configPath)
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return fmt.Errorf("failed to create config directory: %w", err)
-	}
+	return cm.persistLocked(context.Background(), cm.config)
+}
 
-	data, err := json.MarshalIndent(cm.config, "", "  ")
+func (cm *ConfigManager) persistLocked(ctx context.Context, candidate *Config) error {
+	data, err := json.MarshalIndent(candidate, "", "  ")
 	if err != nil {
 		return fmt.Errorf("failed to marshal config: %w", err)
 	}
-
-	// Write config file with secure permissions (only owner can read/write)
-	if err := os.WriteFile(cm.configPath, data, 0600); err != nil {
+	if err := cm.persister.Persist(ctx, cm.configPath, data, 0600); err != nil {
 		return fmt.Errorf("failed to write config file: %w", err)
 	}
-
 	return nil
 }
 
@@ -198,167 +199,98 @@ func (cm *ConfigManager) Get() *Config {
 	return &configCopy
 }
 
-// Set sets a configuration value by key
-func (cm *ConfigManager) Set(key string, value any) error {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-
-	switch key {
-	case "proxyPort":
-		if v, ok := value.(int); ok {
-			cm.config.ProxyPort = v
-		} else if v, ok := value.(float64); ok {
-			cm.config.ProxyPort = int(v)
-		} else {
-			return fmt.Errorf("invalid type for proxyPort")
-		}
-	case "apiPort":
-		if v, ok := value.(int); ok {
-			cm.config.APIPort = v
-		} else if v, ok := value.(float64); ok {
-			cm.config.APIPort = int(v)
-		} else {
-			return fmt.Errorf("invalid type for apiPort")
-		}
-	case "downloadDir":
-		if v, ok := value.(string); ok {
-			if err := ValidateDownloadDir(v); err != nil {
-				return err
-			}
-			cm.config.DownloadDir = v
-		} else {
-			return fmt.Errorf("invalid type for downloadDir")
-		}
-	case "maxConcurrent":
-		if v, ok := value.(int); ok {
-			cm.config.MaxConcurrent = v
-		} else if v, ok := value.(float64); ok {
-			cm.config.MaxConcurrent = int(v)
-		} else {
-			return fmt.Errorf("invalid type for maxConcurrent")
-		}
-	case "autoRetry":
-		if v, ok := value.(bool); ok {
-			cm.config.AutoRetry = v
-		} else {
-			return fmt.Errorf("invalid type for autoRetry")
-		}
-	case "maxRetryCount":
-		if v, ok := value.(int); ok {
-			cm.config.MaxRetryCount = v
-		} else if v, ok := value.(float64); ok {
-			cm.config.MaxRetryCount = int(v)
-		} else {
-			return fmt.Errorf("invalid type for maxRetryCount")
-		}
-	// Note: bilibiliSessData removed - now stored in secure credential storage
-	case "minimizeToTray":
-		if v, ok := value.(bool); ok {
-			cm.config.MinimizeToTray = v
-		} else {
-			return fmt.Errorf("invalid type for minimizeToTray")
-		}
-	case "showNotification":
-		if v, ok := value.(bool); ok {
-			cm.config.ShowNotification = v
-		} else {
-			return fmt.Errorf("invalid type for showNotification")
-		}
-	case "firstRunComplete":
-		if v, ok := value.(bool); ok {
-			cm.config.FirstRunComplete = v
-		} else {
-			return fmt.Errorf("invalid type for firstRunComplete")
-		}
-	case "closeAction":
-		if v, ok := value.(string); ok {
-			if v != "" && v != "exit" && v != "minimize" {
-				return fmt.Errorf("invalid closeAction value: must be '', 'exit', or 'minimize'")
-			}
-			cm.config.CloseAction = v
-		} else {
-			return fmt.Errorf("invalid type for closeAction")
-		}
-	case "dontAskOnClose":
-		if v, ok := value.(bool); ok {
-			cm.config.DontAskOnClose = v
-		} else {
-			return fmt.Errorf("invalid type for dontAskOnClose")
-		}
-	case "version":
-		if v, ok := value.(string); ok {
-			cm.config.Version = v
-		} else {
-			return fmt.Errorf("invalid type for version")
-		}
-	case "theme":
-		if v, ok := value.(string); ok {
-			if v != "dark" && v != "light" {
-				return fmt.Errorf("invalid theme value: must be 'dark' or 'light'")
-			}
-			cm.config.Theme = v
-		} else {
-			return fmt.Errorf("invalid type for theme")
-		}
-	case "language":
-		if v, ok := value.(string); ok {
-			if v != "zh-CN" && v != "en-US" {
-				return fmt.Errorf("invalid language value: must be 'zh-CN' or 'en-US'")
-			}
-			cm.config.Language = v
-		} else {
-			return fmt.Errorf("invalid type for language")
-		}
-	case "upstreamProxy":
-		if v, ok := value.(string); ok {
-			cm.config.UpstreamProxy = v
-		} else {
-			return fmt.Errorf("invalid type for upstreamProxy")
-		}
-	case "useUpstreamProxy":
-		if v, ok := value.(bool); ok {
-			cm.config.UseUpstreamProxy = v
-		} else {
-			return fmt.Errorf("invalid type for useUpstreamProxy")
-		}
-	case "proxyDebug":
-		if v, ok := value.(bool); ok {
-			cm.config.ProxyDebug = v
-		} else {
-			return fmt.Errorf("invalid type for proxyDebug")
-		}
-	case "ffmpegPath":
-		if v, ok := value.(string); ok {
-			cm.config.FFmpegPath = v
-		} else {
-			return fmt.Errorf("invalid type for ffmpegPath")
-		}
-	case "certInstalled":
-		if v, ok := value.(bool); ok {
-			cm.config.CertInstalled = v
-		} else {
-			return fmt.Errorf("invalid type for certInstalled")
-		}
-	case "dontRemindCertWizard":
-		if v, ok := value.(bool); ok {
-			cm.config.DontRemindCertWizard = v
-		} else {
-			return fmt.Errorf("invalid type for dontRemindCertWizard")
-		}
-	default:
-		return fmt.Errorf("unknown config key: %s", key)
+// Commit durably persists next and only then swaps the in-memory snapshot.
+// A failed commit leaves both the previous file and in-memory snapshot intact.
+func (cm *ConfigManager) Commit(ctx context.Context, next *Config) error {
+	if next == nil {
+		return fmt.Errorf("config cannot be nil")
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 
-	return cm.saveInternal()
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	configCopy := *next
+	candidate := cm.mergeWithDefaults(&configCopy)
+	if err := cm.persistLocked(ctx, candidate); err != nil {
+		return err
+	}
+	cm.config = candidate
+	return nil
+}
+
+// Update derives and commits a new snapshot while holding the repository lock.
+// It is intended for bounded, in-memory mutations only; callers must not perform
+// I/O or call back into ConfigManager from mutate.
+func (cm *ConfigManager) Update(ctx context.Context, mutate func(candidate *Config) error) error {
+	if mutate == nil {
+		return fmt.Errorf("config mutation cannot be nil")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	candidate := *cm.config
+	if err := mutate(&candidate); err != nil {
+		return err
+	}
+	return cm.commitLocked(ctx, &candidate)
+}
+
+// RuntimeMetadataPatch is the deliberately narrow write surface for cached
+// runtime/application metadata. User settings must be mutated through the
+// Settings module instead of ConfigManager.
+type RuntimeMetadataPatch struct {
+	FFmpegPath    *string
+	CertInstalled *bool
+	Version       *string
+}
+
+// UpdateRuntimeMetadata durably applies typed non-user metadata without
+// exposing the old stringly-typed ConfigManager.Set escape hatch.
+func (cm *ConfigManager) UpdateRuntimeMetadata(ctx context.Context, patch RuntimeMetadataPatch) error {
+	if patch.FFmpegPath == nil && patch.CertInstalled == nil && patch.Version == nil {
+		return nil
+	}
+	return cm.Update(ctx, func(candidate *Config) error {
+		if patch.FFmpegPath != nil {
+			candidate.FFmpegPath = *patch.FFmpegPath
+		}
+		if patch.CertInstalled != nil {
+			candidate.CertInstalled = *patch.CertInstalled
+		}
+		if patch.Version != nil {
+			candidate.Version = *patch.Version
+		}
+		return nil
+	})
+}
+
+func (cm *ConfigManager) commitLocked(ctx context.Context, next *Config) error {
+	configCopy := *next
+	candidate := cm.mergeWithDefaults(&configCopy)
+	if err := cm.persistLocked(ctx, candidate); err != nil {
+		return err
+	}
+	cm.config = candidate
+	return nil
 }
 
 // Reset resets configuration to defaults
 func (cm *ConfigManager) Reset() error {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
-
-	cm.config = DefaultConfig()
-	return cm.saveInternal()
+	return cm.commitLocked(context.Background(), DefaultConfig())
 }
 
 // GetConfigPath returns the config file path
@@ -371,6 +303,9 @@ func ValidateDownloadDir(path string) error {
 	if path == "" {
 		return fmt.Errorf("download directory path cannot be empty")
 	}
+	if !filepath.IsAbs(path) {
+		return fmt.Errorf("download directory path must be absolute")
+	}
 
 	// Check if path exists
 	info, err := os.Stat(path)
@@ -380,9 +315,13 @@ func ValidateDownloadDir(path string) error {
 			if err := os.MkdirAll(path, 0755); err != nil {
 				return fmt.Errorf("directory does not exist and cannot be created: %w", err)
 			}
-			return nil
+			info, err = os.Stat(path)
+			if err != nil {
+				return fmt.Errorf("cannot access created directory: %w", err)
+			}
+		} else {
+			return fmt.Errorf("cannot access directory: %w", err)
 		}
-		return fmt.Errorf("cannot access directory: %w", err)
 	}
 
 	// Check if it's a directory
@@ -390,24 +329,29 @@ func ValidateDownloadDir(path string) error {
 		return fmt.Errorf("path is not a directory")
 	}
 
-	// Check if writable by creating a temp file
-	testFile := filepath.Join(path, ".easydownload_write_test")
-	f, err := os.Create(testFile)
+	// Use a unique probe so validation can never truncate a user-owned file and
+	// concurrent validations do not contend on one fixed name.
+	f, err := os.CreateTemp(path, ".easydownload-write-test-*")
 	if err != nil {
 		return fmt.Errorf("directory is not writable: %w", err)
 	}
-	f.Close()
-	os.Remove(testFile)
+	testFile := f.Name()
+	closed := false
+	defer func() {
+		if !closed {
+			_ = f.Close()
+		}
+		_ = os.Remove(testFile)
+	}()
+	if _, err := f.Write([]byte{0}); err != nil {
+		return fmt.Errorf("directory write probe failed: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close directory write probe: %w", err)
+	}
+	closed = true
 
 	return nil
-}
-
-// SetDownloadDir sets the download directory with validation
-func (cm *ConfigManager) SetDownloadDir(path string) error {
-	if err := ValidateDownloadDir(path); err != nil {
-		return err
-	}
-	return cm.Set("downloadDir", path)
 }
 
 // Export exports the configuration to a JSON file
@@ -470,6 +414,5 @@ func (cm *ConfigManager) Import(importPath string) error {
 		}
 	}
 
-	cm.config = cm.mergeWithDefaults(&importedConfig)
-	return cm.saveInternal()
+	return cm.commitLocked(context.Background(), &importedConfig)
 }

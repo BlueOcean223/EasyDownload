@@ -70,9 +70,7 @@ func (bd *BilibiliDownloader) GetQRCode() (*BilibiliQRCode, error) {
 	}
 
 	bd.setHeaders(req)
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	resp, err := bd.do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -135,9 +133,7 @@ func (bd *BilibiliDownloader) PollQRCodeStatus(qrcodeKey string) (*BilibiliLogin
 	}
 
 	bd.setHeaders(req)
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	resp, err := bd.do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -176,29 +172,29 @@ func (bd *BilibiliDownloader) PollQRCodeStatus(qrcodeKey string) (*BilibiliLogin
 	// 86101 = QR code not scanned
 
 	if result.Data.Code == 0 {
+		var sessData string
 		// Login successful, extract SESSDATA from cookies in response header
 		for _, cookie := range resp.Cookies() {
 			if cookie.Name == "SESSDATA" {
-				status.SessData = cookie.Value
+				sessData = cookie.Value
 				break
 			}
 		}
 
 		// If SESSDATA not in cookies, try to parse from URL
-		if status.SessData == "" && result.Data.URL != "" {
+		if sessData == "" && result.Data.URL != "" {
 			// URL format: https://passport.bilibili.com/...?SESSDATA=xxx&...
 			if strings.Contains(result.Data.URL, "SESSDATA=") {
 				parts := strings.Split(result.Data.URL, "SESSDATA=")
 				if len(parts) > 1 {
-					sessData := strings.Split(parts[1], "&")[0]
-					status.SessData = sessData
+					sessData = strings.Split(parts[1], "&")[0]
 				}
 			}
 		}
 
 		// Auto-save SESSDATA if obtained
-		if status.SessData != "" {
-			bd.SaveSessData(status.SessData)
+		if sessData != "" {
+			bd.SaveSessData(sessData)
 			logger.Info("Bilibili login successful, SESSDATA saved")
 		}
 	}
@@ -228,9 +224,7 @@ func (bd *BilibiliDownloader) GetUserInfo() (*BilibiliUserInfo, error) {
 	}
 
 	bd.setHeaders(req)
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	resp, err := bd.do(req)
 	if err != nil {
 		return nil, err
 	}

@@ -1,6 +1,23 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
-import type { DetectedVideo, DownloadTask, AppInfo } from '@/types'
+import type {
+  AppRuntimeInfo,
+  DetectionChange,
+  DetectionSnapshot,
+  DetectedVideo,
+  DownloadLifecycleEvent,
+  DownloadStopReceipt,
+  DownloadStopReason,
+  DownloadTask,
+  LegacyDownloadNotice,
+  RestartRequirement,
+  SettingsDiagnostic,
+  SettingsPatch,
+  SettingsSnapshot,
+  SettingsUpdateResult,
+  SettingsWarning,
+  TaskError
+} from '@/types'
 import {
   StartProxy,
   StopProxy,
@@ -10,27 +27,21 @@ import {
   UninstallCert,
   GetDetectedVideos,
   ClearDetectedVideos,
-  DownloadVideoWithKey,
+  StartDetectedDownload,
   GetDownloads,
+  TakeLegacyDownloadNotice,
   PauseDownload,
   ResumeDownload,
+  RetryDownload,
   CancelDownload,
   RemoveDownload,
-  GetDownloadDir,
-  SetDownloadDir,
   SelectDownloadDir,
   OpenDownloadDir,
   GetAppInfo,
+  GetSettings,
+  UpdateSettings,
   IsFFmpegAvailable,
   InstallFFmpeg,
-  SetFirstRunComplete,
-  SetMinimizeToTray,
-  SetShowNotification,
-  SetTheme,
-  SetLanguage,
-  SetCloseAction,
-  SetDontAskOnClose,
-  SetDontRemindCertWizard,
   RequestClose
 } from '../../wailsjs/go/main/App'
 import { EventsOn } from '../../wailsjs/runtime/runtime'
@@ -41,11 +52,38 @@ export const useAppStore = defineStore('app', () => {
   const certInstalled = ref(false)
   const ffmpegAvailable = ref(false)
   const detectedVideos = ref<DetectedVideo[]>([])
+  const detectionRevision = ref(0)
   const downloads = ref<DownloadTask[]>([])
+  const downloadStopOperations = ref<Record<string, {
+    operationId: string
+    reason: DownloadStopReason
+    revision: number
+    instance: number
+    generation: number
+    error?: TaskError
+  }>>({})
+  const downloadLifecycleRevisions = new Map<string, number>()
+  type DownloadTaskVersion = { instance: number; generation: number; revision: number }
+  type DownloadTerminalMarker = DownloadTaskVersion & { status: DownloadTask['status'] | 'removed' }
+  const downloadTaskVersions = new Map<string, DownloadTaskVersion>()
+  // Terminal markers are generation-aware. A retry/resume may supersede one,
+  // while a delayed event from the prior execution can never reopen it.
+  const downloadTerminalStatuses = new Map<string, DownloadTerminalMarker>()
+  const legacyDownloadNotice = ref<LegacyDownloadNotice | null>(null)
   const downloadDir = ref('')
-  const appInfo = ref<AppInfo | null>(null)
+  const appInfo = ref<AppRuntimeInfo | null>(null)
+  const settings = ref<SettingsSnapshot | null>(null)
+  const settingsWarnings = ref<SettingsWarning[]>([])
+  const restartRequirements = ref<RestartRequirement[]>([])
+  const settingsDiagnostic = ref<SettingsDiagnostic | null>(null)
   const loading = ref(false)
+  let initialized = false
+  let initPromise: Promise<void> | null = null
   let listenersReady = false
+  let detectionListenerReady = false
+  let detectionSnapshotApplied = false
+  let downloadSnapshotApplied = false
+  const bufferedDownloadEvents: Array<() => void> = []
   const eventUnsubscribers: Array<() => void> = []
 
   // New state for settings
@@ -69,7 +107,7 @@ export const useAppStore = defineStore('app', () => {
 
   // Computed
   const pendingDownloads = computed(() =>
-    downloads.value.filter(d => d.status === 'pending' || d.status === 'downloading' || d.status === 'retrying' || d.status === 'paused')
+    downloads.value.filter(d => d.status === 'pending' || d.status === 'running' || d.status === 'paused')
   )
 
   const completedDownloads = computed(() =>
@@ -77,44 +115,551 @@ export const useAppStore = defineStore('app', () => {
   )
 
   const problemDownloads = computed(() =>
-    downloads.value.filter(d => d.status === 'failed' || d.status === 'cancelled')
+    downloads.value.filter(d => d.status === 'failed' || d.status === 'canceled')
   )
 
+  function applySettings(snapshot: SettingsSnapshot) {
+    settings.value = snapshot
+    downloadDir.value = snapshot.downloadDir
+    minimizeToTray.value = snapshot.minimizeToTray
+    showNotification.value = snapshot.showNotification
+    firstRunComplete.value = snapshot.firstRunComplete
+    theme.value = snapshot.theme
+    language.value = snapshot.language
+    useUpstreamProxy.value = snapshot.useUpstreamProxy
+    closeAction.value = snapshot.closeAction
+    dontAskOnClose.value = snapshot.dontAskOnClose
+    dontRemindCertWizard.value = snapshot.dontRemindCertWizard
+    document.documentElement.setAttribute('data-theme', snapshot.theme)
+  }
+
+  function normalizeSettingsSnapshot(
+    snapshot: Awaited<ReturnType<typeof GetSettings>>
+  ): SettingsSnapshot {
+    const closeAction = snapshot.closeAction
+    if (closeAction !== '' && closeAction !== 'exit' && closeAction !== 'minimize') {
+      throw new Error(`Unsupported close action from settings binding: ${closeAction}`)
+    }
+    const theme = snapshot.theme
+    if (theme !== 'dark' && theme !== 'light') {
+      throw new Error(`Unsupported theme from settings binding: ${theme}`)
+    }
+    const language = snapshot.language
+    if (language !== 'zh-CN' && language !== 'en-US') {
+      throw new Error(`Unsupported language from settings binding: ${language}`)
+    }
+    return {
+      proxyPort: snapshot.proxyPort,
+      apiPort: snapshot.apiPort,
+      downloadDir: snapshot.downloadDir,
+      maxConcurrent: snapshot.maxConcurrent,
+      minimizeToTray: snapshot.minimizeToTray,
+      showNotification: snapshot.showNotification,
+      firstRunComplete: snapshot.firstRunComplete,
+      closeAction,
+      dontAskOnClose: snapshot.dontAskOnClose,
+      theme,
+      language,
+      upstreamProxy: snapshot.upstreamProxy,
+      useUpstreamProxy: snapshot.useUpstreamProxy,
+      proxyDebug: snapshot.proxyDebug,
+      dontRemindCertWizard: snapshot.dontRemindCertWizard
+    }
+  }
+
+  function normalizeSettingsUpdateResult(
+    result: Awaited<ReturnType<typeof UpdateSettings>>
+  ): SettingsUpdateResult {
+    return {
+      settings: normalizeSettingsSnapshot(result.settings),
+      warnings: result.warnings?.map(warning => ({
+        code: warning.code,
+        effect: warning.effect,
+        message: warning.message
+      })),
+      restartRequired: result.restartRequired,
+      restartRequirements: result.restartRequirements?.map(requirement => {
+        if (requirement.scope !== 'app' && requirement.scope !== 'proxy') {
+          throw new Error(`Unsupported restart scope from settings binding: ${requirement.scope}`)
+        }
+        return {
+          scope: requirement.scope,
+          fields: requirement.fields,
+          reason: requirement.reason
+        }
+      })
+    }
+  }
+
+  async function updateSettings(patch: SettingsPatch): Promise<SettingsUpdateResult> {
+    const result = normalizeSettingsUpdateResult(await UpdateSettings(patch))
+    applySettings(result.settings)
+    settingsWarnings.value = result.warnings ?? []
+    // The App returns the complete current committed-vs-runtime drift, so this
+    // authoritative list both preserves unrelated requirements and clears one
+    // when the committed value again matches the live runtime.
+    restartRequirements.value = result.restartRequirements ?? []
+    // settings.inconsistent is sticky: a later unrelated successful update
+    // does not prove that a failed rollback has recovered.
+    return result
+  }
+
+  type WailsDetectionSnapshot = Awaited<ReturnType<typeof GetDetectedVideos>>
+  type WailsDetectedVideo = WailsDetectionSnapshot['videos'][number]
+  type WailsDetectedResource = WailsDetectedVideo['candidates'][number]
+  type WailsDetectionChange = Awaited<ReturnType<typeof ClearDetectedVideos>>
+  type WailsDownloadTask = Awaited<ReturnType<typeof StartDetectedDownload>>
+  type WailsTaskArtifact = NonNullable<WailsDownloadTask['artifacts']>[number]
+  type WailsTaskError = NonNullable<WailsDownloadTask['lastErrorDetail']>
+  type WailsDownloadStopReceipt = Awaited<ReturnType<typeof PauseDownload>>
+
+  const detectionChangeTypes = ['inserted', 'updated', 'removed', 'cleared'] satisfies DetectionChange['type'][]
+  const downloadStatuses = [
+    'pending', 'running', 'paused', 'completed', 'failed', 'canceled'
+  ] satisfies DownloadTask['status'][]
+  const artifactKinds = ['final', 'temporary'] satisfies NonNullable<DownloadTask['artifacts']>[number]['kind'][]
+  const taskErrorCategories = [
+    'transport', 'platform', 'output', 'canceled', 'unexpected'
+  ] satisfies TaskError['category'][]
+  const downloadStopReasons = [
+    'pause', 'cancel', 'shutdown', 'failure', 'task_removal'
+  ] satisfies DownloadStopReason[]
+
+  function normalizeStringMember<T extends string>(value: string, allowed: readonly T[], label: string): T {
+    const normalized = allowed.find(candidate => candidate === value)
+    if (normalized === undefined) {
+      throw new Error(`Unsupported ${label} from Wails binding: ${value}`)
+    }
+    return normalized
+  }
+
+  function normalizeDetectionTimestamp(value: unknown, field: string): string {
+    if (typeof value !== 'string') {
+      throw new Error(`Invalid ${field} from Wails detection binding`)
+    }
+    return value
+  }
+
+  function normalizeDetectedResource(resource: WailsDetectedResource): DetectedVideo['candidates'][number] {
+    return { ...resource } satisfies DetectedVideo['candidates'][number]
+  }
+
+  function normalizeDetectedVideo(video: WailsDetectedVideo): DetectedVideo {
+    return {
+      ...video,
+      candidates: video.candidates.map(normalizeDetectedResource),
+      detectedAt: normalizeDetectionTimestamp(video.detectedAt, 'detectedAt'),
+      lastSeenAt: normalizeDetectionTimestamp(video.lastSeenAt, 'lastSeenAt')
+    } satisfies DetectedVideo
+  }
+
+  function normalizeDetectionSnapshot(snapshot: WailsDetectionSnapshot): DetectionSnapshot {
+    return {
+      ...snapshot,
+      videos: snapshot.videos.map(normalizeDetectedVideo)
+    } satisfies DetectionSnapshot
+  }
+
+  function normalizeDetectionChange(change: WailsDetectionChange): DetectionChange {
+    return {
+      ...change,
+      type: normalizeStringMember(change.type, detectionChangeTypes, 'detection change type'),
+      snapshot: normalizeDetectionSnapshot(change.snapshot)
+    } satisfies DetectionChange
+  }
+
+  function normalizeTaskError(error: WailsTaskError): TaskError {
+    return {
+      ...error,
+      category: normalizeStringMember(error.category, taskErrorCategories, 'task error category')
+    } satisfies TaskError
+  }
+
+  function normalizeTaskArtifact(
+    artifact: WailsTaskArtifact
+  ): NonNullable<DownloadTask['artifacts']>[number] {
+    return {
+      ...artifact,
+      kind: normalizeStringMember(artifact.kind, artifactKinds, 'artifact kind')
+    } satisfies NonNullable<DownloadTask['artifacts']>[number]
+  }
+
+  function normalizeDownloadTask(task: WailsDownloadTask): DownloadTask {
+    const conflictStrategy = task.outputPolicy.conflictStrategy
+    if (conflictStrategy !== 'auto_rename') {
+      throw new Error(`Unsupported output conflict strategy from Wails binding: ${conflictStrategy}`)
+    }
+    return {
+      ...task,
+      outputPolicy: {
+        ...task.outputPolicy,
+        conflictStrategy
+      },
+      artifacts: task.artifacts?.map(normalizeTaskArtifact),
+      status: normalizeStringMember(task.status, downloadStatuses, 'download status'),
+      lastErrorDetail: task.lastErrorDetail ? normalizeTaskError(task.lastErrorDetail) : undefined
+    } satisfies DownloadTask
+  }
+
+  function normalizeDownloadStopReceipt(receipt: WailsDownloadStopReceipt): DownloadStopReceipt {
+    return {
+      ...receipt,
+      requestedReason: normalizeStringMember(receipt.requestedReason, downloadStopReasons, 'download stop reason'),
+      effectiveReason: normalizeStringMember(receipt.effectiveReason, downloadStopReasons, 'download stop reason'),
+      error: receipt.error ? normalizeTaskError(receipt.error) : undefined
+    } satisfies DownloadStopReceipt
+  }
+
+  function normalizeLegacyDownloadNotice(
+    notice: Awaited<ReturnType<typeof TakeLegacyDownloadNotice>> | null
+  ): LegacyDownloadNotice | null {
+    if (!notice) return null
+    return { ...notice } satisfies LegacyDownloadNotice
+  }
+
+  function applyDetectionSnapshot(snapshot?: DetectionSnapshot) {
+    if (!snapshot || !Number.isFinite(snapshot.revision)) return false
+    if (detectionSnapshotApplied && snapshot.revision <= detectionRevision.value) return false
+    detectionSnapshotApplied = true
+    detectionRevision.value = snapshot.revision
+    detectedVideos.value = snapshot.videos ?? []
+    return true
+  }
+
+  function replaceDownload(task: DownloadTask) {
+    const index = downloads.value.findIndex(existing => existing.id === task.id)
+    if (index === -1) {
+      downloads.value.unshift(task)
+    } else {
+      downloads.value[index] = task
+    }
+  }
+
+  function clearDownloadStopOperation(taskId: string) {
+    if (!downloadStopOperations.value[taskId]) return
+    const operations = { ...downloadStopOperations.value }
+    delete operations[taskId]
+    downloadStopOperations.value = operations
+  }
+
+  function currentDownloadCommandRef(taskId: string) {
+    const version = downloadTaskVersions.get(taskId)
+    if (version && version.instance > 0) return version
+    const task = downloads.value.find(item => item.id === taskId)
+    if (!task) throw new Error(`Download task ${taskId} not found`)
+    return taskVersion(task)
+  }
+
+  function isActiveDownloadStatus(status: DownloadTask['status']) {
+    return status === 'pending' || status === 'running'
+  }
+
+  function taskVersion(task: DownloadTask): DownloadTaskVersion {
+    return {
+      instance: Number.isFinite(task.instance) ? task.instance : 0,
+      generation: Number.isFinite(task.generation) ? task.generation : 0,
+      revision: Number.isFinite(task.revision) ? task.revision : 0
+    }
+  }
+
+  function compareTaskVersions(left: DownloadTaskVersion, right: DownloadTaskVersion) {
+    if (left.instance !== right.instance) return left.instance - right.instance
+    if (left.generation !== right.generation) return left.generation - right.generation
+    return left.revision - right.revision
+  }
+
+  function compareTaskIdentity(left: DownloadTaskVersion, right: DownloadTaskVersion) {
+    if (left.instance !== right.instance) return left.instance - right.instance
+    return left.generation - right.generation
+  }
+
+  function isNewerTaskVersion(next: DownloadTaskVersion, current?: DownloadTaskVersion) {
+    return !current || compareTaskVersions(next, current) > 0
+  }
+
+  function acceptDownloadTaskVersion(task: DownloadTask) {
+    const next = taskVersion(task)
+    if (!isNewerTaskVersion(next, downloadTaskVersions.get(task.id))) return false
+    downloadTaskVersions.set(task.id, next)
+    return true
+  }
+
+  function markerAllows(task: DownloadTask) {
+    const marker = downloadTerminalStatuses.get(task.id)
+    if (!marker) return true
+    const next = taskVersion(task)
+    // A removed marker fences the whole task object, including all of its
+    // execution generations. Only a new manager-assigned instance may reuse
+    // the same public ID. Other terminal states may be superseded by retry or
+    // resume on a later execution generation of the same instance.
+    if (next.instance > marker.instance ||
+      (next.instance === marker.instance && marker.status !== 'removed' && next.generation > marker.generation)) {
+      downloadTerminalStatuses.delete(task.id)
+      return true
+    }
+    return false
+  }
+
+  function markTerminal(task: DownloadTask, status: DownloadTerminalMarker['status']) {
+    const version = taskVersion(task)
+    downloadTerminalStatuses.set(task.id, { ...version, status })
+  }
+
+  function upsertDownload(task: DownloadTask) {
+    if (!acceptDownloadTaskVersion(task) || !markerAllows(task)) return false
+    replaceDownload(task)
+    return true
+  }
+
+  function applyTerminalDownload(task: DownloadTask, fallbackStatus: DownloadTask['status']) {
+    if (!acceptDownloadTaskVersion(task) || !markerAllows(task)) return false
+    const terminalTask = isActiveDownloadStatus(task.status)
+      ? { ...task, status: fallbackStatus }
+      : task
+    replaceDownload(terminalTask)
+    markTerminal(terminalTask, terminalTask.status)
+    return true
+  }
+
+  function applyDownloadStart(task: DownloadTask) {
+    const previous = downloadTaskVersions.get(task.id)
+    if (!acceptDownloadTaskVersion(task) || !markerAllows(task)) return false
+    if (previous && (task.instance > previous.instance ||
+      (task.instance === previous.instance && task.generation > previous.generation))) {
+      clearDownloadStopOperation(task.id)
+    }
+    replaceDownload(task)
+    // Very small downloads may finish before the backend has emitted its
+    // start notification. Preserve that terminal snapshot instead of opening
+    // a hole for a queued progress update.
+    if (!isActiveDownloadStatus(task.status)) {
+      markTerminal(task, task.status)
+    }
+    return true
+  }
+
+  function applyInitialDownloadSnapshot(tasks: DownloadTask[]) {
+    downloads.value = tasks
+    downloadTerminalStatuses.clear()
+    downloadTaskVersions.clear()
+    for (const task of tasks) {
+      downloadTaskVersions.set(task.id, taskVersion(task))
+      if (!isActiveDownloadStatus(task.status)) {
+        markTerminal(task, task.status)
+      }
+    }
+
+    // Events registered before GetDownloads may race its response. Replaying
+    // them after the snapshot makes event order authoritative without allowing
+    // the (possibly older) response to overwrite a newer terminal state.
+    downloadSnapshotApplied = true
+    const pending = bufferedDownloadEvents.splice(0)
+    for (const applyEvent of pending) applyEvent()
+  }
+
+  function applyRestartedDownloadSnapshot(tasks: DownloadTask[], restartedTaskId: string) {
+    // GetDownloads has task-level versions but no collection revision. The
+    // response may therefore have captured its task set before an unrelated
+    // start/complete event that the UI already applied. This command only owns
+    // the task it restarted, so merge that one task and never prune or replace
+    // unrelated IDs from the full-list response.
+    const task = tasks.find(item => item.id === restartedTaskId)
+    if (!task || !acceptDownloadTaskVersion(task) || !markerAllows(task)) return
+    replaceDownload(task)
+    if (!isActiveDownloadStatus(task.status)) {
+      markTerminal(task, task.status)
+    } else if (task.generation > 0) {
+      downloadTerminalStatuses.delete(task.id)
+      clearDownloadStopOperation(task.id)
+    }
+  }
+
+  function applyOrBufferDownloadEvent(applyEvent: () => void) {
+    if (!downloadSnapshotApplied) {
+      bufferedDownloadEvents.push(applyEvent)
+      return
+    }
+    applyEvent()
+  }
+
+  function acceptDownloadLifecycleRevision(taskId: string, revision: number, allowEqual = false) {
+    if (!taskId || !Number.isFinite(revision)) return false
+    const current = downloadLifecycleRevisions.get(taskId) ?? -1
+    if (revision < current || (!allowEqual && revision === current)) return false
+    if (revision > current) downloadLifecycleRevisions.set(taskId, revision)
+    return true
+  }
+
+  function applyStopReceipt(receipt: DownloadStopReceipt) {
+    if (!receipt) return false
+    const receiptTaskVersion: DownloadTaskVersion = {
+      instance: Number.isFinite(receipt.taskInstance) ? receipt.taskInstance : 0,
+      generation: Number.isFinite(receipt.taskGeneration) ? receipt.taskGeneration : 0,
+      revision: Number.isFinite(receipt.taskRevision) ? receipt.taskRevision : 0
+    }
+    const currentTaskVersion = downloadTaskVersions.get(receipt.taskId)
+    if (currentTaskVersion && compareTaskIdentity(receiptTaskVersion, currentTaskVersion) < 0) return false
+    if (!acceptDownloadLifecycleRevision(receipt.taskId, receipt.revision)) return false
+    if (!currentTaskVersion || compareTaskVersions(receiptTaskVersion, currentTaskVersion) > 0) {
+      downloadTaskVersions.set(receipt.taskId, receiptTaskVersion)
+    }
+    if (receipt.executionState === 'completed' || !receipt.accepted) {
+      const operation = downloadStopOperations.value[receipt.taskId]
+      if (!operation || (operation.operationId === receipt.operationId &&
+        operation.instance === receiptTaskVersion.instance &&
+        operation.generation === receiptTaskVersion.generation)) {
+        clearDownloadStopOperation(receipt.taskId)
+      }
+      return true
+    }
+    downloadStopOperations.value = {
+      ...downloadStopOperations.value,
+      [receipt.taskId]: {
+        operationId: receipt.operationId,
+        reason: receipt.effectiveReason,
+        revision: receipt.revision,
+        instance: receiptTaskVersion.instance,
+        generation: receiptTaskVersion.generation,
+        error: receipt.error
+      }
+    }
+    return true
+  }
+
+  function applyDownloadLifecycleEvent(event: DownloadLifecycleEvent) {
+    // The accepted receipt and its initial stopping event intentionally share
+    // one lifecycle revision. Processing that equal event is idempotent and
+    // also carries the task-event fence needed to reject queued snapshots.
+    if (!event || !acceptDownloadLifecycleRevision(event.taskId, event.revision, true)) return false
+    const eventTaskVersion: DownloadTaskVersion = {
+      instance: Number.isFinite(event.taskInstance) ? event.taskInstance : 0,
+      generation: Number.isFinite(event.taskGeneration) ? event.taskGeneration : 0,
+      revision: Number.isFinite(event.taskRevision) ? event.taskRevision : 0
+    }
+    const currentTaskVersion = downloadTaskVersions.get(event.taskId)
+    const identityOrder = currentTaskVersion
+      ? compareTaskIdentity(eventTaskVersion, currentTaskVersion)
+      : 1
+    const existingOperation = downloadStopOperations.value[event.taskId]
+    const matchesExistingOperation = existingOperation != null &&
+      existingOperation.operationId === event.operationId &&
+      existingOperation.instance === eventTaskVersion.instance &&
+      existingOperation.generation === eventTaskVersion.generation
+    if (event.phase === 'stopping') {
+      if (identityOrder < 0) return false
+      // Fence task snapshots that were emitted before stop closed the backend
+      // mutation gate but happen to arrive after this lifecycle event.
+      if (!currentTaskVersion || compareTaskVersions(eventTaskVersion, currentTaskVersion) > 0) {
+        downloadTaskVersions.set(event.taskId, eventTaskVersion)
+      }
+      downloadStopOperations.value = {
+        ...downloadStopOperations.value,
+        [event.taskId]: {
+          operationId: event.operationId,
+          reason: event.effectiveReason,
+          revision: event.revision,
+          instance: eventTaskVersion.instance,
+          generation: eventTaskVersion.generation,
+          error: event.error
+        }
+      }
+      return true
+    }
+
+    if (matchesExistingOperation) clearDownloadStopOperation(event.taskId)
+
+    // Operation convergence and task payload ordering are deliberately
+    // separate. A terminal event may be older than an already applied public
+    // snapshot yet must still clear its matching stopping operation. It may
+    // not, however, mutate a newer execution/task instance.
+    if (identityOrder < 0) return true
+
+    if (event.removed) {
+      const removalFence = currentTaskVersion && compareTaskVersions(currentTaskVersion, eventTaskVersion) > 0
+        ? currentTaskVersion
+        : eventTaskVersion
+      downloadTaskVersions.set(event.taskId, removalFence)
+      downloadTerminalStatuses.set(event.taskId, { ...removalFence, status: 'removed' })
+      downloads.value = downloads.value.filter(task => task.id !== event.taskId)
+      return true
+    }
+
+    if (currentTaskVersion && compareTaskVersions(eventTaskVersion, currentTaskVersion) < 0) {
+      return true
+    }
+    downloadTaskVersions.set(event.taskId, eventTaskVersion)
+
+    const task = downloads.value.find(item => item.id === event.taskId)
+    const eventPayloadVersion = event.task ? taskVersion(event.task) : undefined
+    const hasMatchingPayload = event.task != null && eventPayloadVersion != null &&
+      compareTaskVersions(eventPayloadVersion, eventTaskVersion) === 0
+    const terminalTask: DownloadTask | undefined = hasMatchingPayload
+      ? event.task!
+      : task
+        ? {
+            ...task,
+            instance: eventTaskVersion.instance,
+            generation: eventTaskVersion.generation,
+            revision: eventTaskVersion.revision,
+            status: event.resultStatus ?? task.status,
+            lastErrorDetail: event.error ?? task.lastErrorDetail,
+            error: event.error?.message ?? task.error,
+            executionState: 'finished'
+          }
+        : undefined
+    if (terminalTask) {
+      replaceDownload(terminalTask)
+      if (event.resultStatus) markTerminal(terminalTask, event.resultStatus)
+    }
+    return true
+  }
+
   // Actions
-  async function initApp() {
+  function initApp(): Promise<void> {
+    if (initialized) return Promise.resolve()
+    if (initPromise) return initPromise
+    initPromise = initializeApp().finally(() => {
+      initPromise = null
+    })
+    return initPromise
+  }
+
+  async function initializeApp() {
     loading.value = true
     try {
-      // Get app info
-      appInfo.value = await GetAppInfo() as AppInfo
-      downloadDir.value = await GetDownloadDir()
-
-      // Check status
-      proxyRunning.value = await IsProxyRunning()
-      certInstalled.value = await IsCertInstalled()
-      ffmpegAvailable.value = await IsFFmpegAvailable()
-      // Note: firstRunComplete is deprecated, wizard display is now based on certInstalled
-
-      // Load settings from appInfo
-      if (appInfo.value) {
-        minimizeToTray.value = appInfo.value.minimizeToTray ?? true
-        showNotification.value = appInfo.value.showNotification ?? true
-        theme.value = appInfo.value.theme ?? 'dark'
-        language.value = appInfo.value.language ?? 'zh-CN'
-        useUpstreamProxy.value = appInfo.value.useUpstreamProxy ?? false
-        closeAction.value = appInfo.value.closeAction ?? ''
-        dontAskOnClose.value = appInfo.value.dontAskOnClose ?? false
-        dontRemindCertWizard.value = appInfo.value.dontRemindCertWizard ?? false
-
-        // Apply theme to DOM
-        document.documentElement.setAttribute('data-theme', theme.value)
-      }
-
-      // Load existing data
-      detectedVideos.value = await GetDetectedVideos() as DetectedVideo[]
-      downloads.value = await GetDownloads() as DownloadTask[]
-
-      // Setup event listeners
+      // Register download listeners before any initial RPC. Download events are
+      // buffered until GetDownloads resolves, then replayed over that snapshot.
       setupEventListeners()
+
+      // Fetch the full initial view before committing any of it. If one RPC
+      // fails, a later initApp call can retry without mixing a partial snapshot
+      // with live download events received in the meantime.
+      const [runtimeInfo, settingsSnapshot, proxyStatus, certStatus, ffmpegStatus,
+        detectionSnapshot, downloadSnapshot] = await Promise.all([
+        GetAppInfo(),
+        GetSettings(),
+        IsProxyRunning(),
+        IsCertInstalled(),
+        IsFFmpegAvailable(),
+        GetDetectedVideos(),
+        GetDownloads()
+      ])
+      const normalizedSettings = normalizeSettingsSnapshot(settingsSnapshot)
+      const normalizedDetection = normalizeDetectionSnapshot(detectionSnapshot)
+      const normalizedDownloads = downloadSnapshot.map(normalizeDownloadTask)
+      // This call consumes a one-time notice, so run it only after all
+      // retryable reads and binding validation have succeeded.
+      const legacyNotice = normalizeLegacyDownloadNotice(await TakeLegacyDownloadNotice())
+
+      appInfo.value = runtimeInfo
+      applySettings(normalizedSettings)
+      proxyRunning.value = proxyStatus
+      certInstalled.value = certStatus
+      ffmpegAvailable.value = ffmpegStatus
+      applyDetectionSnapshot(normalizedDetection)
+      applyInitialDownloadSnapshot(normalizedDownloads)
+      legacyDownloadNotice.value = legacyNotice
+      initialized = true
     } catch (error) {
       console.error('Failed to init app:', error)
     } finally {
@@ -122,203 +667,48 @@ export const useAppStore = defineStore('app', () => {
     }
   }
 
+  function setupDetectionListener() {
+    if (detectionListenerReady) return
+    detectionListenerReady = true
+    // The backend DetectionStore owns identity, merge, ordering, and capacity.
+    // Each event carries an authoritative snapshot, so this store has no
+    // platform-specific merge policy.
+    eventUnsubscribers.push(EventsOn('video:detected', (change: DetectionChange) => {
+      applyDetectionSnapshot(change?.snapshot)
+    }))
+  }
+
   function setupEventListeners() {
     if (listenersReady) return
     listenersReady = true
+    setupDetectionListener()
 
     const on = (eventName: string, callback: (...data: any[]) => void) => {
       eventUnsubscribers.push(EventsOn(eventName, callback))
     }
 
-    function isBadWeChatTitle(t?: string) {
-      if (!t) return true
-      const s = String(t).trim()
-      if (!s) return true
-      const low = s.toLowerCase()
-      if (low.includes('this is a modal window')) return true
-      if (low.includes('modal window') && low.includes('this is')) return true
-      if (low.includes('beginning of dialog window')) return true
-      if (low.includes('escape will cancel')) return true
-      if (low.includes('cancel and close the window')) return true
-      if (low === 'play video' || low.includes('play video')) return true
-      if (low.includes('restore all settings to the default values')) return true
-      if (low.includes('video player is loading')) return true
-      if (low.includes('transparency') && low.includes('opaque')) return true
-      if (low === 'transparency' || low === 'opaque' || low.includes('semi-transparent') || low.includes('semi transparent')) return true
-      if (/[0-9]{1,2}:[0-9]{2}\s*\/\s*[0-9]{1,2}:[0-9]{2}/.test(s)) return true
-      if (s.includes('自动续播') || s.includes('小窗模式') || s.includes('默认值')) return true
-      if (s === '未知标题') return true
-      return false
-    }
-
-    function isBadWeChatAuthor(a?: string) {
-      if (!a) return true
-      const s = String(a).trim()
-      if (!s) return true
-      const low = s.toLowerCase()
-      if (low === 'play video' || low.includes('play video')) return true
-      if (low.includes('beginning of dialog window')) return true
-      if (low.includes('escape will cancel')) return true
-      if (low.includes('restore all settings to the default values')) return true
-      if (low.includes('video player is loading')) return true
-      if (s === '未知作者') return true
-      return false
-    }
-
-    function isLikelyBadWeChatURL(u?: string) {
-      if (!u) return true
-      const s = String(u).trim()
-      if (!s) return true
-      const low = s.toLowerCase()
-      // obvious live/stream formats
-      if (low.includes('.m3u8') || low.includes('.flv') || low.includes('.mpd')) return true
-      // chunk-ish worker URLs can slip through; never prefer them
-      if (low.includes('startidx=') || low.includes('size=')) return true
-      // if it's a finder download host, require VOD signature
-      if (low.includes('finder.video.qq.com') || low.includes('findermp.video.qq.com')) {
-        if (!low.includes('stodownload')) return true
-        if (!low.includes('encfilekey=')) return true
+    on('settings:changed', (payload: { settings?: SettingsSnapshot }) => {
+      if (payload?.settings) {
+        applySettings(payload.settings)
       }
-      return false
-    }
+    })
 
-    function mergePreferExisting(oldV: DetectedVideo, next: DetectedVideo): DetectedVideo {
-      // "First valid value locks" strategy:
-      // Once a field has a valid value, it won't be overwritten by subsequent updates
-      // (except for numeric fields where larger values are considered better)
-      const merged: DetectedVideo = { ...oldV }
-
-      // id: always use the stable id (should be the same anyway)
-      if (next.id) merged.id = next.id
-
-      // url: only update if old is bad and new is good
-      const oldUrlBad = !oldV.url || isLikelyBadWeChatURL(oldV.url)
-      const newUrlGood = next.url && !isLikelyBadWeChatURL(next.url)
-      if (oldUrlBad && newUrlGood) {
-        merged.url = next.url
-      }
-
-      // title: only update if old is bad and new is good (first valid locks)
-      const oldTitleBad = isBadWeChatTitle(oldV.title)
-      const newTitleGood = !isBadWeChatTitle(next.title)
-      if (oldTitleBad && newTitleGood) {
-        merged.title = next.title
-      }
-
-      // author: only update if old is bad and new is good (first valid locks)
-      const oldAuthorBad = isBadWeChatAuthor(oldV.author)
-      const newAuthorGood = !isBadWeChatAuthor(next.author)
-      if (oldAuthorBad && newAuthorGood) {
-        merged.author = next.author
-      }
-
-      // cover: only update if old is empty and new is not
-      if (!oldV.cover && next.cover) {
-        merged.cover = next.cover
-      }
-
-      // authorAvatar: only update if old is empty and new is not
-      if (!oldV.authorAvatar && next.authorAvatar) {
-        merged.authorAvatar = next.authorAvatar
-      }
-
-      // duration: only update if old is 0/missing and new is positive
-      if ((!oldV.duration || oldV.duration <= 0) && next.duration && next.duration > 0) {
-        merged.duration = next.duration
-      }
-
-      // fileSize: update if old is 0/missing, or if new is significantly larger (more accurate)
-      if ((!oldV.fileSize || oldV.fileSize <= 0) && next.fileSize && next.fileSize > 0) {
-        merged.fileSize = next.fileSize
-      } else if (oldV.fileSize && oldV.fileSize > 0 && next.fileSize && next.fileSize > oldV.fileSize * 1.2) {
-        // New fileSize is >20% larger, likely more accurate (full size vs chunk size)
-        merged.fileSize = next.fileSize
-      }
-
-      // width/height: only update if old is 0/missing and new is positive
-      if ((!oldV.width || oldV.width <= 0) && next.width && next.width > 0) {
-        merged.width = next.width
-      }
-      if ((!oldV.height || oldV.height <= 0) && next.height && next.height > 0) {
-        merged.height = next.height
-      }
-
-      // fileFormats: only update if old is empty and new is not
-      if ((!oldV.fileFormats || oldV.fileFormats.length === 0) && next.fileFormats && next.fileFormats.length > 0) {
-        merged.fileFormats = next.fileFormats
-      }
-
-      // specs: only update if old is empty and new is not
-      if ((!oldV.specs || oldV.specs.length === 0) && next.specs && next.specs.length > 0) {
-        merged.specs = next.specs
-      }
-
-      // decodeKey: only update if old is empty and new is not
-      if (!oldV.decodeKey && next.decodeKey) {
-        merged.decodeKey = next.decodeKey
-      }
-
-      // isCurrentVideo: always take the latest value (this is a state flag, not content)
-      merged.isCurrentVideo = next.isCurrentVideo
-
-      // source/quality/timestamp: take from next (metadata fields)
-      if (next.source) merged.source = next.source
-      if (next.quality) merged.quality = next.quality
-      if (next.timestamp) merged.timestamp = next.timestamp
-
-      return merged
-    }
-
-    // Video detected event
-    on('video:detected', (video: DetectedVideo) => {
-      // For WeChat: keep history, but dedupe/update by stable id (pageKey) to avoid spam
-      if (video.source === 'wechat') {
-        // Ensure only ONE card is marked as "当前"
-        if (video.isCurrentVideo) {
-          for (const v of detectedVideos.value) {
-            if (v.source === 'wechat') v.isCurrentVideo = false
-          }
-        }
-
-        // Newest first:
-        // - New id: unshift to front
-        // - Same id: update in place (do not reorder) to avoid UI jumps when metadata refreshes
-        const idx = detectedVideos.value.findIndex(v => v.source === 'wechat' && v.id === video.id)
-        if (idx !== -1) {
-          detectedVideos.value[idx] = mergePreferExisting(detectedVideos.value[idx], video)
-        } else {
-          detectedVideos.value.unshift(video)
-        }
-
-        // cap wechat history (keep other sources untouched)
-        const maxWechat = 80
-        const wechat = detectedVideos.value.filter(v => v.source === 'wechat')
-        const others = detectedVideos.value.filter(v => v.source !== 'wechat')
-        detectedVideos.value = [...wechat.slice(0, maxWechat), ...others]
-        return
-      }
-
-      // Check for duplicates
-      const exists = detectedVideos.value.some(v => v.url === video.url)
-      if (!exists) {
-        detectedVideos.value.unshift(video)
-      }
+    on('settings:diagnostic', (diagnostic: SettingsDiagnostic) => {
+      settingsDiagnostic.value = diagnostic
     })
 
     // Download progress event
     on('download:progress', (task: DownloadTask) => {
-      const index = downloads.value.findIndex(d => d.id === task.id)
-      if (index !== -1) {
-        downloads.value[index] = task
-      }
+      applyOrBufferDownloadEvent(() => {
+        upsertDownload(task)
+      })
     })
 
     // Download complete event
     on('download:complete', (task: DownloadTask) => {
-      const index = downloads.value.findIndex(d => d.id === task.id)
-      if (index !== -1) {
-        downloads.value[index] = task
-      }
+      applyOrBufferDownloadEvent(() => {
+        applyTerminalDownload(task, 'completed')
+      })
     })
 
     // Download error event
@@ -328,18 +718,22 @@ export const useAppStore = defineStore('app', () => {
         console.error(errorText || 'Download error')
         return
       }
-      const index = downloads.value.findIndex(d => d.id === data.task!.id)
-      if (index !== -1) {
-        downloads.value[index] = { ...data.task, error: errorText || data.task.error }
-      }
+      applyOrBufferDownloadEvent(() => {
+        applyTerminalDownload({ ...data.task!, error: errorText || data.task!.error }, 'failed')
+      })
     })
 
     // Download start event
     on('download:start', (task: DownloadTask) => {
-      const exists = downloads.value.some(d => d.id === task.id)
-      if (!exists) {
-        downloads.value.unshift(task)
-      }
+      applyOrBufferDownloadEvent(() => {
+        applyDownloadStart(task)
+      })
+    })
+
+    on('download:lifecycle', (event: DownloadLifecycleEvent) => {
+      applyOrBufferDownloadEvent(() => {
+        applyDownloadLifecycleEvent(event)
+      })
     })
 
     // FFmpeg ready event
@@ -358,6 +752,7 @@ export const useAppStore = defineStore('app', () => {
       } else {
         await StartProxy()
         proxyRunning.value = true
+        restartRequirements.value = restartRequirements.value.filter(requirement => requirement.scope !== 'proxy')
       }
     } catch (error) {
       console.error('Failed to toggle proxy:', error)
@@ -369,6 +764,7 @@ export const useAppStore = defineStore('app', () => {
     try {
       await InstallCert()
       certInstalled.value = true
+      if (appInfo.value) appInfo.value.certInstalled = true
     } catch (error) {
       console.error('Failed to install certificate:', error)
       throw error
@@ -379,6 +775,7 @@ export const useAppStore = defineStore('app', () => {
     try {
       await UninstallCert()
       certInstalled.value = false
+      if (appInfo.value) appInfo.value.certInstalled = false
     } catch (error) {
       console.error('Failed to uninstall certificate:', error)
       throw error
@@ -389,6 +786,10 @@ export const useAppStore = defineStore('app', () => {
     try {
       const path = await InstallFFmpeg()
       ffmpegAvailable.value = true
+      if (appInfo.value) {
+        appInfo.value.ffmpegAvailable = true
+        appInfo.value.ffmpegPath = path
+      }
       return path
     } catch (error) {
       console.error('Failed to install FFmpeg:', error)
@@ -397,29 +798,18 @@ export const useAppStore = defineStore('app', () => {
   }
 
   async function clearVideos() {
-    await ClearDetectedVideos()
-    detectedVideos.value = []
+    const change = normalizeDetectionChange(await ClearDetectedVideos())
+    applyDetectionSnapshot(change?.snapshot)
   }
 
-  async function downloadDetectedVideo(video: DetectedVideo, selectedFormat?: string) {
+  async function downloadDetectedVideo(video: DetectedVideo, candidateId?: string) {
     try {
-      // DetectedVideo.id is a stable identifier used for dedupe in the sniffer list.
-      // Download tasks must use a unique ID per download attempt; otherwise the backend
-      // rejects duplicates ("task with ID ... already exists") and subsequent downloads fail.
-      const downloadTaskId = `${video.source}_${video.id}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
-      
-      // Use DownloadVideoWithKey if decodeKey is present (for encrypted WeChat videos)
-      const task = await DownloadVideoWithKey(
-        downloadTaskId,
-        video.url,
-        video.title,
-        video.cover,
-        video.source,
-        selectedFormat || video.quality || '',
-        video.decodeKey || ''
-      ) as DownloadTask
-
-      downloads.value.unshift(task)
+      const selected = video.candidates.some(candidate => candidate.id === candidateId)
+        ? candidateId
+        : video.candidates.find(candidate => candidate.default)?.id || video.candidates[0]?.id
+      if (!selected) throw new Error('没有可下载的候选资源')
+      const task = normalizeDownloadTask(await StartDetectedDownload(video.id, selected))
+      applyDownloadStart(task)
       return task
     } catch (error) {
       console.error('Failed to start download:', error)
@@ -428,38 +818,36 @@ export const useAppStore = defineStore('app', () => {
   }
 
   async function pauseDownloadTask(id: string) {
-    await PauseDownload(id)
-    const task = downloads.value.find(d => d.id === id)
-    if (task) {
-      task.status = 'paused'
-    }
+    const ref = currentDownloadCommandRef(id)
+    applyStopReceipt(normalizeDownloadStopReceipt(await PauseDownload(id, ref.instance, ref.generation)))
   }
 
   async function resumeDownloadTask(id: string) {
-    await ResumeDownload(id)
-    const task = downloads.value.find(d => d.id === id)
-    if (task) {
-      task.status = 'pending'
-    }
+    const ref = currentDownloadCommandRef(id)
+    await ResumeDownload(id, ref.instance, ref.generation)
+    applyRestartedDownloadSnapshot((await GetDownloads()).map(normalizeDownloadTask), id)
   }
 
   async function cancelDownloadTask(id: string) {
-    await CancelDownload(id)
-    const task = downloads.value.find(d => d.id === id)
-    if (task) {
-      task.status = 'cancelled'
-    }
+    const ref = currentDownloadCommandRef(id)
+    applyStopReceipt(normalizeDownloadStopReceipt(await CancelDownload(id, ref.instance, ref.generation)))
+  }
+
+  async function retryDownloadTask(id: string) {
+    const ref = currentDownloadCommandRef(id)
+    await RetryDownload(id, ref.instance, ref.generation)
+    applyRestartedDownloadSnapshot((await GetDownloads()).map(normalizeDownloadTask), id)
   }
 
   async function removeDownloadTask(id: string) {
-    await RemoveDownload(id)
-    downloads.value = downloads.value.filter(d => d.id !== id)
+    const ref = currentDownloadCommandRef(id)
+    applyStopReceipt(normalizeDownloadStopReceipt(await RemoveDownload(id, ref.instance, ref.generation)))
   }
 
   async function selectFolder() {
     const dir = await SelectDownloadDir()
     if (dir) {
-      downloadDir.value = dir
+      await updateSettings({ downloadDir: dir })
     }
     return dir
   }
@@ -469,53 +857,71 @@ export const useAppStore = defineStore('app', () => {
   }
 
   async function updateDownloadDir(dir: string) {
-    await SetDownloadDir(dir)
-    downloadDir.value = dir
+    await updateSettings({ downloadDir: dir })
   }
 
   async function completeFirstRun() {
-    await SetFirstRunComplete(true)
-    firstRunComplete.value = true
+    await updateSettings({ firstRunComplete: true })
   }
 
   async function setMinimizeToTray(enabled: boolean) {
-    await SetMinimizeToTray(enabled)
-    minimizeToTray.value = enabled
+    await updateSettings({ minimizeToTray: enabled })
   }
 
   async function setShowNotification(enabled: boolean) {
-    await SetShowNotification(enabled)
-    showNotification.value = enabled
+    await updateSettings({ showNotification: enabled })
   }
 
   async function setAppTheme(newTheme: 'dark' | 'light') {
-    await SetTheme(newTheme)
-    theme.value = newTheme
-    document.documentElement.setAttribute('data-theme', newTheme)
+    await updateSettings({ theme: newTheme })
   }
 
   async function setAppLanguage(newLang: 'zh-CN' | 'en-US') {
-    await SetLanguage(newLang)
-    language.value = newLang
+    await updateSettings({ language: newLang })
   }
 
-  async function setCloseAction(action: '' | 'exit' | 'minimize') {
-    await SetCloseAction(action)
-    closeAction.value = action
-  }
-
-  async function setDontAskOnClose(dontAsk: boolean) {
-    await SetDontAskOnClose(dontAsk)
-    dontAskOnClose.value = dontAsk
+  async function setCloseBehavior(action: '' | 'exit' | 'minimize') {
+    await updateSettings({ closeAction: action, dontAskOnClose: action !== '' })
   }
 
   async function setDontRemindCertWizard(dontRemind: boolean) {
-    await SetDontRemindCertWizard(dontRemind)
-    dontRemindCertWizard.value = dontRemind
+    await updateSettings({ dontRemindCertWizard: dontRemind })
+  }
+
+  async function setUseUpstreamProxy(enabled: boolean, upstreamProxy?: string) {
+    const patch: SettingsPatch = { useUpstreamProxy: enabled }
+    // Enabling and supplying the endpoint form one valid candidate snapshot;
+    // do not persist the boolean first and leave an impossible intermediate state.
+    if (enabled && upstreamProxy !== undefined) {
+      patch.upstreamProxy = upstreamProxy
+    }
+    await updateSettings(patch)
+  }
+
+  async function setUpstreamProxy(proxyURL: string) {
+    await updateSettings({ upstreamProxy: proxyURL })
+  }
+
+  async function setProxyDebug(enabled: boolean) {
+    await updateSettings({ proxyDebug: enabled })
   }
 
   async function requestAppClose(action: 'exit' | 'minimize') {
     await RequestClose(action)
+  }
+
+  function dismissSettingsDiagnostic() {
+    settingsDiagnostic.value = null
+  }
+
+  function dismissRestartRequirements() {
+    restartRequirements.value = []
+  }
+
+  function dismissSettingsWarning(warning: SettingsWarning) {
+    const index = settingsWarnings.value.indexOf(warning)
+    if (index === -1) return
+    settingsWarnings.value = settingsWarnings.value.filter((_, warningIndex) => warningIndex !== index)
   }
 
   return {
@@ -524,9 +930,16 @@ export const useAppStore = defineStore('app', () => {
     certInstalled,
     ffmpegAvailable,
     detectedVideos,
+    detectionRevision,
     downloads,
+    downloadStopOperations,
+    legacyDownloadNotice,
     downloadDir,
     appInfo,
+    settings,
+    settingsWarnings,
+    restartRequirements,
+    settingsDiagnostic,
     loading,
     firstRunComplete,
     minimizeToTray,
@@ -553,6 +966,7 @@ export const useAppStore = defineStore('app', () => {
     downloadDetectedVideo,
     pauseDownloadTask,
     resumeDownloadTask,
+    retryDownloadTask,
     cancelDownloadTask,
     removeDownloadTask,
     selectFolder,
@@ -563,9 +977,15 @@ export const useAppStore = defineStore('app', () => {
     setShowNotification,
     setAppTheme,
     setAppLanguage,
-    setCloseAction,
-    setDontAskOnClose,
+    setCloseBehavior,
     setDontRemindCertWizard,
+    setUseUpstreamProxy,
+    setUpstreamProxy,
+    setProxyDebug,
+    updateSettings,
+    dismissSettingsDiagnostic,
+    dismissRestartRequirements,
+    dismissSettingsWarning,
     requestAppClose
   }
 })

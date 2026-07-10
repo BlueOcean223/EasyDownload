@@ -16,9 +16,69 @@ import (
 	"sync"
 	"testing"
 
-	"EasyDownload/internal/download"
+	"EasyDownload/internal/download/fetch"
+	downloadtask "EasyDownload/internal/download/task"
 	"EasyDownload/internal/utils"
 )
+
+type testExecutionContext struct {
+	fetcher         fetch.Fetcher
+	finalPath       string
+	progressCalled  bool
+	progressMu      sync.Mutex
+	progressUpdates []downloadtask.TaskProgressUpdate
+	completedPath   string
+}
+
+func (e *testExecutionContext) Fetcher() fetch.Fetcher {
+	if e.fetcher == nil {
+		return fetch.New(nil)
+	}
+	return e.fetcher
+}
+func (*testExecutionContext) FFmpeg() downloadtask.FFmpegLocator        { return nil }
+func (*testExecutionContext) Credentials() downloadtask.CredentialStore { return nil }
+
+func (e *testExecutionContext) UpdateTaskProgress(update downloadtask.TaskProgressUpdate) error {
+	e.progressMu.Lock()
+	defer e.progressMu.Unlock()
+	e.progressCalled = true
+	e.progressUpdates = append(e.progressUpdates, update)
+	return nil
+}
+func (e *testExecutionContext) RecordArtifact(downloadtask.TaskArtifact) error {
+	return nil
+}
+func (e *testExecutionContext) RecordPostPublishCleanupFailure(downloadtask.TaskArtifact) error {
+	return nil
+}
+func (e *testExecutionContext) RecordCheckpoint(downloadtask.PlatformCheckpointEnvelope) error {
+	return nil
+}
+func (e *testExecutionContext) PublishFinal(_ context.Context, temporaryPath string, draft downloadtask.TaskArtifactDraft) (downloadtask.TaskArtifact, error) {
+	target := e.finalPath
+	if target == "" {
+		target = temporaryPath
+	}
+	if target != temporaryPath {
+		if err := os.Rename(temporaryPath, target); err != nil {
+			return downloadtask.TaskArtifact{}, err
+		}
+	}
+	e.completedPath = target
+	return downloadtask.TaskArtifact{Kind: downloadtask.TaskArtifactFinal, Path: target, Size: draft.Size, MediaType: draft.MediaType, Primary: draft.Primary}, nil
+}
+
+func TestDouyinExpiredResourceReturnsStructuredPlatformError(t *testing.T) {
+	err := douyinExecutionError(&fetch.Error{Kind: fetch.ErrorStatusCode, StatusCode: http.StatusForbidden})
+	var taskErr *downloadtask.TaskError
+	if !errors.As(err, &taskErr) {
+		t.Fatalf("expected structured task error, got %T", err)
+	}
+	if taskErr.Code != "douyin.resource_expired" || taskErr.UserAction != "refresh_source" {
+		t.Fatalf("unexpected task error: %+v", taskErr)
+	}
+}
 
 func TestDownloadVideoSuccess(t *testing.T) {
 	data := []byte("video-data-123")
@@ -40,6 +100,7 @@ func TestDownloadVideoSuccess(t *testing.T) {
 
 	dl := NewDownloader()
 	dl.httpClient = ts.Client()
+	dl.fetcher = fetch.New(ts.Client())
 
 	dest := filepath.Join(t.TempDir(), "video.mp4")
 	var progress []float64
@@ -92,6 +153,7 @@ func TestDownloadVideoForbidden(t *testing.T) {
 
 	dl := NewDownloader()
 	dl.httpClient = ts.Client()
+	dl.fetcher = fetch.New(ts.Client())
 
 	dest := filepath.Join(t.TempDir(), "video.mp4")
 	if err := dl.DownloadVideo(item, "any", dest, nil); err == nil {
@@ -141,6 +203,7 @@ func TestDownloadAlbumZipAndRetry(t *testing.T) {
 
 	dl := NewDownloader()
 	dl.httpClient = ts.Client()
+	dl.fetcher = fetch.New(ts.Client())
 
 	dest := filepath.Join(t.TempDir(), "album.zip")
 	var progress []float64
@@ -188,7 +251,7 @@ func TestDownloadAlbumNoImages(t *testing.T) {
 	}
 }
 
-func TestBuildDownloadFuncVideo(t *testing.T) {
+func TestAdapterRunTaskVideo(t *testing.T) {
 	data := []byte("hello")
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
@@ -205,30 +268,31 @@ func TestBuildDownloadFuncVideo(t *testing.T) {
 
 	dl := NewDownloader()
 	dl.httpClient = ts.Client()
+	dl.fetcher = fetch.New(ts.Client())
 
 	destDir := t.TempDir()
-	fn := dl.BuildDownloadFunc(item, "720p", destDir)
-
-	var progressCalled bool
-	var completedPath string
-	err := fn(context.Background(), &downloader.DownloadTask{}, func(d, total int64) {
-		progressCalled = true
-		if total == 0 {
-			t.Fatalf("expected non-zero total")
-		}
-	}, func(path string) {
-		completedPath = path
-	})
+	platformData, err := MarshalTaskData(item, "720p", nil, false)
 	if err != nil {
-		t.Fatalf("download func error: %v", err)
+		t.Fatal(err)
 	}
-	if !progressCalled {
+	finalPath := filepath.Join(destDir, "video.mp4")
+	execution := &testExecutionContext{fetcher: fetch.New(ts.Client()), finalPath: finalPath}
+	err = NewAdapter(dl).RunTask(context.Background(), downloadtask.TaskSnapshot{
+		PlatformDataVersion: downloadtask.CurrentPlatformDataVersion,
+		ID:                  "douyin-test",
+		OutputPolicy:        downloadtask.OutputPolicy{PlannedFinalPath: finalPath},
+		PlatformData:        platformData,
+	}, execution)
+	if err != nil {
+		t.Fatalf("adapter run error: %v", err)
+	}
+	if !execution.progressCalled {
 		t.Fatal("expected progress callback")
 	}
-	if completedPath == "" {
-		t.Fatal("expected onComplete callback")
+	if execution.completedPath == "" {
+		t.Fatal("expected completion callback")
 	}
-	info, err := os.Stat(completedPath)
+	info, err := os.Stat(execution.completedPath)
 	if err != nil || info.Size() == 0 {
 		t.Fatalf("expected output file, got err=%v size=%d", err, info.Size())
 	}
@@ -374,7 +438,7 @@ func TestImageFileNameWithExt(t *testing.T) {
 	}
 }
 
-func TestBuildDownloadFuncAlbum(t *testing.T) {
+func TestAdapterRunTaskAlbum(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("image-data"))
 	}))
@@ -387,23 +451,45 @@ func TestBuildDownloadFuncAlbum(t *testing.T) {
 
 	dl := NewDownloader()
 	dl.httpClient = ts.Client()
+	dl.fetcher = fetch.New(ts.Client())
 
 	destDir := t.TempDir()
-	fn := dl.BuildDownloadFunc(item, "", destDir)
-
-	var completedPath string
-	err := fn(context.Background(), &downloader.DownloadTask{}, nil, func(path string) {
-		completedPath = path
-	})
+	platformData, err := MarshalTaskData(item, "", nil, false)
 	if err != nil {
-		t.Fatalf("download func error: %v", err)
+		t.Fatal(err)
 	}
-	if !strings.HasSuffix(completedPath, ".zip") {
-		t.Fatalf("expected .zip extension, got %s", completedPath)
+	finalPath := filepath.Join(destDir, "album.zip")
+	execution := &testExecutionContext{fetcher: fetch.New(ts.Client()), finalPath: finalPath}
+	err = NewAdapter(dl).RunTask(context.Background(), downloadtask.TaskSnapshot{
+		PlatformDataVersion: downloadtask.CurrentPlatformDataVersion,
+		ID:                  "douyin-album-test",
+		OutputPolicy:        downloadtask.OutputPolicy{PlannedFinalPath: finalPath},
+		PlatformData:        platformData,
+	}, execution)
+	if err != nil {
+		t.Fatalf("adapter run error: %v", err)
+	}
+	if !strings.HasSuffix(execution.completedPath, ".zip") {
+		t.Fatalf("expected .zip extension, got %s", execution.completedPath)
+	}
+	execution.progressMu.Lock()
+	updates := append([]downloadtask.TaskProgressUpdate(nil), execution.progressUpdates...)
+	execution.progressMu.Unlock()
+	var sawExplicitPercent, sawByteOnlyUpdate bool
+	for _, update := range updates {
+		if update.StagePercent != nil {
+			sawExplicitPercent = true
+		}
+		if (update.BytesLoaded > 0 || update.BytesTotal > 0) && update.StagePercent == nil {
+			sawByteOnlyUpdate = true
+		}
+	}
+	if !sawExplicitPercent || !sawByteOnlyUpdate {
+		t.Fatalf("album progress must distinguish percent and byte-only updates: %+v", updates)
 	}
 }
 
-func TestBuildDownloadFuncWithFilePath(t *testing.T) {
+func TestAdapterRunTaskWithFilePath(t *testing.T) {
 	data := []byte("hello")
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
@@ -418,20 +504,26 @@ func TestBuildDownloadFuncWithFilePath(t *testing.T) {
 
 	dl := NewDownloader()
 	dl.httpClient = ts.Client()
+	dl.fetcher = fetch.New(ts.Client())
 
 	destDir := t.TempDir()
-	customPath := filepath.Join(destDir, "custom_video")
-	fn := dl.BuildDownloadFunc(item, "720p", destDir)
-
-	var completedPath string
-	err := fn(context.Background(), &downloader.DownloadTask{FilePath: customPath}, nil, func(path string) {
-		completedPath = path
-	})
+	customPath := filepath.Join(destDir, "custom_video.mp4")
+	platformData, err := MarshalTaskData(item, "720p", nil, false)
 	if err != nil {
-		t.Fatalf("download func error: %v", err)
+		t.Fatal(err)
 	}
-	if completedPath != customPath+".mp4" {
-		t.Fatalf("expected custom path with .mp4, got %s", completedPath)
+	execution := &testExecutionContext{fetcher: fetch.New(ts.Client()), finalPath: customPath}
+	err = NewAdapter(dl).RunTask(context.Background(), downloadtask.TaskSnapshot{
+		PlatformDataVersion: downloadtask.CurrentPlatformDataVersion,
+		ID:                  "douyin-filepath-test",
+		OutputPolicy:        downloadtask.OutputPolicy{PlannedFinalPath: customPath},
+		PlatformData:        platformData,
+	}, execution)
+	if err != nil {
+		t.Fatalf("adapter run error: %v", err)
+	}
+	if execution.completedPath != customPath {
+		t.Fatalf("expected custom path with .mp4, got %s", execution.completedPath)
 	}
 }
 
@@ -448,6 +540,7 @@ func TestDownloadVideoTooManyRequests(t *testing.T) {
 
 	dl := NewDownloader()
 	dl.httpClient = ts.Client()
+	dl.fetcher = fetch.New(ts.Client())
 
 	err := dl.DownloadVideo(item, "any", filepath.Join(t.TempDir(), "video.mp4"), nil)
 	if err == nil {
@@ -468,6 +561,7 @@ func TestDownloadVideoUnexpectedStatus(t *testing.T) {
 
 	dl := NewDownloader()
 	dl.httpClient = ts.Client()
+	dl.fetcher = fetch.New(ts.Client())
 
 	err := dl.DownloadVideo(item, "any", filepath.Join(t.TempDir(), "video.mp4"), nil)
 	if err == nil {
@@ -505,6 +599,7 @@ func TestDownloadAlbumPartial_Success(t *testing.T) {
 
 		dl := NewDownloader()
 		dl.httpClient = ts.Client()
+		dl.fetcher = fetch.New(ts.Client())
 
 		dest := filepath.Join(t.TempDir(), "album_partial.zip")
 		var progress []float64
@@ -569,6 +664,7 @@ func TestDownloadAlbumPartial_EmptyIndices(t *testing.T) {
 
 		dl := NewDownloader()
 		dl.httpClient = ts.Client()
+		dl.fetcher = fetch.New(ts.Client())
 
 		dest := filepath.Join(t.TempDir(), "album_partial.zip")
 		err := downloadAlbumPartialVariant(dl, item, []int{}, dest, nil, withCtx)
@@ -603,6 +699,7 @@ func TestDownloadAlbumPartial_IndexOutOfRange(t *testing.T) {
 
 		dl := NewDownloader()
 		dl.httpClient = ts.Client()
+		dl.fetcher = fetch.New(ts.Client())
 
 		dest := filepath.Join(t.TempDir(), "album_partial.zip")
 		err := downloadAlbumPartialVariant(dl, item, []int{2}, dest, nil, withCtx)
@@ -639,6 +736,7 @@ func TestDownloadAlbumPartial_SingleImage(t *testing.T) {
 
 		dl := NewDownloader()
 		dl.httpClient = ts.Client()
+		dl.fetcher = fetch.New(ts.Client())
 
 		dest := filepath.Join(t.TempDir(), "album_partial.zip")
 		err := downloadAlbumPartialVariant(dl, item, []int{0}, dest, nil, withCtx)
@@ -696,6 +794,7 @@ func TestDownloadAlbumPartial_DuplicateIndices(t *testing.T) {
 
 		dl := NewDownloader()
 		dl.httpClient = ts.Client()
+		dl.fetcher = fetch.New(ts.Client())
 
 		dest := filepath.Join(t.TempDir(), "album_partial.zip")
 		err := downloadAlbumPartialVariant(dl, item, []int{0, 0, 1}, dest, nil, withCtx)
@@ -851,25 +950,5 @@ func TestEffectiveHeadersCustom(t *testing.T) {
 	}
 	if headers["Referer"] != "https://custom.com/" {
 		t.Fatalf("expected custom referer, got %s", headers["Referer"])
-	}
-}
-
-func TestTotalSizeFromContentRange(t *testing.T) {
-	tests := []struct {
-		input    string
-		expected int64
-	}{
-		{"bytes 0-99/1000", 1000},
-		{"bytes 0-99/*", 0},
-		{"", 0},
-		{"invalid", 0},
-		{"bytes 0-99/abc", 0},
-		{"bytes 0-99/-1", 0},
-	}
-	for _, tc := range tests {
-		got := downloader.TotalSizeFromContentRange(tc.input)
-		if got != tc.expected {
-			t.Errorf("TotalSizeFromContentRange(%q) = %d, want %d", tc.input, got, tc.expected)
-		}
 	}
 }

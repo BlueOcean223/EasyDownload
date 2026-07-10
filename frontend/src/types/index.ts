@@ -1,60 +1,157 @@
-// Video specification for a specific quality (WeChat)
-export interface VideoSpec {
-  fileFormat: string
-  width: number
-  height: number
-  durationMs: number
+export interface DetectedResource {
+  id: string
+  label: string
+  mimeType?: string
+  quality?: string
+  fileFormat?: string
+  width?: number
+  height?: number
+  durationMs?: number
+  sizeBytes?: number
+  encrypted?: boolean
+  default?: boolean
 }
 
-// Video detected by proxy/sniffer
+export type DetectionChangeType = 'inserted' | 'updated' | 'removed' | 'cleared'
+
+// Backend-owned detected-media domain model. Identity and merge semantics live
+// in internal/detection; the frontend only renders authoritative snapshots.
 export interface DetectedVideo {
   id: string
+  source: string
+  platform: string
   title: string
-  cover: string
-  url: string
-  source: 'wechat' | 'bilibili'
-  quality: string
-  duration: number
-  author: string
-  authorAvatar?: string  // Author avatar URL
-  timestamp: number
-  decodeKey?: string  // Decryption key for WeChat videos
-  fileSize?: number   // File size in bytes
-  width?: number      // Video width in pixels
-  height?: number     // Video height in pixels
-  isCurrentVideo?: boolean
-  fileFormats?: string[]  // Available quality formats (e.g., 'mp4_720p', 'mp4_1080p')
-  specs?: VideoSpec[]     // Detailed spec info for each quality
+  author?: string
+  pageUrl?: string
+  coverUrl?: string
+  candidates: DetectedResource[]
+  detectedAt: string
+  lastSeenAt: string
+  authorAvatar?: string
+  durationMs?: number
+  width?: number
+  height?: number
+  isCurrent?: boolean
+}
+
+export interface DetectionSnapshot {
+  revision: number
+  videos: DetectedVideo[]
+}
+
+export interface DetectionChange {
+  type: DetectionChangeType
+  changedId?: string
+  snapshot: DetectionSnapshot
 }
 
 // Download task status
-export type DownloadStatus = 'pending' | 'downloading' | 'retrying' | 'paused' | 'completed' | 'failed' | 'cancelled'
+export type DownloadStatus = 'pending' | 'running' | 'paused' | 'completed' | 'failed' | 'canceled'
 
-// Download task
+export interface OutputPolicy {
+  directory: string
+  plannedFilename: string
+  plannedFinalPath: string
+  conflictStrategy: 'auto_rename'
+}
+
+export interface TaskProgressSummary {
+  percent: number
+  bytesLoaded?: number
+  bytesTotal?: number
+  currentStage?: string
+  stageLabel?: string
+  itemsDone?: number
+  itemsTotal?: number
+}
+
+export interface TaskArtifact {
+  id?: string
+  kind: 'final' | 'temporary'
+  path: string
+  fileName?: string
+  mediaType?: string
+  size?: number
+  primary?: boolean
+  createdAt?: number
+  cleanupFailed?: boolean
+}
+
+export interface TaskError {
+  code: string
+  category: 'transport' | 'platform' | 'output' | 'canceled' | 'unexpected'
+  message: string
+  retryable: boolean
+  userAction?: string
+  cause?: string
+  metadata?: Record<string, string>
+}
+
+// Secret-free task projection returned by the backend. Platform execution
+// inputs (URLs, headers, credentials, decode keys and checkpoints) never cross
+// the Wails boundary.
 export interface DownloadTask {
   id: string
-  url: string
+  instance: number
+  generation: number
+  revision: number
+  platformId?: string
   title: string
   cover: string
-  source: string
-  quality: string
-  filePath: string
-  fileName: string
-  fileSize: number
-  downloaded: number
-  progress: number
+  displaySource?: string
+  outputPolicy: OutputPolicy
+  progressSummary: TaskProgressSummary
+  artifacts?: TaskArtifact[]
   speed: number
   status: DownloadStatus
   error: string
-  retryCount?: number
-  maxRetry?: number
   lastError?: string
+  lastErrorDetail?: TaskError
   createdAt: number
   completedAt: number
-  // Album fields (for Douyin albums)
-  isAlbum?: boolean
-  albumTotal?: number
-  albumCompleted?: number
+  executionState?: 'running' | 'publishing' | 'stopping' | 'finished' | string
+}
+
+export type DownloadStopReason = 'pause' | 'cancel' | 'shutdown' | 'failure' | 'task_removal'
+
+export interface DownloadStopReceipt {
+  accepted: boolean
+  operationId: string
+  taskId: string
+  requestedReason: DownloadStopReason
+  effectiveReason: DownloadStopReason
+  executionState: string
+  revision: number
+  taskInstance: number
+  taskGeneration: number
+  taskRevision: number
+  error?: TaskError
+}
+
+export interface DownloadLifecycleEvent {
+  operationId: string
+  taskId: string
+  phase: 'stopping' | 'completed' | 'failed'
+  effectiveReason: DownloadStopReason
+  resultStatus?: DownloadStatus
+  removed?: boolean
+  error?: TaskError
+  revision: number
+  taskInstance: number
+  taskGeneration: number
+  taskRevision: number
+  task?: DownloadTask
+  occurredAt: number
+}
+
+export interface LegacyDownloadNotice {
+  code: string
+  legacyPath: string
+  v2Path: string
+  imported: boolean
+  preserved: boolean
+  rollbackAvailable: boolean
+  message: string
 }
 
 // Bilibili video stream
@@ -81,7 +178,6 @@ export interface BilibiliQRCode {
 export interface BilibiliLoginStatus {
   code: number    // 0=success, 86038=expired, 86090=scanned waiting, 86101=not scanned
   message: string
-  sessData: string
 }
 
 // Bilibili user info
@@ -132,27 +228,76 @@ export interface BilibiliVideo {
   currentPartIndex?: number
 }
 
-// App info
-export interface AppInfo {
+// Runtime metadata. User settings are intentionally not duplicated here.
+export interface AppRuntimeInfo {
   version: string
-  proxyPort: number
   apiPort: number
   apiToken?: string
-  downloadDir: string
   ffmpegPath?: string
-  certPath: string
+  certPath?: string
+  certInstalled: boolean
+  ffmpegAvailable: boolean
+}
+
+export interface SettingsSnapshot {
+  proxyPort: number
+  apiPort: number
+  downloadDir: string
+  maxConcurrent: number
   minimizeToTray: boolean
   showNotification: boolean
   firstRunComplete: boolean
-  dontRemindCertWizard?: boolean
+  closeAction: '' | 'exit' | 'minimize'
+  dontAskOnClose: boolean
+  theme: 'dark' | 'light'
+  language: 'zh-CN' | 'en-US'
+  upstreamProxy: string
+  useUpstreamProxy: boolean
+  proxyDebug: boolean
+  dontRemindCertWizard: boolean
+}
+
+export interface SettingsPatch {
+  proxyPort?: number
+  apiPort?: number
+  downloadDir?: string
+  maxConcurrent?: number
+  minimizeToTray?: boolean
+  showNotification?: boolean
+  firstRunComplete?: boolean
+  closeAction?: '' | 'exit' | 'minimize'
+  dontAskOnClose?: boolean
   theme?: 'dark' | 'light'
   language?: 'zh-CN' | 'en-US'
   upstreamProxy?: string
   useUpstreamProxy?: boolean
   proxyDebug?: boolean
-  closeAction?: '' | 'exit' | 'minimize'
-  dontAskOnClose?: boolean
-  wechatNoMITM?: boolean
+  dontRemindCertWizard?: boolean
+}
+
+export interface SettingsWarning {
+  code: string
+  effect?: string
+  message: string
+}
+
+export interface RestartRequirement {
+  scope: 'app' | 'proxy'
+  fields: string[]
+  reason: string
+}
+
+export interface SettingsUpdateResult {
+  settings: SettingsSnapshot
+  warnings?: SettingsWarning[]
+  restartRequired: boolean
+  restartRequirements?: RestartRequirement[]
+}
+
+export interface SettingsDiagnostic {
+  code: 'settings.inconsistent' | string
+  message: string
+  rollbackErrors?: string[]
 }
 
 // App status

@@ -25,27 +25,6 @@ import (
 	"github.com/elazarl/goproxy"
 )
 
-// VideoInfo represents detected video information
-type VideoInfo struct {
-	ID           string             `json:"id"`
-	Title        string             `json:"title"`
-	Cover        string             `json:"cover"`
-	URL          string             `json:"url"`
-	Source       string             `json:"source"` // "wechat" or "bilibili"
-	Quality      string             `json:"quality"`
-	Duration     int                `json:"duration"`
-	Author       string             `json:"author"`
-	AuthorAvatar string             `json:"authorAvatar"`
-	Timestamp    int64              `json:"timestamp"`
-	DecodeKey    string             `json:"decodeKey"` // Decryption key for WeChat videos
-	FileSize     float64            `json:"fileSize"`  // File size in bytes
-	Width        int                `json:"width"`
-	Height       int                `json:"height"`
-	IsCurrent    bool               `json:"isCurrentVideo"`
-	FileFormats  []string           `json:"fileFormats"` // Available quality formats
-	Specs        []wechat.VideoSpec `json:"specs"`       // Detailed spec info for each quality
-}
-
 // ProxyServer represents the MITM proxy server using goproxy
 type ProxyServer struct {
 	proxy       *goproxy.ProxyHttpServer
@@ -56,13 +35,13 @@ type ProxyServer struct {
 	mu          sync.RWMutex
 
 	// Callback for detected videos
-	onVideoDetected func(VideoInfo)
+	onVideoDetected func(wechat.VideoInfo)
 
 	// Upstream proxy support
 	upstreamProxy string
 
 	// Diagnostics
-	debug bool
+	debug atomic.Bool
 
 	// WeChat video capture components
 	jsInjector    *JSInjector
@@ -84,29 +63,11 @@ func NewProxyServer(certManager *CertManager, port int) *ProxyServer {
 	ps.jsInjector = NewJSInjector()
 	ps.wechatHandler = wechat.NewHandler()
 
-	// Set up WeChat handler callback to convert to VideoInfo
+	// Forward the boundary model to the composition root. It is converted to
+	// detection.Video before entering the DetectionStore.
 	ps.wechatHandler.SetVideoCallback(func(info wechat.VideoInfo) {
-		if ps.onVideoDetected != nil {
-			videoInfo := VideoInfo{
-				ID:           info.ID,
-				Title:        info.Title,
-				Cover:        info.CoverURL,
-				URL:          info.URL,
-				Source:       "wechat",
-				Duration:     info.Duration,
-				Author:       info.Author,
-				AuthorAvatar: info.AuthorAvatar,
-				// Frontend expects milliseconds
-				Timestamp:   time.Now().UnixMilli(),
-				DecodeKey:   info.DecodeKey,
-				FileSize:    info.FileSize,
-				Width:       info.Width,
-				Height:      info.Height,
-				IsCurrent:   info.IsCurrentVideo,
-				FileFormats: info.FileFormats,
-				Specs:       info.Specs,
-			}
-			ps.onVideoDetected(videoInfo)
+		if callback := ps.videoCallback(); callback != nil {
+			callback(info)
 		}
 	})
 
@@ -114,8 +75,17 @@ func NewProxyServer(certManager *CertManager, port int) *ProxyServer {
 }
 
 // SetVideoCallback sets the callback function for detected videos
-func (ps *ProxyServer) SetVideoCallback(callback func(VideoInfo)) {
+func (ps *ProxyServer) SetVideoCallback(callback func(wechat.VideoInfo)) {
+	ps.mu.Lock()
 	ps.onVideoDetected = callback
+	ps.mu.Unlock()
+}
+
+func (ps *ProxyServer) videoCallback() func(wechat.VideoInfo) {
+	ps.mu.RLock()
+	callback := ps.onVideoDetected
+	ps.mu.RUnlock()
+	return callback
 }
 
 // SetUpstreamProxy sets the upstream proxy URL for proxy chaining.
@@ -135,7 +105,7 @@ func (ps *ProxyServer) SetUpstreamProxy(proxyURL string) {
 
 // SetDebug enables/disables verbose proxy diagnostics logging.
 func (ps *ProxyServer) SetDebug(enabled bool) {
-	ps.debug = enabled
+	ps.debug.Store(enabled)
 }
 
 // setupTransport configures the HTTP transport with optimized settings.
@@ -275,8 +245,26 @@ func (ps *ProxyServer) IsRunning() bool {
 	return ps.running
 }
 
+// SetPort updates the port used by the next Start. Changing a live listener is
+// deliberately rejected; callers can persist the setting and apply it after
+// Stop instead of creating a second listener or an ambiguous partial switch.
+func (ps *ProxyServer) SetPort(port int) error {
+	if port < 1 || port > 65535 {
+		return fmt.Errorf("proxy port must be between 1 and 65535")
+	}
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	if ps.running && port != ps.port {
+		return fmt.Errorf("cannot change proxy port while proxy is running")
+	}
+	ps.port = port
+	return nil
+}
+
 // GetPort returns the proxy port
 func (ps *ProxyServer) GetPort() int {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
 	return ps.port
 }
 
@@ -347,12 +335,12 @@ func (ps *ProxyServer) setupHandlers() {
 	// breaking unrelated traffic and to keep the privacy boundary narrow.
 	ps.proxy.OnRequest().HandleConnectFunc(func(host string, ctx *goproxy.ProxyCtx) (*goproxy.ConnectAction, string) {
 		if shouldMITMHost(host) {
-			if ps.debug {
+			if ps.debug.Load() {
 				logger.Info("[proxy-debug] CONNECT MITM: %s", host)
 			}
 			return goproxy.MitmConnect, host
 		}
-		if ps.debug {
+		if ps.debug.Load() {
 			logger.Info("[proxy-debug] CONNECT pass-through (outside MITM allowlist): %s", host)
 		}
 		return goproxy.OkConnect, host
@@ -449,7 +437,7 @@ func (ps *ProxyServer) setupWeChatHandlers() {
 // handleWeChatReportRequest logs request bodies for /web/report-error and /web/report-perf
 // to help diagnose why the Channels page fails under MITM.
 func (ps *ProxyServer) handleWeChatReportRequest(r *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
-	if !ps.debug || r == nil {
+	if !ps.debug.Load() || r == nil {
 		return r, nil
 	}
 	if !strings.Contains(r.URL.Path, "/web/report-") {
@@ -518,7 +506,7 @@ func (ps *ProxyServer) handleWeChatAPIRequest(r *http.Request, ctx *goproxy.Prox
 	}
 	r.Body.Close()
 
-	if ps.debug {
+	if ps.debug.Load() {
 		// Avoid dumping huge bodies; keep first 2KB
 		const maxLog = 2 * 1024
 		logBody := body
@@ -540,7 +528,7 @@ func (ps *ProxyServer) handleWeChatAPIRequest(r *http.Request, ctx *goproxy.Prox
 
 	// Heartbeat from injected scripts to help diagnose whether script is running at all.
 	if reqType == "ping" {
-		if ps.debug {
+		if ps.debug.Load() {
 			logger.Info("[proxy-debug] WECHAT_PING host=%q len=%d", r.Host, len(body))
 		}
 		return r, goproxy.NewResponse(r, goproxy.ContentTypeText, http.StatusOK, "OK")
@@ -549,7 +537,7 @@ func (ps *ProxyServer) handleWeChatAPIRequest(r *http.Request, ctx *goproxy.Prox
 	// Low-frequency trace from injected scripts (throttled on client side).
 	// Useful to confirm whether injected hooks are being executed and what they see.
 	if reqType == "trace" {
-		if ps.debug {
+		if ps.debug.Load() {
 			logger.Info("[proxy-debug] WECHAT_TRACE host=%q len=%d body=%s", r.Host, len(body), string(body))
 		}
 		return r, goproxy.NewResponse(r, goproxy.ContentTypeText, http.StatusOK, "OK")
@@ -574,14 +562,14 @@ func (ps *ProxyServer) handleWeChatJSResponse(resp *http.Response, ctx *goproxy.
 	}
 
 	requestPath := ctx.Req.URL.String()
-	if ps.debug {
+	if ps.debug.Load() {
 		logger.Info("[proxy-debug] RESP res.wx.qq.com %s status=%d enc=%q ct=%q", requestPath, resp.StatusCode, resp.Header.Get("Content-Encoding"), resp.Header.Get("Content-Type"))
 	}
 
 	contentType := resp.Header.Get("Content-Type")
 	// Only process JavaScript files
 	if !strings.Contains(contentType, "javascript") && !strings.Contains(contentType, "text/plain") {
-		if ps.debug {
+		if ps.debug.Load() {
 			logger.Info("[proxy-debug] SKIP js (content-type): %s ct=%q", requestPath, contentType)
 		}
 		return resp
@@ -598,7 +586,7 @@ func (ps *ProxyServer) handleWeChatJSResponse(resp *http.Response, ctx *goproxy.
 	decodedBody, decoded, derr := decodeBodyBytes(rawBody, encoding)
 	if derr != nil {
 		// Can't inspect/modify; keep original body/headers intact
-		if ps.debug {
+		if ps.debug.Load() {
 			logger.Info("[proxy-debug] SKIP js (decode failed enc=%q): %s", encoding, requestPath)
 		}
 		return resp
@@ -616,7 +604,7 @@ func (ps *ProxyServer) handleWeChatJSResponse(resp *http.Response, ctx *goproxy.
 	hasCandidate := strings.Contains(jsContent, "finderGetCommentDetail") || strings.Contains(jsContent, "get media")
 
 	if !isTargetFile && !(isFinderBundle && hasCandidate) {
-		if ps.debug {
+		if ps.debug.Load() {
 			logger.Info("[proxy-debug] SKIP js (pass-through): %s", requestPath)
 		}
 		return resp
@@ -625,7 +613,7 @@ func (ps *ProxyServer) handleWeChatJSResponse(resp *http.Response, ctx *goproxy.
 	// Enforce injection budget for non-target bundles to avoid reintroducing playback issues.
 	const maxWeChatJSInjections = int32(4)
 	if !isTargetFile && atomic.LoadInt32(&ps.wechatJSInjected) >= maxWeChatJSInjections {
-		if ps.debug {
+		if ps.debug.Load() {
 			logger.Info("[proxy-debug] SKIP js (budget reached %d): %s", maxWeChatJSInjections, requestPath)
 		}
 		return resp
@@ -634,7 +622,7 @@ func (ps *ProxyServer) handleWeChatJSResponse(resp *http.Response, ctx *goproxy.
 	modifiedJS := ps.jsInjector.InjectAll(jsContent)
 	if modifiedJS == jsContent {
 		// No changes (regex didn't match); keep original bytes/headers
-		if ps.debug {
+		if ps.debug.Load() {
 			logger.Info("[proxy-debug] SKIP js (no injection match): %s", requestPath)
 		}
 		return resp
@@ -654,7 +642,7 @@ func (ps *ProxyServer) handleWeChatJSResponse(resp *http.Response, ctx *goproxy.
 	if decoded || strings.TrimSpace(resp.Header.Get("Content-Encoding")) != "" {
 		resp.Header.Del("Content-Encoding")
 	}
-	if ps.debug {
+	if ps.debug.Load() {
 		logger.Info("[proxy-debug] REWRITE js done: %s decoded=%v in=%d out=%d", requestPath, decoded, len(jsContent), len(modifiedBody))
 	}
 
@@ -703,12 +691,12 @@ func (ps *ProxyServer) handleWeChatHTMLResponse(resp *http.Response, ctx *goprox
 	}
 
 	contentType := resp.Header.Get("Content-Type")
-	if ps.debug && ctx != nil && ctx.Req != nil {
+	if ps.debug.Load() && ctx != nil && ctx.Req != nil {
 		logger.Info("[proxy-debug] RESP channels.weixin.qq.com %s status=%d enc=%q ct=%q", ctx.Req.URL.String(), resp.StatusCode, resp.Header.Get("Content-Encoding"), contentType)
 	}
 	// Only process HTML responses
 	if !strings.Contains(contentType, "text/html") {
-		if ps.debug && ctx != nil && ctx.Req != nil {
+		if ps.debug.Load() && ctx != nil && ctx.Req != nil {
 			logger.Info("[proxy-debug] SKIP html (content-type): %s ct=%q", ctx.Req.URL.String(), contentType)
 		}
 		return resp
@@ -725,14 +713,14 @@ func (ps *ProxyServer) handleWeChatHTMLResponse(resp *http.Response, ctx *goprox
 	encoding := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding")))
 	body, decoded, err := decodeBodyBytes(rawBody, encoding)
 	if err != nil {
-		if ps.debug && ctx != nil && ctx.Req != nil {
+		if ps.debug.Load() && ctx != nil && ctx.Req != nil {
 			logger.Info("[proxy-debug] SKIP html (decode failed enc=%q): %s", resp.Header.Get("Content-Encoding"), ctx.Req.URL.String())
 		}
 		return resp
 	}
 	// If Content-Encoding exists but we didn't decode it, do NOT modify this response.
 	if !decoded && encoding != "" {
-		if ps.debug && ctx != nil && ctx.Req != nil {
+		if ps.debug.Load() && ctx != nil && ctx.Req != nil {
 			logger.Info("[proxy-debug] SKIP html (cannot decode enc=%q): %s", resp.Header.Get("Content-Encoding"), ctx.Req.URL.String())
 		}
 		return resp
@@ -754,7 +742,7 @@ func (ps *ProxyServer) handleWeChatHTMLResponse(resp *http.Response, ctx *goprox
 	if decoded {
 		resp.Header.Del("Content-Encoding")
 	}
-	if ps.debug && ctx != nil && ctx.Req != nil {
+	if ps.debug.Load() && ctx != nil && ctx.Req != nil {
 		logger.Info("[proxy-debug] REWRITE html done: %s decoded=%v out=%d", ctx.Req.URL.String(), decoded, len(modifiedBody))
 	}
 

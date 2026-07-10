@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, watch } from 'vue'
 import { useAppStore } from '@/stores/app'
 import {
   NCard, NButton, NInput, NSpace, NTag,
@@ -22,12 +22,6 @@ import {
   GetLogDir,
   GetLogSize,
   ClearLogs,
-  GetUpstreamProxy,
-  SetUpstreamProxy,
-  SetUseUpstreamProxy,
-  GetProxyDebug,
-  SetProxyDebug,
-  GetCloseAction,
   CanRestartAsAdmin,
   IsAdmin,
   RestartAsAdmin
@@ -57,6 +51,23 @@ const restarting = ref(false)
 const adminDialogAction = ref<'install' | 'uninstall'>('install')
 const platform = ref('')
 const canInstallFFmpeg = computed(() => platform.value === 'darwin')
+const restartRequirementText = computed(() => store.restartRequirements
+  .map(requirement => `${requirement.fields.join('、')}: ${requirement.reason}`)
+  .join('；'))
+let lastSyncedUpstreamProxy = ''
+
+watch(() => store.settings, snapshot => {
+  if (!snapshot) return
+  // Do not overwrite an in-progress free-text edit when the asynchronous
+  // initial/settings snapshot arrives. Select/switch values can safely follow
+  // the authoritative snapshot directly.
+  if (upstreamProxyInput.value === lastSyncedUpstreamProxy) {
+    upstreamProxyInput.value = snapshot.upstreamProxy || ''
+  }
+  lastSyncedUpstreamProxy = snapshot.upstreamProxy || ''
+  proxyDebug.value = snapshot.proxyDebug
+  closeAction.value = snapshot.closeAction
+}, { immediate: true })
 
 const closeActionOptions = [
   { label: '每次询问', value: '' },
@@ -92,26 +103,6 @@ onMounted(async () => {
     console.error('Failed to get log size:', e)
   }
   
-  // Load upstream proxy
-  try {
-    upstreamProxyInput.value = await GetUpstreamProxy()
-  } catch (e) {
-    console.error('Failed to get upstream proxy:', e)
-  }
-
-  // Load diagnostics toggles
-  try {
-    proxyDebug.value = await GetProxyDebug()
-  } catch (e) {
-    console.error('Failed to get proxy debug:', e)
-  }
-  
-  // Load close action
-  try {
-    closeAction.value = await GetCloseAction() as '' | 'exit' | 'minimize'
-  } catch (e) {
-    console.error('Failed to get close action:', e)
-  }
 })
 
 async function installCert() {
@@ -192,7 +183,6 @@ async function installFFmpeg() {
   installingFFmpeg.value = true
   try {
     const path = await store.installFFmpeg()
-    await store.initApp()
     message.success(path ? `FFmpeg 已就绪: ${path}` : 'FFmpeg 已就绪')
   } catch (e: any) {
     message.error(getErrorMessage(e, 'FFmpeg 安装失败'))
@@ -279,10 +269,8 @@ async function toggleShowNotification(value: boolean) {
 
 async function handleCloseActionChange(action: '' | 'exit' | 'minimize') {
   try {
-    await store.setCloseAction(action)
+    await store.setCloseBehavior(action)
     closeAction.value = action
-    // If user selects a specific action, also set dontAskOnClose
-    await store.setDontAskOnClose(action !== '')
     message.success('关闭行为已更新')
   } catch (e: any) {
     message.error(e.message || '设置失败')
@@ -291,8 +279,7 @@ async function handleCloseActionChange(action: '' | 'exit' | 'minimize') {
 
 async function toggleUseUpstreamProxy(value: boolean) {
   try {
-    await SetUseUpstreamProxy(value)
-    await store.initApp() // Refresh app info
+    await store.setUseUpstreamProxy(value, upstreamProxyInput.value)
   } catch (e: any) {
     message.error(e.message || '设置失败')
   }
@@ -300,7 +287,7 @@ async function toggleUseUpstreamProxy(value: boolean) {
 
 async function toggleProxyDebug(value: boolean) {
   try {
-    await SetProxyDebug(value)
+    await store.setProxyDebug(value)
     proxyDebug.value = value
     message.success(value ? '代理调试已开启（请复现一次问题后导出日志）' : '代理调试已关闭')
   } catch (e: any) {
@@ -312,7 +299,7 @@ async function toggleProxyDebug(value: boolean) {
 
 async function saveUpstreamProxy() {
   try {
-    await SetUpstreamProxy(upstreamProxyInput.value)
+    await store.setUpstreamProxy(upstreamProxyInput.value)
     message.success('上游代理已保存')
   } catch (e: any) {
     message.error(e.message || '保存失败')
@@ -354,6 +341,37 @@ async function clearLogs() {
     <h2 class="text-xl font-semibold mb-6">设置</h2>
     
     <div class="max-w-2xl space-y-4">
+      <NAlert
+        v-if="store.settingsDiagnostic"
+        type="error"
+        title="设置回滚未完整完成"
+        closable
+        @close="store.dismissSettingsDiagnostic"
+      >
+        {{ store.settingsDiagnostic.message }}
+      </NAlert>
+
+      <NAlert
+        v-if="store.restartRequirements.length > 0"
+        type="warning"
+        title="需要重启后生效"
+        closable
+        @close="store.dismissRestartRequirements"
+      >
+        {{ restartRequirementText }}
+      </NAlert>
+
+      <NAlert
+        v-for="(warning, warningIndex) in store.settingsWarnings"
+        :key="`${warning.code}:${warning.effect || ''}:${warningIndex}`"
+        type="warning"
+        title="设置已保存，但部分同步失败"
+        closable
+        @close="store.dismissSettingsWarning(warning)"
+      >
+        {{ warning.message }}
+      </NAlert>
+
       <!-- Proxy Settings -->
       <NCard title="代理服务" :bordered="false" class="bg-secondary rounded-xl shadow-sm">
         <template #header-extra>
@@ -368,7 +386,7 @@ async function clearLogs() {
               <p class="text-sm font-medium">代理端口</p>
               <p class="text-xs text-text-secondary">MITM 代理服务监听端口</p>
             </div>
-            <span class="text-sm text-text-secondary">{{ store.appInfo?.proxyPort || 8899 }}</span>
+            <span class="text-sm text-text-secondary">{{ store.settings?.proxyPort || 8899 }}</span>
           </div>
           
           <NDivider class="my-2" />
@@ -378,7 +396,7 @@ async function clearLogs() {
               <p class="text-sm font-medium">API 端口</p>
               <p class="text-xs text-text-secondary">内部通信端口</p>
             </div>
-            <span class="text-sm text-text-secondary">{{ store.appInfo?.apiPort || 18899 }}</span>
+            <span class="text-sm text-text-secondary">{{ store.settings?.apiPort || 18899 }}</span>
           </div>
           
           <NDivider class="my-2" />
@@ -404,12 +422,12 @@ async function clearLogs() {
             <NSwitch :value="proxyDebug" @update:value="toggleProxyDebug" />
           </div>
           
-          <div v-if="store.useUpstreamProxy">
+          <div>
             <p class="text-sm font-medium mb-2">上游代理地址</p>
             <div class="flex gap-2">
               <NInput 
                 v-model:value="upstreamProxyInput"
-                placeholder="http://127.0.0.1:7890"
+                placeholder="http://127.0.0.1:7890 或 socks5://127.0.0.1:1080"
                 class="flex-1"
               />
               <NButton 

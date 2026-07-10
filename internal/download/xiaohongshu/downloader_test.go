@@ -11,12 +11,118 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
-	"EasyDownload/internal/download"
+	"EasyDownload/internal/download/fetch"
+	downloadtask "EasyDownload/internal/download/task"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+type testExecutionContext struct {
+	fetcher        fetch.Fetcher
+	finalPath      string
+	progressCalls  int64
+	lastDownloaded int64
+	lastTotal      int64
+	albumCompleted int
+	albumTotal     int
+	completedPath  string
+}
+
+type capturingXHSFetcher struct {
+	request fetch.FetchRequest
+}
+
+func (f *capturingXHSFetcher) Download(_ context.Context, request fetch.FetchRequest, _ fetch.Destination, _ fetch.ProgressReporter) (fetch.FetchResult, error) {
+	f.request = request
+	return fetch.FetchResult{}, &fetch.Error{Kind: fetch.ErrorTimeout, Err: context.DeadlineExceeded}
+}
+
+func (*capturingXHSFetcher) Probe(context.Context, fetch.ProbeRequest) (fetch.ProbeResult, error) {
+	return fetch.ProbeResult{}, nil
+}
+
+func TestXHSDownloadForwardsNoProgressTimeoutAndPreservesSentinel(t *testing.T) {
+	downloader := NewDownloader()
+	downloader.SetNoProgressTimeout(17 * time.Millisecond)
+	fetcher := &capturingXHSFetcher{}
+	_, err := downloader.downloadAlbumMedia(
+		context.Background(),
+		fetcher,
+		"https://media.example/video.mp4",
+		nil,
+		filepath.Join(t.TempDir(), "video.part"),
+		1024,
+		nil,
+	)
+	require.ErrorIs(t, err, ErrNoProgressTimeout)
+	require.Equal(t, 17*time.Millisecond, fetcher.request.NoProgressTimeout)
+}
+
+func (e *testExecutionContext) Fetcher() fetch.Fetcher {
+	if e.fetcher == nil {
+		return fetch.New(nil)
+	}
+	return e.fetcher
+}
+func (e *testExecutionContext) FFmpeg() downloadtask.FFmpegLocator        { return nil }
+func (e *testExecutionContext) Credentials() downloadtask.CredentialStore { return nil }
+func (e *testExecutionContext) UpdateTaskProgress(update downloadtask.TaskProgressUpdate) error {
+	e.progressCalls++
+	e.lastDownloaded = update.BytesLoaded
+	e.lastTotal = update.BytesTotal
+	e.albumCompleted = update.ItemsDone
+	e.albumTotal = update.ItemsTotal
+	return nil
+}
+func (e *testExecutionContext) RecordArtifact(downloadtask.TaskArtifact) error {
+	return nil
+}
+func (e *testExecutionContext) RecordPostPublishCleanupFailure(downloadtask.TaskArtifact) error {
+	return nil
+}
+func (e *testExecutionContext) RecordCheckpoint(downloadtask.PlatformCheckpointEnvelope) error {
+	return nil
+}
+func (e *testExecutionContext) PublishFinal(_ context.Context, temporaryPath string, draft downloadtask.TaskArtifactDraft) (downloadtask.TaskArtifact, error) {
+	target := e.finalPath
+	if target == "" {
+		target = temporaryPath
+	}
+	if target != temporaryPath {
+		if err := os.Rename(temporaryPath, target); err != nil {
+			return downloadtask.TaskArtifact{}, err
+		}
+	}
+	e.completedPath = target
+	return downloadtask.TaskArtifact{Kind: downloadtask.TaskArtifactFinal, Path: target, Size: draft.Size, MediaType: draft.MediaType, Primary: draft.Primary}, nil
+}
+
+func TestXHSExpiredResourceReturnsStructuredPlatformError(t *testing.T) {
+	err := xhsExecutionError(&fetch.Error{Kind: fetch.ErrorStatusCode, StatusCode: http.StatusGone})
+	var taskErr *downloadtask.TaskError
+	require.ErrorAs(t, err, &taskErr)
+	require.Equal(t, "xiaohongshu.resource_expired", taskErr.Code)
+	require.Equal(t, downloadtask.TaskErrorCategoryPlatform, taskErr.Category)
+	require.Equal(t, "refresh_source", taskErr.UserAction)
+}
+
+func runAdapterTask(t *testing.T, dl *Downloader, item *XHSItem, selectedImages []int, quality string, filePath string) *testExecutionContext {
+	t.Helper()
+	platformData, err := MarshalTaskData(item, selectedImages, quality)
+	require.NoError(t, err)
+	execution := &testExecutionContext{fetcher: fetch.New(dl.httpClient), finalPath: filePath}
+	err = NewAdapter(dl).RunTask(context.Background(), downloadtask.TaskSnapshot{
+		PlatformDataVersion: downloadtask.CurrentPlatformDataVersion,
+		ID:                  "xhs-test",
+		OutputPolicy:        downloadtask.OutputPolicy{PlannedFinalPath: filePath},
+		PlatformData:        platformData,
+	}, execution)
+	require.NoError(t, err)
+	return execution
+}
 
 func TestDownloadAlbumZip(t *testing.T) {
 	var hits1, hits2 atomic.Int32
@@ -47,26 +153,18 @@ func TestDownloadAlbumZip(t *testing.T) {
 
 	dl := NewDownloaderWithClient(ts.Client())
 	outDir := t.TempDir()
-	fn := dl.BuildDownloadFunc(item, nil, "", outDir)
-
-	task := &downloader.DownloadTask{}
-	var progressCalls int64
-	var completePath string
-	err := fn(context.Background(), task, func(downloaded, total int64) {
-		progressCalls++
-	}, func(p string) { completePath = p })
-	require.NoError(t, err)
-	require.NotEmpty(t, completePath)
+	execution := runAdapterTask(t, dl, item, nil, "", filepath.Join(outDir, "album.zip"))
+	require.NotEmpty(t, execution.completedPath)
 
 	assert.Equal(t, int32(1), hits1.Load())
 	assert.Equal(t, int32(1), hits2.Load())
 
-	zipFiles := readZipFiles(t, completePath)
+	zipFiles := readZipFiles(t, execution.completedPath)
 	assert.Len(t, zipFiles, 2)
 
-	assert.NotZero(t, progressCalls)
-	assert.Equal(t, 2, task.AlbumCompleted)
-	assert.GreaterOrEqual(t, task.Progress, 99.9)
+	assert.NotZero(t, execution.progressCalls)
+	assert.Equal(t, 2, execution.albumCompleted)
+	assert.Equal(t, 2, execution.albumTotal)
 }
 
 func TestDownloadVideoQualitySelect(t *testing.T) {
@@ -100,11 +198,7 @@ func TestDownloadVideoQualitySelect(t *testing.T) {
 
 	dl := NewDownloaderWithClient(ts.Client())
 	outDir := t.TempDir()
-	fn := dl.BuildDownloadFunc(item, nil, "hd", outDir)
-
-	task := &downloader.DownloadTask{}
-	err := fn(context.Background(), task, nil, nil)
-	require.NoError(t, err)
+	runAdapterTask(t, dl, item, nil, "hd", filepath.Join(outDir, "video.mp4"))
 
 	assert.Equal(t, int32(0), sdHits.Load())
 	assert.NotZero(t, hdHits.Load())
@@ -139,10 +233,7 @@ func TestDownloadVideoUsesBackupURL(t *testing.T) {
 
 	dl := NewDownloaderWithClient(ts.Client())
 	outDir := t.TempDir()
-	fn := dl.BuildDownloadFunc(item, nil, "hd_115", outDir)
-
-	err := fn(context.Background(), &downloader.DownloadTask{}, nil, nil)
-	require.NoError(t, err)
+	runAdapterTask(t, dl, item, nil, "hd_115", filepath.Join(outDir, "video.mp4"))
 	assert.NotZero(t, primaryHits.Load())
 	assert.Equal(t, int32(1), backupHits.Load())
 }
@@ -151,6 +242,7 @@ func TestDownloadVideoFallbackContinuesPartialFile(t *testing.T) {
 	payload := []byte("0123456789")
 	var backupRange atomic.Value
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"same-video"`)
 		switch r.URL.Path {
 		case "/v/primary.mp4":
 			w.Header().Set("Content-Length", "10")
@@ -184,14 +276,10 @@ func TestDownloadVideoFallbackContinuesPartialFile(t *testing.T) {
 
 	dl := NewDownloaderWithClient(ts.Client())
 	outDir := t.TempDir()
-	fn := dl.BuildDownloadFunc(item, nil, "hd_115", outDir)
-
-	var completePath string
-	err := fn(context.Background(), &downloader.DownloadTask{}, nil, func(p string) { completePath = p })
-	require.NoError(t, err)
+	execution := runAdapterTask(t, dl, item, nil, "hd_115", filepath.Join(outDir, "video.mp4"))
 	assert.Equal(t, "bytes=5-", backupRange.Load())
 
-	data, err := os.ReadFile(completePath)
+	data, err := os.ReadFile(execution.completedPath)
 	require.NoError(t, err)
 	assert.Equal(t, payload, data)
 }
@@ -222,15 +310,11 @@ func TestDownloadAlbumUsesImageBackupURL(t *testing.T) {
 
 	dl := NewDownloaderWithClient(ts.Client())
 	outDir := t.TempDir()
-	fn := dl.BuildDownloadFunc(item, nil, "", outDir)
-
-	var completePath string
-	err := fn(context.Background(), &downloader.DownloadTask{}, nil, func(p string) { completePath = p })
-	require.NoError(t, err)
+	execution := runAdapterTask(t, dl, item, nil, "", filepath.Join(outDir, "album.zip"))
 	assert.NotZero(t, primaryHits.Load())
 	assert.Equal(t, int32(1), backupHits.Load())
 
-	zipFiles := readZipFiles(t, completePath)
+	zipFiles := readZipFiles(t, execution.completedPath)
 	assert.Equal(t, []byte("image-backup"), zipFiles["001.jpg"])
 }
 
@@ -257,13 +341,9 @@ func TestDownloadAlbumIncludesLivePhotoVideo(t *testing.T) {
 
 	dl := NewDownloaderWithClient(ts.Client())
 	outDir := t.TempDir()
-	fn := dl.BuildDownloadFunc(item, nil, "", outDir)
+	execution := runAdapterTask(t, dl, item, nil, "", filepath.Join(outDir, "album.zip"))
 
-	var completePath string
-	err := fn(context.Background(), &downloader.DownloadTask{}, nil, func(p string) { completePath = p })
-	require.NoError(t, err)
-
-	zipFiles := readZipFiles(t, completePath)
+	zipFiles := readZipFiles(t, execution.completedPath)
 	assert.Equal(t, []byte("still"), zipFiles["001.jpg"])
 	assert.Equal(t, []byte("live-video"), zipFiles["001_live.mp4"])
 }
@@ -288,18 +368,10 @@ func TestDownloadProgressCallback(t *testing.T) {
 
 	dl := NewDownloaderWithClient(ts.Client())
 	outDir := t.TempDir()
-	fn := dl.BuildDownloadFunc(item, nil, "q", outDir)
-
-	var calls int
-	var lastDownloaded, lastTotal int64
-	err := fn(context.Background(), &downloader.DownloadTask{}, func(downloaded, total int64) {
-		calls++
-		lastDownloaded, lastTotal = downloaded, total
-	}, nil)
-	require.NoError(t, err)
-	assert.GreaterOrEqual(t, calls, 1)
-	assert.Equal(t, int64(1024), lastTotal)
-	assert.Equal(t, int64(1024), lastDownloaded)
+	execution := runAdapterTask(t, dl, item, nil, "q", filepath.Join(outDir, "video.mp4"))
+	assert.GreaterOrEqual(t, int(execution.progressCalls), 1)
+	assert.Equal(t, int64(1024), execution.lastTotal)
+	assert.Equal(t, int64(1024), execution.lastDownloaded)
 }
 
 func TestDownloadFileNaming(t *testing.T) {
@@ -321,26 +393,42 @@ func TestDownloadErrors(t *testing.T) {
 	dl := NewDownloader()
 
 	{
-		fn := dl.BuildDownloadFunc(nil, nil, "", "")
-		err := fn(context.Background(), &downloader.DownloadTask{}, nil, nil)
+		platformData, marshalErr := MarshalTaskData(nil, nil, "")
+		require.NoError(t, marshalErr)
+		err := NewAdapter(dl).RunTask(context.Background(), downloadtask.TaskSnapshot{
+			PlatformDataVersion: downloadtask.CurrentPlatformDataVersion,
+			OutputPolicy:        downloadtask.OutputPolicy{PlannedFinalPath: filepath.Join(t.TempDir(), "out.mp4")},
+			PlatformData:        platformData,
+		}, &testExecutionContext{})
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "nil xhs item")
+		assert.Contains(t, err.Error(), "missing xiaohongshu item")
 	}
 
 	{
 		item := &XHSItem{Type: "album", Images: nil}
-		fn := dl.BuildDownloadFunc(item, nil, "", t.TempDir())
-		err := fn(context.Background(), &downloader.DownloadTask{}, nil, nil)
+		platformData, marshalErr := MarshalTaskData(item, nil, "")
+		require.NoError(t, marshalErr)
+		err := NewAdapter(dl).RunTask(context.Background(), downloadtask.TaskSnapshot{
+			PlatformDataVersion: downloadtask.CurrentPlatformDataVersion,
+			OutputPolicy:        downloadtask.OutputPolicy{PlannedFinalPath: filepath.Join(t.TempDir(), "album.zip")},
+			PlatformData:        platformData,
+		}, &testExecutionContext{})
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "no images")
 	}
 
 	{
 		item := &XHSItem{Type: "video", Streams: nil}
-		fn := dl.BuildDownloadFunc(item, nil, "", t.TempDir())
-		err := fn(context.Background(), &downloader.DownloadTask{}, nil, nil)
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "stream not found")
+		platformData, marshalErr := MarshalTaskData(item, nil, "")
+		require.NoError(t, marshalErr)
+		err := NewAdapter(dl).RunTask(context.Background(), downloadtask.TaskSnapshot{
+			PlatformDataVersion: downloadtask.CurrentPlatformDataVersion,
+			OutputPolicy:        downloadtask.OutputPolicy{PlannedFinalPath: filepath.Join(t.TempDir(), "out.mp4")},
+			PlatformData:        platformData,
+		}, &testExecutionContext{})
+		var taskErr *downloadtask.TaskError
+		require.ErrorAs(t, err, &taskErr)
+		assert.Equal(t, "xiaohongshu.stream_fallback_exhausted", taskErr.Code)
 	}
 }
 
@@ -444,11 +532,8 @@ func TestDownloadAlbumPartialSelection(t *testing.T) {
 
 	dl := NewDownloaderWithClient(ts.Client())
 	outDir := t.TempDir()
-	fn := dl.BuildDownloadFunc(item, []int{0, 2}, "", outDir)
 
-	task := &downloader.DownloadTask{}
-	err := fn(context.Background(), task, nil, nil)
-	require.NoError(t, err)
+	runAdapterTask(t, dl, item, []int{0, 2}, "", filepath.Join(outDir, "album.zip"))
 
 	assert.Equal(t, int32(2), hits.Load())
 }
@@ -472,15 +557,11 @@ func TestDownloadWithTaskFilePath(t *testing.T) {
 	outDir := t.TempDir()
 	customPath := filepath.Join(outDir, "custom.mp4")
 
-	task := &downloader.DownloadTask{FilePath: customPath}
-	fn := dl.BuildDownloadFunc(item, nil, "q", outDir)
-	var completePath string
-	err := fn(context.Background(), task, nil, func(p string) { completePath = p })
-	require.NoError(t, err)
+	execution := runAdapterTask(t, dl, item, nil, "q", customPath)
 
-	assert.Equal(t, customPath, completePath)
+	assert.Equal(t, customPath, execution.completedPath)
 
-	_, err = os.Stat(customPath)
+	_, err := os.Stat(customPath)
 	require.NoError(t, err)
 }
 
@@ -504,8 +585,13 @@ func TestDownloadVideoSizeLimit(t *testing.T) {
 	dl := NewDownloaderWithClient(ts.Client())
 	dl.SetMaxVideoSize(3) // smaller than 4 bytes
 	outDir := t.TempDir()
-	fn := dl.BuildDownloadFunc(item, nil, "q", outDir)
 
-	err := fn(context.Background(), &downloader.DownloadTask{}, nil, nil)
+	platformData, marshalErr := MarshalTaskData(item, nil, "q")
+	require.NoError(t, marshalErr)
+	err := NewAdapter(dl).RunTask(context.Background(), downloadtask.TaskSnapshot{
+		PlatformDataVersion: downloadtask.CurrentPlatformDataVersion,
+		OutputPolicy:        downloadtask.OutputPolicy{PlannedFinalPath: filepath.Join(outDir, "video.mp4")},
+		PlatformData:        platformData,
+	}, &testExecutionContext{fetcher: fetch.New(ts.Client()), finalPath: filepath.Join(outDir, "video.mp4")})
 	require.ErrorIs(t, err, ErrVideoTooLarge)
 }

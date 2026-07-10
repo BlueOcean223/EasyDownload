@@ -8,6 +8,8 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"EasyDownload/internal/download/fetch"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -16,7 +18,7 @@ func TestDownloadFileWithFallbackNoURL(t *testing.T) {
 	bd := NewBilibiliDownloader()
 	destPath := filepath.Join(t.TempDir(), "out.m4s")
 
-	_, err := bd.downloadFileWithFallback(context.Background(), "", []string{"", " "}, destPath, 0, nil)
+	_, err := bd.downloadFileWithFallback(context.Background(), nil, "", []string{"", " "}, destPath, 0, nil)
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no download URL available")
@@ -47,7 +49,7 @@ func TestGetContentLengthWithFallbackUsesBackup(t *testing.T) {
 	defer ts.Close()
 
 	bd := NewBilibiliDownloader()
-	got := bd.getContentLengthWithFallback(ts.URL+"/primary", []string{ts.URL + "/backup"})
+	got := bd.getContentLengthWithFallback(context.Background(), fetch.New(ts.Client()), ts.URL+"/primary", []string{ts.URL + "/backup"})
 
 	assert.Equal(t, int64(123), got)
 	assert.Equal(t, int32(1), primaryHEADs.Load())

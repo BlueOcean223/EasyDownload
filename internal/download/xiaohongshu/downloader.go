@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -14,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"EasyDownload/internal/download"
+	"EasyDownload/internal/download/fetch"
 	"EasyDownload/internal/utils"
 )
 
@@ -88,67 +87,6 @@ func (d *Downloader) SetNoProgressTimeout(timeout time.Duration) {
 		return
 	}
 	d.noProgressTimeout = timeout
-}
-
-// BuildDownloadFunc creates a download function for the DownloadManager.
-func (d *Downloader) BuildDownloadFunc(item *XHSItem, selectedImages []int, quality string, outputDir string) downloader.DownloadFunc {
-	return func(ctx context.Context, task *downloader.DownloadTask, onProgress func(downloaded, total int64), onComplete func(outputPath string)) error {
-		if item == nil {
-			return fmt.Errorf("nil xhs item")
-		}
-
-		isAlbum := item.IsAlbum()
-		ext := ".mp4"
-		if isAlbum {
-			ext = ".zip"
-		}
-
-		baseName := xhsFileBase(item)
-		destPath := filepath.Join(outputDir, baseName+ext)
-		if task != nil && task.FilePath != "" {
-			destPath = task.FilePath
-			if filepath.Ext(destPath) == "" {
-				destPath += ext
-			}
-		}
-
-		if isAlbum {
-			if err := item.ValidateSelectedImages(selectedImages); err != nil {
-				return err
-			}
-			indices := normalizeSelection(selectedImages, len(item.Images))
-			total := int64(len(indices))
-			progressFn := func(done int) {
-				if task != nil && total > 0 {
-					task.AlbumCompleted = done
-					task.Progress = float64(done) / float64(total) * 100
-				}
-				if onProgress != nil {
-					onProgress(int64(done), total)
-				}
-			}
-			if err := d.downloadAlbumZip(ctx, item, indices, destPath, progressFn); err != nil {
-				return err
-			}
-			if task != nil {
-				task.AlbumCompleted = int(total)
-				task.Progress = 100
-			}
-		} else {
-			stream := selectStream(item, quality)
-			if stream == nil || strings.TrimSpace(stream.URL) == "" {
-				return ErrStreamNotFound
-			}
-			if err := d.downloadFileWithFallback(ctx, stream.URL, stream.BackupURLs, destPath, onProgress); err != nil {
-				return err
-			}
-		}
-
-		if onComplete != nil {
-			onComplete(destPath)
-		}
-		return nil
-	}
 }
 
 func xhsFileBase(item *XHSItem) string {
@@ -237,7 +175,7 @@ func selectStreamURL(item *XHSItem, quality string) string {
 
 // downloadAlbumZip downloads album images with resumable support.
 // Uses AlbumState to track progress and temp files for each image.
-func (d *Downloader) downloadAlbumZip(ctx context.Context, item *XHSItem, indices []int, destPath string, progressFn func(done int)) (err error) {
+func (d *Downloader) downloadAlbumZip(ctx context.Context, fetcher fetch.Fetcher, item *XHSItem, indices []int, destPath string, progressFn func(done int)) (err error) {
 	if item == nil {
 		return fmt.Errorf("nil xhs item")
 	}
@@ -249,6 +187,9 @@ func (d *Downloader) downloadAlbumZip(ctx context.Context, item *XHSItem, indice
 	}
 	if len(indices) == 0 {
 		return fmt.Errorf("empty indices")
+	}
+	if fetcher == nil {
+		return fmt.Errorf("fetcher is required")
 	}
 	for _, idx := range indices {
 		if idx < 0 || idx >= len(item.Images) {
@@ -342,23 +283,21 @@ func (d *Downloader) downloadAlbumZip(ctx context.Context, item *XHSItem, indice
 			return fmt.Errorf("empty image url: index %d", idx)
 		}
 
-		data, dlErr := d.downloadBytesWithFallback(ctx, raw, img.BackupURLs)
-		if dlErr != nil {
-			_ = utils.SaveAlbumState(state)
-			return dlErr
-		}
-
 		tempPath := utils.AlbumImageTempPath(tempDir, idx)
-		if err := os.WriteFile(tempPath, data, 0644); err != nil {
+		result, err := d.downloadAlbumMedia(ctx, fetcher, raw, img.BackupURLs, tempPath, maxImageSize, nil)
+		if err != nil {
 			_ = utils.SaveAlbumState(state)
 			return err
 		}
+		_ = removeResumeState(result.ResumeStatePath)
 
 		if liveURL := strings.TrimSpace(img.LivePhotoURL); liveURL != "" {
-			if err := d.downloadToFileAtomic(ctx, liveURL, albumLivePhotoTempPath(tempDir, idx), maxLivePhotoSize); err != nil {
+			result, err := d.downloadAlbumMedia(ctx, fetcher, liveURL, nil, albumLivePhotoTempPath(tempDir, idx), maxLivePhotoSize, nil)
+			if err != nil {
 				_ = utils.SaveAlbumState(state)
 				return err
 			}
+			_ = removeResumeState(result.ResumeStatePath)
 		}
 
 		completed[idx] = struct{}{}
@@ -437,172 +376,73 @@ const maxImageSize = 50 * 1024 * 1024
 // maxLivePhotoSize is the maximum allowed size for Live Photo video sidecars (200MB).
 const maxLivePhotoSize = 200 * 1024 * 1024
 
-func (d *Downloader) downloadBytesWithFallback(ctx context.Context, primaryURL string, backupURLs []string) ([]byte, error) {
-	urls := collectDownloadURLs(primaryURL, backupURLs)
+func (d *Downloader) downloadAlbumMedia(ctx context.Context, fetcher fetch.Fetcher, primaryURL string, equivalentURLs []string, temporaryPath string, maxBytes int64, onProgress func(downloaded, total int64)) (fetch.FetchResult, error) {
+	urls := collectDownloadURLs(primaryURL, equivalentURLs)
 	if len(urls) == 0 {
-		return nil, fmt.Errorf("empty url")
+		return fetch.FetchResult{}, fmt.Errorf("empty url")
 	}
-
-	var lastErr error
-	for _, rawURL := range urls {
-		data, err := d.downloadBytes(ctx, rawURL)
-		if err == nil {
-			return data, nil
+	if fetcher == nil {
+		return fetch.FetchResult{}, fmt.Errorf("fetcher is required")
+	}
+	result, err := fetcher.Download(ctx, fetch.FetchRequest{
+		URL:                  urls[0],
+		EquivalentMirrorURLs: urls[1:],
+		Headers:              d.downloadHeaders(),
+		MaxBytes:             maxBytes,
+		NoProgressTimeout:    d.noProgressTimeout,
+		ResumePolicy: fetch.ResumePolicy{
+			Enabled:                 true,
+			RestartWhenRangeIgnored: true,
+		},
+		RetryPolicy: fetch.RetryPolicy{
+			MaxAttempts:    3,
+			InitialBackoff: 200 * time.Millisecond,
+			MaxBackoff:     2 * time.Second,
+		},
+	}, fetch.Destination{
+		TemporaryPath:   temporaryPath,
+		ResumeStatePath: temporaryPath + ".resume.json",
+	}, func(progress fetch.Progress) {
+		if onProgress != nil {
+			onProgress(progress.Downloaded, progress.Total)
 		}
-		if ctx.Err() != nil {
-			return nil, err
+	})
+	if err != nil {
+		var fetchErr *fetch.Error
+		if errors.As(err, &fetchErr) && fetchErr.Kind == fetch.ErrorTimeout {
+			return fetch.FetchResult{}, fmt.Errorf("%w: %v", ErrNoProgressTimeout, fetchErr)
 		}
-		lastErr = err
-	}
-	return nil, fmt.Errorf("all xhs image URLs failed: %w", lastErr)
-}
-
-func (d *Downloader) downloadBytes(ctx context.Context, rawURL string) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", rawURL, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("User-Agent", d.userAgent)
-	req.Header.Set("Referer", d.referer)
-	resp, err := d.httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("unexpected status %d", resp.StatusCode)
-	}
-	// Limit response body size to prevent memory exhaustion
-	limitedReader := io.LimitReader(resp.Body, maxImageSize+1)
-	data, err := io.ReadAll(limitedReader)
-	if err != nil {
-		return nil, err
-	}
-	if int64(len(data)) > maxImageSize {
-		return nil, fmt.Errorf("image size exceeds limit (%d bytes)", maxImageSize)
-	}
-	return data, nil
-}
-
-// downloadFile downloads a video file with resumable support.
-// Uses HTTP Range requests to continue from where it left off.
-func (d *Downloader) downloadFile(ctx context.Context, rawURL string, destPath string, onProgress func(downloaded, total int64)) error {
-	headers := map[string]string{
-		"User-Agent": d.userAgent,
-		"Referer":    d.referer,
-	}
-
-	downloaded, total, err := downloader.DownloadFileResumable(ctx, d.httpClient, rawURL, destPath, downloader.ResumableDownloadOptions{
-		Headers:           headers,
-		MaxRangeRetries:   3,
-		MaxBytes:          d.maxVideoSize,
-		NoProgressTimeout: d.noProgressTimeout,
-	}, onProgress)
-	if err != nil {
-		var sizeErr *downloader.SizeLimitExceededError
-		if errors.As(err, &sizeErr) {
-			if sizeErr.Reason == "total" && sizeErr.Total > 0 {
-				return fmt.Errorf("%w: total=%d limit=%d", ErrVideoTooLarge, sizeErr.Total, sizeErr.Limit)
+		if errors.As(err, &fetchErr) && fetchErr.Kind == fetch.ErrorSizeLimit {
+			if maxBytes == d.maxVideoSize {
+				return fetch.FetchResult{}, fmt.Errorf("%w: %v", ErrVideoTooLarge, fetchErr.Err)
 			}
-			return fmt.Errorf("%w: downloaded=%d limit=%d", ErrVideoTooLarge, sizeErr.Downloaded, sizeErr.Limit)
+			return fetch.FetchResult{}, fetchErr
 		}
-
-		var stallErr *downloader.NoProgressTimeoutError
-		if errors.As(err, &stallErr) {
-			return fmt.Errorf("%w: timeout=%s", ErrNoProgressTimeout, stallErr.Timeout)
-		}
-		return err
+		return fetch.FetchResult{}, fmt.Errorf("xhs media download failed: %w", err)
 	}
-
-	if onProgress != nil {
-		onProgress(downloaded, total)
-	}
-	return nil
+	return result, nil
 }
 
-func (d *Downloader) downloadToFileAtomic(ctx context.Context, rawURL string, destPath string, maxBytes int64) (err error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
-	if err != nil {
-		return err
+func (d *Downloader) downloadHeaders() map[string]string {
+	userAgent := strings.TrimSpace(d.userAgent)
+	if userAgent == "" {
+		userAgent = defaultUserAgent
 	}
-	req.Header.Set("User-Agent", d.userAgent)
-	req.Header.Set("Referer", d.referer)
-
-	resp, err := d.httpClient.Do(req)
-	if err != nil {
-		return err
+	referer := strings.TrimSpace(d.referer)
+	if referer == "" {
+		referer = defaultReferer
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("unexpected status %d", resp.StatusCode)
+	return map[string]string{
+		"User-Agent": userAgent,
+		"Referer":    referer,
 	}
-
-	if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
-		return err
-	}
-	tmpPath := destPath + ".tmp"
-	_ = os.Remove(tmpPath)
-	out, err := os.Create(tmpPath)
-	if err != nil {
-		return err
-	}
-	closed := false
-	defer func() {
-		if !closed {
-			_ = out.Close()
-		}
-		if err != nil {
-			_ = os.Remove(tmpPath)
-		}
-	}()
-
-	var reader io.Reader = resp.Body
-	if maxBytes > 0 {
-		reader = io.LimitReader(resp.Body, maxBytes+1)
-	}
-	written, err := io.Copy(out, reader)
-	if err != nil {
-		return err
-	}
-	if maxBytes > 0 && written > maxBytes {
-		return fmt.Errorf("download size exceeds limit (%d bytes)", maxBytes)
-	}
-	if err = out.Sync(); err != nil {
-		return err
-	}
-	if err = out.Close(); err != nil {
-		return err
-	}
-	closed = true
-
-	_ = os.Remove(destPath)
-	if err = os.Rename(tmpPath, destPath); err != nil {
-		return err
-	}
-	return nil
 }
 
-func (d *Downloader) downloadFileWithFallback(ctx context.Context, primaryURL string, backupURLs []string, destPath string, onProgress func(downloaded, total int64)) error {
-	urls := collectDownloadURLs(primaryURL, backupURLs)
-	if len(urls) == 0 {
-		return fmt.Errorf("empty url")
+func removeResumeState(path string) error {
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove xhs resume state: %w", err)
 	}
-
-	var lastErr error
-	for _, rawURL := range urls {
-		err := d.downloadFile(ctx, rawURL, destPath, onProgress)
-		if err == nil {
-			return nil
-		}
-		if ctx.Err() != nil {
-			return err
-		}
-		if errors.Is(err, ErrVideoTooLarge) {
-			return err
-		}
-		lastErr = err
-	}
-	return fmt.Errorf("all xhs download URLs failed: %w", lastErr)
+	return nil
 }
 
 // writeAlbumZip creates a ZIP archive from downloaded temp images.

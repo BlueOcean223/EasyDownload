@@ -10,8 +10,8 @@ export function CanRestartAsAdmin() {
   return window['go']['main']['App']['CanRestartAsAdmin']();
 }
 
-export function CancelDownload(arg1) {
-  return window['go']['main']['App']['CancelDownload'](arg1);
+export function CancelDownload(arg1, arg2, arg3) {
+  return window['go']['main']['App']['CancelDownload'](arg1, arg2, arg3);
 }
 
 export function ClearDetectedVideos() {
@@ -36,14 +36,6 @@ export function DownloadDouyinAlbumPartial(arg1, arg2) {
 
 export function DownloadDouyinVideo(arg1, arg2) {
   return window['go']['main']['App']['DownloadDouyinVideo'](arg1, arg2);
-}
-
-export function DownloadVideo(arg1, arg2, arg3, arg4, arg5, arg6) {
-  return window['go']['main']['App']['DownloadVideo'](arg1, arg2, arg3, arg4, arg5, arg6);
-}
-
-export function DownloadVideoWithKey(arg1, arg2, arg3, arg4, arg5, arg6, arg7) {
-  return window['go']['main']['App']['DownloadVideoWithKey'](arg1, arg2, arg3, arg4, arg5, arg6, arg7);
 }
 
 export function DownloadXHSNote(arg1, arg2, arg3, arg4) {
@@ -74,10 +66,6 @@ export function GetCertPath() {
   return window['go']['main']['App']['GetCertPath']();
 }
 
-export function GetCloseAction() {
-  return window['go']['main']['App']['GetCloseAction']();
-}
-
 export function GetDetectedVideos() {
   return window['go']['main']['App']['GetDetectedVideos']();
 }
@@ -86,16 +74,8 @@ export function GetDouyinVideoInfo(arg1) {
   return window['go']['main']['App']['GetDouyinVideoInfo'](arg1);
 }
 
-export function GetDownloadDir() {
-  return window['go']['main']['App']['GetDownloadDir']();
-}
-
 export function GetDownloads() {
   return window['go']['main']['App']['GetDownloads']();
-}
-
-export function GetLanguage() {
-  return window['go']['main']['App']['GetLanguage']();
 }
 
 export function GetLogDir() {
@@ -106,20 +86,8 @@ export function GetLogSize() {
   return window['go']['main']['App']['GetLogSize']();
 }
 
-export function GetProxyDebug() {
-  return window['go']['main']['App']['GetProxyDebug']();
-}
-
-export function GetProxyPort() {
-  return window['go']['main']['App']['GetProxyPort']();
-}
-
-export function GetTheme() {
-  return window['go']['main']['App']['GetTheme']();
-}
-
-export function GetUpstreamProxy() {
-  return window['go']['main']['App']['GetUpstreamProxy']();
+export function GetSettings() {
+  return window['go']['main']['App']['GetSettings']();
 }
 
 export function GetXHSNoteInfo(arg1) {
@@ -146,14 +114,6 @@ export function IsCertInstalled() {
   return window['go']['main']['App']['IsCertInstalled']();
 }
 
-export function IsDontAskOnClose() {
-  return window['go']['main']['App']['IsDontAskOnClose']();
-}
-
-export function IsDontRemindCertWizard() {
-  return window['go']['main']['App']['IsDontRemindCertWizard']();
-}
-
 export function IsFFmpegAvailable() {
   return window['go']['main']['App']['IsFFmpegAvailable']();
 }
@@ -164,10 +124,6 @@ export function IsProxyRunning() {
 
 export function IsQuitRequested() {
   return window['go']['main']['App']['IsQuitRequested']();
-}
-
-export function IsUseUpstreamProxy() {
-  return window['go']['main']['App']['IsUseUpstreamProxy']();
 }
 
 export function LogFrontend(arg1) {
@@ -190,8 +146,8 @@ export function OpenLogDir() {
   return window['go']['main']['App']['OpenLogDir']();
 }
 
-export function PauseDownload(arg1) {
-  return window['go']['main']['App']['PauseDownload'](arg1);
+export function PauseDownload(arg1, arg2, arg3) {
+  return window['go']['main']['App']['PauseDownload'](arg1, arg2, arg3);
 }
 
 export function PollBilibiliQRCode(arg1) {
@@ -202,8 +158,8 @@ export function RemoveDetectedVideo(arg1) {
   return window['go']['main']['App']['RemoveDetectedVideo'](arg1);
 }
 
-export function RemoveDownload(arg1) {
-  return window['go']['main']['App']['RemoveDownload'](arg1);
+export function RemoveDownload(arg1, arg2, arg3) {
+  return window['go']['main']['App']['RemoveDownload'](arg1, arg2, arg3);
 }
 
 export function RequestClose(arg1) {
@@ -222,12 +178,12 @@ export function RestoreFromTray() {
   return window['go']['main']['App']['RestoreFromTray']();
 }
 
-export function ResumeDownload(arg1) {
-  return window['go']['main']['App']['ResumeDownload'](arg1);
+export function ResumeDownload(arg1, arg2, arg3) {
+  return window['go']['main']['App']['ResumeDownload'](arg1, arg2, arg3);
 }
 
-export function RetryDownload(arg1) {
-  return window['go']['main']['App']['RetryDownload'](arg1);
+export function RetryDownload(arg1, arg2, arg3) {
+  return window['go']['main']['App']['RetryDownload'](arg1, arg2, arg3);
 }
 
 export function SelectDownloadDir() {
@@ -238,52 +194,8 @@ export function SetBilibiliSessData(arg1) {
   return window['go']['main']['App']['SetBilibiliSessData'](arg1);
 }
 
-export function SetCloseAction(arg1) {
-  return window['go']['main']['App']['SetCloseAction'](arg1);
-}
-
-export function SetDontAskOnClose(arg1) {
-  return window['go']['main']['App']['SetDontAskOnClose'](arg1);
-}
-
-export function SetDontRemindCertWizard(arg1) {
-  return window['go']['main']['App']['SetDontRemindCertWizard'](arg1);
-}
-
-export function SetDownloadDir(arg1) {
-  return window['go']['main']['App']['SetDownloadDir'](arg1);
-}
-
-export function SetFirstRunComplete(arg1) {
-  return window['go']['main']['App']['SetFirstRunComplete'](arg1);
-}
-
-export function SetLanguage(arg1) {
-  return window['go']['main']['App']['SetLanguage'](arg1);
-}
-
-export function SetMinimizeToTray(arg1) {
-  return window['go']['main']['App']['SetMinimizeToTray'](arg1);
-}
-
-export function SetProxyDebug(arg1) {
-  return window['go']['main']['App']['SetProxyDebug'](arg1);
-}
-
-export function SetShowNotification(arg1) {
-  return window['go']['main']['App']['SetShowNotification'](arg1);
-}
-
-export function SetTheme(arg1) {
-  return window['go']['main']['App']['SetTheme'](arg1);
-}
-
-export function SetUpstreamProxy(arg1) {
-  return window['go']['main']['App']['SetUpstreamProxy'](arg1);
-}
-
-export function SetUseUpstreamProxy(arg1) {
-  return window['go']['main']['App']['SetUseUpstreamProxy'](arg1);
+export function StartDetectedDownload(arg1, arg2) {
+  return window['go']['main']['App']['StartDetectedDownload'](arg1, arg2);
 }
 
 export function StartProxy() {
@@ -294,6 +206,14 @@ export function StopProxy() {
   return window['go']['main']['App']['StopProxy']();
 }
 
+export function TakeLegacyDownloadNotice() {
+  return window['go']['main']['App']['TakeLegacyDownloadNotice']();
+}
+
 export function UninstallCert() {
   return window['go']['main']['App']['UninstallCert']();
+}
+
+export function UpdateSettings(arg1) {
+  return window['go']['main']['App']['UpdateSettings'](arg1);
 }

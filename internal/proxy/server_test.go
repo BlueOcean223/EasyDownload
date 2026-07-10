@@ -1,16 +1,63 @@
 package proxy
 
 import (
+	"EasyDownload/internal/download/wechat"
 	"bytes"
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/leanovate/gopter"
 	"github.com/leanovate/gopter/gen"
 	"github.com/leanovate/gopter/prop"
 )
+
+func TestProxyServerSetPortOnlyChangesStoppedListener(t *testing.T) {
+	server := NewProxyServer(nil, 8899)
+	if err := server.SetPort(9999); err != nil {
+		t.Fatalf("SetPort while stopped returned error: %v", err)
+	}
+	if got := server.GetPort(); got != 9999 {
+		t.Fatalf("GetPort = %d, want 9999", got)
+	}
+	if err := server.SetPort(0); err == nil {
+		t.Fatal("SetPort accepted an invalid port")
+	}
+
+	server.mu.Lock()
+	server.running = true
+	server.mu.Unlock()
+	if err := server.SetPort(10000); err == nil {
+		t.Fatal("SetPort changed a running listener")
+	}
+	if got := server.GetPort(); got != 9999 {
+		t.Fatalf("running server port changed to %d", got)
+	}
+	if err := server.SetPort(9999); err != nil {
+		t.Fatalf("idempotent SetPort on running listener returned error: %v", err)
+	}
+}
+
+func TestProxyVideoCallbackCanBeReplacedConcurrently(t *testing.T) {
+	server := NewProxyServer(nil, 8899)
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			server.SetVideoCallback(func(wechat.VideoInfo) {})
+		}()
+		go func() {
+			defer wg.Done()
+			if callback := server.videoCallback(); callback != nil {
+				callback(wechat.VideoInfo{})
+			}
+		}()
+	}
+	wg.Wait()
+}
 
 // For any video streaming domain (finder.video.qq.com, findermp.video.qq.com, szextshort.weixin.qq.com),
 // that domain should NOT appear in the MITM configuration list.

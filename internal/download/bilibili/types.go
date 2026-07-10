@@ -89,11 +89,11 @@ type FFmpegManagerInterface interface {
 	Merge(videoPath, audioPath, outputPath string) error // Merges video and audio into a single file
 }
 
-// ConfigManagerInterface defines the interface for configuration management.
-// It allows the downloader to persist settings like SESSDATA across sessions.
+// ConfigManagerInterface exposes read-only configuration. Settings persistence
+// is owned by the Settings module; downloaders must not regain a generic write
+// escape hatch (SESSDATA is already stored in secure credential storage).
 type ConfigManagerInterface interface {
-	Get() *config.Config             // Returns the current configuration
-	Set(key string, value any) error // Updates a configuration value
+	Get() *config.Config
 }
 
 // BilibiliQRCode represents QR code login information.
@@ -109,14 +109,13 @@ type BilibiliQRCode struct {
 // of the QR code login process.
 //
 // Status Codes:
-//   - 0:     Login successful - SessData field contains the authentication cookie
+//   - 0:     Login successful - the authentication cookie was stored privately
 //   - 86038: QR code expired - generate a new QR code
 //   - 86090: QR code scanned - waiting for user to confirm on mobile app
 //   - 86101: QR code not scanned - user hasn't scanned the QR code yet
 type BilibiliLoginStatus struct {
-	Code     int    `json:"code"`     // Status code indicating login progress (see above)
-	Message  string `json:"message"`  // Human-readable status message from API
-	SessData string `json:"sessData"` // SESSDATA authentication cookie (only set when Code=0)
+	Code    int    `json:"code"`    // Status code indicating login progress (see above)
+	Message string `json:"message"` // Human-readable status message from API
 }
 
 // BilibiliUserInfo represents information about the currently logged-in Bilibili user.

@@ -23,6 +23,7 @@ const (
 type Handler struct {
 	onVideoDetected   func(VideoInfo)
 	onDownloadRequest func(VideoInfo)
+	callbackMu        sync.RWMutex
 	recentVideos      sync.Map
 
 	currentVideo   *VideoInfo
@@ -41,12 +42,30 @@ func NewHandler() *Handler {
 
 // SetVideoCallback sets the callback function for detected videos.
 func (h *Handler) SetVideoCallback(callback func(VideoInfo)) {
+	h.callbackMu.Lock()
 	h.onVideoDetected = callback
+	h.callbackMu.Unlock()
 }
 
 // SetDownloadCallback sets the callback function for download requests.
 func (h *Handler) SetDownloadCallback(callback func(VideoInfo)) {
+	h.callbackMu.Lock()
 	h.onDownloadRequest = callback
+	h.callbackMu.Unlock()
+}
+
+func (h *Handler) videoCallback() func(VideoInfo) {
+	h.callbackMu.RLock()
+	callback := h.onVideoDetected
+	h.callbackMu.RUnlock()
+	return callback
+}
+
+func (h *Handler) downloadCallback() func(VideoInfo) {
+	h.callbackMu.RLock()
+	callback := h.onDownloadRequest
+	h.callbackMu.RUnlock()
+	return callback
 }
 
 // GetCurrentVideo returns the current video info.
@@ -79,8 +98,8 @@ func (h *Handler) HandleRequestWithType(body []byte, reqType string) error {
 
 	h.updateCurrentVideo(videoInfo)
 
-	if h.onVideoDetected != nil {
-		h.onVideoDetected(*videoInfo)
+	if callback := h.videoCallback(); callback != nil {
+		callback(*videoInfo)
 	}
 
 	h.maybeProbeAndUpdateFileSize(videoInfo)
@@ -157,8 +176,8 @@ func (h *Handler) maybeProbeAndUpdateFileSize(videoInfo *VideoInfo) {
 		}
 		h.currentVideoMu.Unlock()
 
-		if h.onVideoDetected != nil {
-			h.onVideoDetected(base)
+		if callback := h.videoCallback(); callback != nil {
+			callback(base)
 		}
 	}()
 }
@@ -258,8 +277,8 @@ func (h *Handler) handleDownloadRequest(body []byte) error {
 		)
 	}
 
-	if h.onDownloadRequest != nil {
-		h.onDownloadRequest(*videoInfo)
+	if callback := h.downloadCallback(); callback != nil {
+		callback(*videoInfo)
 	}
 	return nil
 }

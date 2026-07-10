@@ -5,37 +5,54 @@
 // The package supports:
 //   - Concurrent download management with configurable limits and a pending queue
 //   - Pause, resume, and cancel operations for download tasks
-//   - Automatic retry with exponential backoff on failure
+//   - User-initiated retry of failed tasks
 //   - Progress tracking and speed calculation
 //   - State persistence for recovery after application restart
-//   - Custom downloader functions for special sources (e.g., Bilibili DASH)
+//   - Platform adapters for special sources (e.g., Bilibili DASH, albums, decryption)
 //   - Optional video decryption for encrypted content (decryption failures mark tasks failed)
-//   - Both sequential and strictly validated multipart (chunked) download strategies
+//   - A shared Fetcher for sequential transfer and explicitly enabled multipart transfer
 //
-// Download Strategies:
-//   - Sequential: Simple HTTP download with Range support for resume
-//   - Multipart: Parallel chunk downloads for large files (faster throughput)
+// Fetch always writes a verified temporary file. Resume is gated by resource
+// identity, validators, If-Range, and an atomic sidecar; untrusted partials are
+// reset rather than spliced. Multipart is used only when FetchRequest explicitly
+// enables MultipartPolicy. Every part must return a matching 206 Content-Range
+// for the same validator and total size before assembly.
 //
-// The package automatically selects the best strategy based on:
-//   - Server Range request support verified by GET Range (not HEAD alone)
-//   - File size (multipart for files > 1MB)
-//   - Existing partial download state
+// New task state is stored in downloads.v2.json as revisioned full snapshots.
+// The legacy downloads.json is left byte-for-byte unchanged for rollback. Task
+// creation data and runtime checkpoints are separate, so registered adapters can
+// execute restored tasks without application-layer closure reconstruction.
+// Adapters reject unknown PlatformDataVersion values before decoding private
+// execution data, so a future or corrupted payload cannot run with v1 semantics.
+// Output paths are reserved at creation. Adapters write only temporary files;
+// PublishFinal persists an intent, performs a no-replace publish, and records the
+// primary artifact and completed status atomically for crash recovery. Native
+// no-replace rename primitives are used on Windows, Linux, and macOS; directory
+// sync and fallback temporary-name cleanup happen after the visibility commit
+// and are retained as diagnostics rather than reported as a failed download.
+// After primary publication closes normal mutation sinks, adapters may only
+// record a narrowly-scoped post-publish cleanup-failure artifact.
 //
-// Multipart downloads require each chunk to return 206 Partial Content with a
-// matching Content-Range. Short reads fail with io.ErrUnexpectedEOF to avoid
-// silently producing corrupt output files.
+// Stop lifecycle:
 //
-// State persistence stores serializable task metadata only. Custom downloader
-// functions must be reattached by the application layer after restart, or the
-// restored task should be marked as requiring re-parse.
+// Pause, cancel, and remove return an accepted StopReceipt immediately. Wails
+// commands compare the caller's expected task instance/generation atomically;
+// queued work reserves the generation that automatic dispatch later reuses. A
+// coordinator waits for the real worker to exit before cleanup and emits a
+// revisioned StopEvent with an authoritative terminal PublicDownloadTask.
+// Pause and shutdown preserve partials; cancel and remove clean exactly once. A
+// timeout leaves the task stopping while background coordination continues.
+// Generation-bound mutation sinks reject late writes. Public task events carry
+// a manager-wide task instance, execution generation, and event revision. This
+// lets clients reject old retry events and fence a removed task ID until a
+// genuinely new task instance is created.
 //
-// Task Lifecycle:
+// Task status:
 //
-//	pending -> downloading -> completed
-//	                      \-> failed -> (manual retry) -> pending
-//	                      \-> paused -> (resume) -> downloading
-//	downloading -> retrying -> downloading (automatic retry)
-//	any state -> cancelled (user-initiated)
+//	pending -> running -> completed
+//	                    \-> failed -> (manual retry) -> pending
+//	                    \-> paused -> (resume) -> running
+//	any state -> canceled (user-initiated)
 //
 // Basic usage:
 //
@@ -44,15 +61,29 @@
 //	manager.SetCompleteCallback(func(task *DownloadTask) { ... })
 //	manager.SetErrorCallback(func(task *DownloadTask, err error) { ... })
 //
-//	task, err := manager.AddTask(id, url, title, cover, "wechat", "")
+//	adapter := NewGenericAdapter()
+//	manager.RegisterPlatformAdapter(adapter)
+//	data, err := MarshalGenericPlatformData(url, nil)
+//	task, err := manager.CreateTask(TaskCreationInput{
+//	    ID: id, PlatformID: adapter.ID(), Title: title, Cover: cover,
+//	    DisplaySource: "generic", SuggestedFilename: title,
+//	    SuggestedExtension: ".mp4", PlatformDataVersion: 1, PlatformData: data,
+//	})
 //	if err != nil {
 //	    return err
 //	}
 //	manager.StartTask(task.ID)
 //
-// For sources requiring special handling (e.g., Bilibili DASH format):
+// For sources requiring special handling (e.g., Bilibili DASH format), register
+// a platform adapter and create tasks with serializable platform data:
 //
-//	downloader := bilibili.NewDownloader()
-//	downloadFunc := downloader.BuildDownloadFunc(videoInfo, quality, outputDir)
-//	task, err := manager.AddTaskWithDownloader(id, url, title, cover, "bilibili", quality, downloadFunc)
+//	bili := bilibili.NewBilibiliDownloader()
+//	adapter := bilibili.NewAdapter(bili)
+//	manager.RegisterPlatformAdapter(adapter)
+//	data, err := bilibili.MarshalTaskData(videoInfo, quality, partIndex)
+//	task, err := manager.CreateTask(TaskCreationInput{
+//	    ID: id, PlatformID: adapter.ID(), Title: title, Cover: cover,
+//	    DisplaySource: "bilibili", SuggestedFilename: title,
+//	    SuggestedExtension: ".mp4", PlatformDataVersion: 1, PlatformData: data,
+//	})
 package downloader

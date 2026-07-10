@@ -1,7 +1,11 @@
 package api
 
 import (
+	"EasyDownload/internal/detection"
+	"EasyDownload/internal/detection/wechatadapter"
+	"EasyDownload/internal/download/wechat"
 	"EasyDownload/internal/infra/logger"
+	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
@@ -14,33 +18,39 @@ import (
 	"time"
 )
 
-// VideoSpec represents video specification for a specific quality
-type VideoSpec struct {
+// ProxyVideoSpec is the legacy browser callback representation. It is a
+// boundary DTO; detection.Video is the only detected-media domain model.
+type ProxyVideoSpec struct {
 	FileFormat string `json:"fileFormat"`
 	Width      int    `json:"width"`
 	Height     int    `json:"height"`
 	DurationMs int    `json:"durationMs"`
 }
 
-// DetectedVideo represents a video detected by the proxy
-type DetectedVideo struct {
-	ID           string      `json:"id"`
-	Title        string      `json:"title"`
-	Cover        string      `json:"cover"`
-	URL          string      `json:"url"`
-	Source       string      `json:"source"`
-	Quality      string      `json:"quality"`
-	Duration     int         `json:"duration"`
-	Author       string      `json:"author"`
-	AuthorAvatar string      `json:"authorAvatar"` // Author avatar URL
-	Timestamp    int64       `json:"timestamp"`
-	DecodeKey    string      `json:"decodeKey"` // Decryption key for WeChat videos
-	FileSize     float64     `json:"fileSize"`  // File size in bytes
-	Width        int         `json:"width"`     // Video width in pixels
-	Height       int         `json:"height"`    // Video height in pixels
-	IsCurrent    bool        `json:"isCurrentVideo"`
-	FileFormats  []string    `json:"fileFormats"` // Available quality formats
-	Specs        []VideoSpec `json:"specs"`       // Detailed spec info for each quality
+// ProxyDetectedVideoRequest is the input accepted from existing injected
+// scripts. It is converted immediately at the API boundary.
+type ProxyDetectedVideoRequest struct {
+	ID           string           `json:"id"`
+	PageKey      string           `json:"pageKey"`
+	PageURL      string           `json:"pageUrl"`
+	Href         string           `json:"href"`
+	Title        string           `json:"title"`
+	Cover        string           `json:"cover"`
+	CoverURL     string           `json:"coverUrl"`
+	URL          string           `json:"url"`
+	Source       string           `json:"source"`
+	Quality      string           `json:"quality"`
+	Duration     int              `json:"duration"`
+	Author       string           `json:"author"`
+	AuthorAvatar string           `json:"authorAvatar"`
+	Timestamp    int64            `json:"timestamp"`
+	DecodeKey    string           `json:"decodeKey"`
+	FileSize     float64          `json:"fileSize"`
+	Width        int              `json:"width"`
+	Height       int              `json:"height"`
+	IsCurrent    bool             `json:"isCurrentVideo"`
+	FileFormats  []string         `json:"fileFormats"`
+	Specs        []ProxyVideoSpec `json:"specs"`
 }
 
 // InternalAPI provides an HTTP API for receiving data from injected scripts
@@ -50,23 +60,29 @@ type InternalAPI struct {
 	token  string
 	mu     sync.RWMutex
 
-	// Detected videos storage
-	detectedVideos []DetectedVideo
-	videosMu       sync.RWMutex
+	detectionStore detection.Store
 
 	// Callback for new videos
-	onVideoDetected func(DetectedVideo)
+	onVideoDetected func(detection.Change)
 
 	// Image proxy handler
 	imageProxy *ImageProxyHandler
 }
 
 // NewInternalAPI creates a new internal API server
-func NewInternalAPI(port int) *InternalAPI {
+
+func NewInternalAPI(port int, stores ...detection.Store) *InternalAPI {
+	var store detection.Store
+	if len(stores) > 0 {
+		store = stores[0]
+	}
+	if store == nil {
+		store = detection.NewMemoryStore(100)
+	}
 	return &InternalAPI{
 		port:           port,
 		token:          generateAPIToken(),
-		detectedVideos: make([]DetectedVideo, 0),
+		detectionStore: store,
 		imageProxy:     NewImageProxyHandler(),
 	}
 }
@@ -142,8 +158,30 @@ func (api *InternalAPI) isAllowedOrigin(origin string) bool {
 }
 
 // SetVideoCallback sets the callback for new detected videos
-func (api *InternalAPI) SetVideoCallback(callback func(DetectedVideo)) {
+func (api *InternalAPI) SetVideoCallback(callback func(detection.Change)) {
+	api.mu.Lock()
 	api.onVideoDetected = callback
+	api.mu.Unlock()
+}
+
+func (api *InternalAPI) videoCallback() func(detection.Change) {
+	api.mu.RLock()
+	callback := api.onVideoDetected
+	api.mu.RUnlock()
+	return callback
+}
+
+// Ingest is the common adapter entry point used by both the HTTP callback and
+// in-process proxy callbacks.
+func (api *InternalAPI) Ingest(ctx context.Context, video detection.Video) (detection.Change, error) {
+	change, err := api.detectionStore.Upsert(ctx, video)
+	if err != nil {
+		return detection.Change{}, err
+	}
+	if callback := api.videoCallback(); callback != nil {
+		callback(change)
+	}
+	return change, nil
 }
 
 // Start starts the internal API server
@@ -223,63 +261,17 @@ func (api *InternalAPI) handleDetect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var video DetectedVideo
-	if err := json.NewDecoder(r.Body).Decode(&video); err != nil {
+	var request ProxyDetectedVideoRequest
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		return
 	}
-
-	// Add to storage
-	api.videosMu.Lock()
-	// Check for duplicates
-	isDuplicate := false
-	for _, v := range api.detectedVideos {
-		if v.URL == video.URL {
-			isDuplicate = true
-			break
-		}
+	video := request.toDomain(time.Now().UTC())
+	if _, err := api.Ingest(r.Context(), video); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
-	if video.Source == "wechat" {
-		// Ensure only ONE WeChat item is marked as current at any time.
-		if video.IsCurrent {
-			for i := range api.detectedVideos {
-				if api.detectedVideos[i].Source == "wechat" {
-					api.detectedVideos[i].IsCurrent = false
-				}
-			}
-		}
-
-		// Keep history but dedupe/update by stable ID (pageKey) to avoid spam
-		updated := false
-		if video.ID != "" {
-			for i, v := range api.detectedVideos {
-				if v.Source == "wechat" && v.ID == video.ID {
-					api.detectedVideos[i] = video
-					updated = true
-					break
-				}
-			}
-		}
-		if !updated && !isDuplicate {
-			api.detectedVideos = append(api.detectedVideos, video)
-		}
-		// Cap list size (avoid unbounded growth)
-		if len(api.detectedVideos) > 80 {
-			api.detectedVideos = api.detectedVideos[len(api.detectedVideos)-80:]
-		}
-		if api.onVideoDetected != nil {
-			api.onVideoDetected(video)
-		}
-	} else if !isDuplicate {
-		api.detectedVideos = append(api.detectedVideos, video)
-		logger.Debug("Detected new video: %s", video.Title)
-
-		// Trigger callback
-		if api.onVideoDetected != nil {
-			api.onVideoDetected(video)
-		}
-	}
-	api.videosMu.Unlock()
+	logger.Debug("Detected video upserted: %s", video.Title)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
@@ -292,12 +284,14 @@ func (api *InternalAPI) handleGetVideos(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	api.videosMu.RLock()
-	videos := api.detectedVideos
-	api.videosMu.RUnlock()
+	snapshot, err := api.detectionStore.List(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(videos)
+	json.NewEncoder(w).Encode(snapshot.Public())
 }
 
 // handleClear handles POST /api/clear - clears all detected videos
@@ -307,9 +301,10 @@ func (api *InternalAPI) handleClear(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	api.videosMu.Lock()
-	api.detectedVideos = make([]DetectedVideo, 0)
-	api.videosMu.Unlock()
+	if _, err := api.clearVideos(r.Context(), true); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
@@ -456,32 +451,164 @@ func (api *InternalAPI) handleProxyMedia(w http.ResponseWriter, r *http.Request)
 	}
 }
 
-// GetDetectedVideos returns all detected videos
-func (api *InternalAPI) GetDetectedVideos() []DetectedVideo {
-	api.videosMu.RLock()
-	defer api.videosMu.RUnlock()
-
-	videos := make([]DetectedVideo, len(api.detectedVideos))
-	copy(videos, api.detectedVideos)
-	return videos
+// getDetectedVideos returns the private domain list for package-local tests.
+// Public callers must use GetDetectionSnapshot.
+func (api *InternalAPI) getDetectedVideos() []detection.Video {
+	snapshot, err := api.detectionStore.List(context.Background())
+	if err != nil {
+		logger.Warn("Failed to list detected videos: %v", err)
+		return []detection.Video{}
+	}
+	return snapshot.Videos
 }
 
-// ClearVideos clears all detected videos
-func (api *InternalAPI) ClearVideos() {
-	api.videosMu.Lock()
-	api.detectedVideos = make([]DetectedVideo, 0)
-	api.videosMu.Unlock()
+// GetDetectionSnapshot returns the secret-free authoritative projection used
+// by Wails clients. Private candidate data never crosses this boundary.
+func (api *InternalAPI) GetDetectionSnapshot() detection.PublicSnapshot {
+	snapshot, err := api.detectionStore.List(context.Background())
+	if err != nil {
+		logger.Warn("Failed to list detected videos: %v", err)
+		return detection.PublicSnapshot{Videos: []detection.VideoDTO{}}
+	}
+	return snapshot.Public()
+}
+
+// ClearVideos clears all detected videos and returns the authoritative public
+// change so callers do not need to make speculative local edits.
+func (api *InternalAPI) ClearVideos() (detection.PublicChange, error) {
+	change, err := api.clearVideos(context.Background(), true)
+	if err != nil {
+		return detection.PublicChange{}, err
+	}
+	return change.Public(), nil
 }
 
 // RemoveVideo removes a video by ID
-func (api *InternalAPI) RemoveVideo(id string) {
-	api.videosMu.Lock()
-	defer api.videosMu.Unlock()
+func (api *InternalAPI) RemoveVideo(id string) (detection.PublicChange, error) {
+	change, err := api.detectionStore.Remove(context.Background(), id)
+	if err != nil {
+		return detection.PublicChange{}, err
+	}
+	if callback := api.videoCallback(); callback != nil {
+		callback(change)
+	}
+	return change.Public(), nil
+}
 
-	for i, v := range api.detectedVideos {
-		if v.ID == id {
-			api.detectedVideos = append(api.detectedVideos[:i], api.detectedVideos[i+1:]...)
-			break
+func (api *InternalAPI) clearVideos(ctx context.Context, publish bool) (detection.Change, error) {
+	change, err := api.detectionStore.Clear(ctx)
+	if callback := api.videoCallback(); err == nil && publish && callback != nil {
+		callback(change)
+	}
+	return change, err
+}
+
+func (request ProxyDetectedVideoRequest) toDomain(now time.Time) detection.Video {
+	platform := strings.ToLower(strings.TrimSpace(request.Source))
+	if platform == "" {
+		platform = "wechat"
+	}
+	source := detection.Source(platform + "_proxy")
+	if platform == "wechat" {
+		coverURL := request.CoverURL
+		if coverURL == "" {
+			coverURL = request.Cover
+		}
+		pageURL := strings.TrimSpace(request.PageURL)
+		if pageURL == "" {
+			pageURL = strings.TrimSpace(request.Href)
+		}
+		specs := make([]wechat.VideoSpec, 0, len(request.Specs))
+		for _, spec := range request.Specs {
+			specs = append(specs, wechat.VideoSpec{
+				FileFormat: spec.FileFormat, Width: spec.Width, Height: spec.Height, DurationMs: spec.DurationMs,
+			})
+		}
+		return wechatadapter.FromVideoInfo(wechat.VideoInfo{
+			ID: request.ID, PageKey: request.PageKey, Href: pageURL, URL: request.URL,
+			CoverURL: coverURL, Title: request.Title, FileSize: request.FileSize,
+			DecodeKey: request.DecodeKey, FileFormats: append([]string(nil), request.FileFormats...),
+			Specs: specs, Author: request.Author, AuthorAvatar: request.AuthorAvatar,
+			Duration: request.Duration, Width: request.Width, Height: request.Height,
+			IsCurrentVideo: request.IsCurrent, TS: request.Timestamp, Source: request.Source,
+		}, now)
+	}
+	pageURL := strings.TrimSpace(request.PageURL)
+	if pageURL == "" {
+		pageURL = strings.TrimSpace(request.Href)
+	}
+	contentID := strings.TrimSpace(request.ID)
+	if contentID == "" {
+		contentID = strings.TrimSpace(request.PageKey)
+	}
+	seenAt := timestampTime(request.Timestamp, now)
+	coverURL := request.CoverURL
+	if coverURL == "" {
+		coverURL = request.Cover
+	}
+	size := int64(0)
+	if request.FileSize > 0 {
+		size = int64(request.FileSize)
+	}
+	video := detection.Video{
+		Source: source, Platform: platform, Title: request.Title, Author: request.Author,
+		PageURL: pageURL, CoverURL: coverURL,
+		DetectedAt: seenAt, LastSeenAt: seenAt,
+		AuthorAvatar: request.AuthorAvatar,
+		DurationMS:   request.Duration, Width: request.Width, Height: request.Height,
+		IsCurrent: request.IsCurrent,
+	}
+	video.ID = detection.StableID(detection.Identity{
+		Source: source, Platform: platform, PlatformContentID: contentID,
+		PageURL: pageURL, PrimaryURL: request.URL,
+	})
+	if request.URL != "" {
+		headers := map[string]string(nil)
+		if platform == "wechat" {
+			headers = map[string]string{"Referer": "https://channels.weixin.qq.com/"}
+		}
+		video.Candidates = append(video.Candidates, detection.Resource{
+			ID: "original", URL: request.URL, Headers: headers, DecodeKey: request.DecodeKey,
+			Quality: request.Quality, Width: request.Width, Height: request.Height,
+			DurationMS: request.Duration, SizeBytes: size, Default: true,
+		})
+		seenFormats := make(map[string]struct{}, len(request.Specs)+len(request.FileFormats))
+		for _, spec := range request.Specs {
+			format := strings.TrimSpace(spec.FileFormat)
+			if format == "" {
+				continue
+			}
+			seenFormats[format] = struct{}{}
+			video.Candidates = append(video.Candidates, detection.Resource{
+				ID: "format:" + format, URL: request.URL, Headers: headers, DecodeKey: request.DecodeKey,
+				FileFormat: format, Width: spec.Width, Height: spec.Height,
+				DurationMS: spec.DurationMs,
+			})
+		}
+		for _, rawFormat := range request.FileFormats {
+			format := strings.TrimSpace(rawFormat)
+			if format == "" {
+				continue
+			}
+			if _, exists := seenFormats[format]; exists {
+				continue
+			}
+			seenFormats[format] = struct{}{}
+			video.Candidates = append(video.Candidates, detection.Resource{
+				ID: "format:" + format, URL: request.URL, Headers: headers, DecodeKey: request.DecodeKey,
+				FileFormat: format,
+			})
 		}
 	}
+	return video
+}
+
+func timestampTime(value int64, fallback time.Time) time.Time {
+	if value <= 0 {
+		return fallback
+	}
+	if value > 1_000_000_000_000 {
+		return time.UnixMilli(value).UTC()
+	}
+	return time.Unix(value, 0).UTC()
 }

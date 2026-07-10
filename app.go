@@ -2,10 +2,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
-	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -13,14 +14,19 @@ import (
 	"EasyDownload/assets/icons"
 	"EasyDownload/internal/api"
 	"EasyDownload/internal/config"
+	"EasyDownload/internal/detection"
+	"EasyDownload/internal/detection/wechatadapter"
 	"EasyDownload/internal/download"
 	"EasyDownload/internal/download/bilibili"
 	"EasyDownload/internal/download/douyin"
+	"EasyDownload/internal/download/fetch"
+	downloadtask "EasyDownload/internal/download/task"
 	"EasyDownload/internal/download/wechat"
 	"EasyDownload/internal/download/xiaohongshu"
 	"EasyDownload/internal/infra/ffmpeg"
 	"EasyDownload/internal/infra/logger"
 	"EasyDownload/internal/proxy"
+	"EasyDownload/internal/settings"
 	"EasyDownload/internal/tray"
 	"EasyDownload/internal/utils"
 
@@ -45,27 +51,28 @@ type App struct {
 	trayManager        *tray.TrayManager
 	ffmpegManager      *ffmpeg.FFmpegManager
 	configManager      *config.ConfigManager
-
-	// Settings
-	proxyPort            int
-	apiPort              int
-	downloadDir          string
-	minimizeToTray       bool
-	showNotification     bool
-	firstRunComplete     bool
-	dontRemindCertWizard bool
-	theme                string // "dark" or "light"
-	language             string // "zh-CN" or "en-US"
-	upstreamProxy        string // Upstream proxy URL
-	useUpstreamProxy     bool   // Whether to use upstream proxy
-
-	// Diagnostics
-	proxyDebug bool
+	detectionStore     detection.Store
+	settingsModule     *settings.Module
+	settingsRuntimeMu  sync.Mutex
 
 	// Close behavior
-	closeAction    string // "exit", "minimize", or "" (ask)
-	dontAskOnClose bool   // Whether to skip the close confirmation dialog
-	quitRequested  atomic.Bool
+	quitRequested atomic.Bool
+}
+
+type appFFmpegLocator struct{ manager *ffmpeg.FFmpegManager }
+
+func (locator appFFmpegLocator) Locate(ctx context.Context) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if locator.manager == nil {
+		return "", fmt.Errorf("ffmpeg manager is not initialized")
+	}
+	path := strings.TrimSpace(locator.manager.GetPath())
+	if path == "" {
+		return "", fmt.Errorf("ffmpeg is not available")
+	}
+	return path, nil
 }
 
 // NewApp creates a new App application struct
@@ -77,22 +84,7 @@ func NewApp() *App {
 	utils.EnsureDir(appDataDir)
 	utils.EnsureDir(downloadDir)
 
-	return &App{
-		proxyPort:            8899,
-		apiPort:              18899,
-		downloadDir:          downloadDir,
-		minimizeToTray:       true,
-		showNotification:     true,
-		firstRunComplete:     false,
-		dontRemindCertWizard: false,
-		theme:                "dark",
-		language:             "zh-CN",
-		upstreamProxy:        "",
-		useUpstreamProxy:     false,
-		proxyDebug:           false,
-		closeAction:          "",    // Empty means ask user
-		dontAskOnClose:       false, // Show dialog by default
-	}
+	return &App{}
 }
 
 // startup is called when the app starts
@@ -105,38 +97,10 @@ func (a *App) startup(ctx context.Context) {
 	if err := a.configManager.Load(); err != nil {
 		logger.Error("Failed to load config: %v", err)
 	}
-	if a.configManager != nil {
-		cfg := a.configManager.Get()
-		if cfg != nil {
-			// Apply config to app fields (only if non-zero/meaningful)
-			if cfg.ProxyPort > 0 {
-				a.proxyPort = cfg.ProxyPort
-			}
-			if cfg.APIPort > 0 {
-				a.apiPort = cfg.APIPort
-			}
-			if cfg.DownloadDir != "" {
-				a.downloadDir = cfg.DownloadDir
-			}
-			a.minimizeToTray = cfg.MinimizeToTray
-			a.showNotification = cfg.ShowNotification
-			a.firstRunComplete = cfg.FirstRunComplete
-			a.dontRemindCertWizard = cfg.DontRemindCertWizard
-			if cfg.Theme != "" {
-				a.theme = cfg.Theme
-			}
-			if cfg.Language != "" {
-				a.language = cfg.Language
-			}
-			a.upstreamProxy = cfg.UpstreamProxy
-			a.useUpstreamProxy = cfg.UseUpstreamProxy
-			a.proxyDebug = cfg.ProxyDebug
-			a.closeAction = cfg.CloseAction
-			a.dontAskOnClose = cfg.DontAskOnClose
-		}
-	}
+	a.settingsModule = settings.NewModule(a.configManager, appSettingsEffectPlanner{app: a})
+	cfg := a.currentConfig()
 
-	if a.proxyDebug {
+	if cfg.ProxyDebug {
 		logger.GetGlobalLogger().SetLevel(logger.LevelDebug)
 	}
 
@@ -148,44 +112,24 @@ func (a *App) startup(ctx context.Context) {
 	// Users must install certificate via Welcome Wizard or Settings page
 
 	// Initialize proxy server
-	a.proxyServer = proxy.NewProxyServer(a.certManager, a.proxyPort)
-	a.proxyServer.SetDebug(a.proxyDebug)
+	a.proxyServer = proxy.NewProxyServer(a.certManager, cfg.ProxyPort)
+	a.proxyServer.SetDebug(cfg.ProxyDebug)
+	if cfg.UseUpstreamProxy && cfg.UpstreamProxy != "" {
+		a.proxyServer.SetUpstreamProxy(cfg.UpstreamProxy)
+	}
 
 	// Initialize system proxy
 	a.systemProxy = proxy.NewSystemProxy()
 
-	// Initialize internal API
-	a.internalAPI = api.NewInternalAPI(a.apiPort)
-	a.internalAPI.SetVideoCallback(func(video api.DetectedVideo) {
-		// Emit event to frontend
-		runtime.EventsEmit(a.ctx, "video:detected", video)
-	})
-
-	// Initialize download manager and restore persisted task state.
-	a.downloadManager = downloader.NewDownloadManager(a.downloadDir, 3)
-	a.downloadManager.SetStatePath(filepath.Join(utils.GetAppDataDir(), "downloads.json"))
-	if err := a.downloadManager.LoadState(); err != nil {
-		logger.Error("Failed to load download state: %v", err)
-	}
-	a.downloadManager.SetProgressCallback(func(task *downloader.DownloadTask) {
-		runtime.EventsEmit(a.ctx, "download:progress", task.TaskToJSON())
-	})
-	a.downloadManager.SetCompleteCallback(func(task *downloader.DownloadTask) {
-		runtime.EventsEmit(a.ctx, "download:complete", task.TaskToJSON())
-		// Show notification for download complete
-		if a.showNotification && a.trayManager != nil {
-			a.trayManager.ShowNotification("下载完成", task.Title)
-		}
-	})
-	a.downloadManager.SetErrorCallback(func(task *downloader.DownloadTask, err error) {
-		runtime.EventsEmit(a.ctx, "download:error", map[string]interface{}{
-			"task":  task.TaskToJSON(),
-			"error": err.Error(),
-		})
+	// Initialize the session-scoped detection store and API adapter.
+	a.detectionStore = detection.NewMemoryStore(100)
+	a.internalAPI = api.NewInternalAPI(cfg.APIPort, a.detectionStore)
+	a.internalAPI.SetVideoCallback(func(change detection.Change) {
+		runtime.EventsEmit(a.ctx, "video:detected", change.Public())
 	})
 
 	// Initialize Bilibili downloader
-	a.bilibiliDownloader = bilibili.NewBilibiliDownloader()
+	a.bilibiliDownloader = bilibili.NewBilibiliDownloader(bilibili.NewAPIHTTPClient())
 	if a.configManager != nil {
 		a.bilibiliDownloader.SetConfigManager(a.configManager)
 		// Load persisted SESSDATA
@@ -202,11 +146,6 @@ func (a *App) startup(ctx context.Context) {
 	a.xhsClient = xiaohongshu.NewClient()
 	a.xhsDownloader = xiaohongshu.NewDownloader()
 
-	// Douyin/XHS custom downloader closures cannot be reconstructed safely from
-	// persisted state alone. Mark unfinished restored tasks as needing re-parse
-	// instead of letting them resume through the generic HTTP downloader.
-	a.markUnresumableRestoredCustomTasks()
-
 	// Initialize FFmpeg manager with embedded FFmpeg
 	a.ffmpegManager = ffmpeg.NewFFmpegManager()
 	ffmpegDir := filepath.Join(utils.GetAppDataDir(), "ffmpeg")
@@ -214,6 +153,50 @@ func (a *App) startup(ctx context.Context) {
 
 	// Set FFmpeg manager for Bilibili downloader
 	a.bilibiliDownloader.SetFFmpegManager(a.ffmpegManager)
+
+	// Initialize download manager and restore persisted task state.
+	a.downloadManager = downloader.NewDownloadManager(cfg.DownloadDir, cfg.MaxConcurrent)
+	// The composition root owns one shared transport capability. Platform
+	// adapters can only obtain it through TaskExecutionContext.
+	a.downloadManager.SetExecutionCapabilities(fetch.New(nil), appFFmpegLocator{manager: a.ffmpegManager}, nil)
+	for _, entry := range []struct {
+		name    string
+		adapter downloadtask.PlatformAdapter
+	}{
+		{name: "generic", adapter: downloader.NewGenericAdapter()},
+		{name: "wechat", adapter: wechat.NewAdapter()},
+		{name: "bilibili", adapter: bilibili.NewAdapter(a.bilibiliDownloader)},
+		{name: "douyin", adapter: douyin.NewAdapter(a.douyinDownloader)},
+		{name: "xiaohongshu", adapter: xiaohongshu.NewAdapter(a.xhsDownloader)},
+	} {
+		if err := a.downloadManager.RegisterPlatformAdapter(entry.adapter); err != nil {
+			logger.Warn("Failed to register %s download adapter: %v", entry.name, err)
+		}
+	}
+	a.downloadManager.SetStatePath(filepath.Join(utils.GetAppDataDir(), "downloads.json"))
+	if err := a.downloadManager.LoadState(); err != nil {
+		logger.Error("Failed to load download state: %v", err)
+	}
+	a.downloadManager.SetProgressCallback(func(task *downloader.DownloadTask) {
+		runtime.EventsEmit(a.ctx, "download:progress", a.downloadManager.PublicTaskSnapshot(task))
+	})
+	a.downloadManager.SetCompleteCallback(func(task *downloader.DownloadTask) {
+		runtime.EventsEmit(a.ctx, "download:complete", a.downloadManager.PublicTaskSnapshot(task))
+		// Show notification for download complete
+		if a.notificationsEnabled() && a.trayManager != nil {
+			a.trayManager.ShowNotification("下载完成", task.Title)
+		}
+	})
+	a.downloadManager.SetErrorCallback(func(task *downloader.DownloadTask, err error) {
+		publicTask := a.downloadManager.PublicTaskSnapshot(task)
+		runtime.EventsEmit(a.ctx, "download:error", map[string]interface{}{
+			"task":  publicTask,
+			"error": publicTask.Error,
+		})
+	})
+	a.downloadManager.SetStopEventCallback(func(event downloader.StopEvent) {
+		runtime.EventsEmit(a.ctx, "download:lifecycle", event)
+	})
 
 	// Set embedded FS and extract if available
 	if assets.HasEmbeddedFFmpeg() {
@@ -231,46 +214,17 @@ func (a *App) startup(ctx context.Context) {
 	if ffmpegPath := a.ffmpegManager.GetPath(); ffmpegPath != "" {
 		logger.Debug("FFmpeg detected at: %s", ffmpegPath)
 		// Cache to config for faster startup next time
-		if a.configManager != nil {
-			_ = a.configManager.Set("ffmpegPath", ffmpegPath)
-		}
+		a.updateRuntimeMetadataBestEffort(config.RuntimeMetadataPatch{FFmpegPath: &ffmpegPath})
 		// Ensure frontend is notified if it wasn't the embedded extraction that triggered it
 		runtime.EventsEmit(a.ctx, "ffmpeg:ready", true)
 	}
 
 	// Set proxy video callback
-	a.proxyServer.SetVideoCallback(func(video proxy.VideoInfo) {
-		// Convert specs from proxy type to api type
-		apiSpecs := make([]api.VideoSpec, len(video.Specs))
-		for i, spec := range video.Specs {
-			apiSpecs[i] = api.VideoSpec{
-				FileFormat: spec.FileFormat,
-				Width:      spec.Width,
-				Height:     spec.Height,
-				DurationMs: spec.DurationMs,
-			}
+	a.proxyServer.SetVideoCallback(func(video wechat.VideoInfo) {
+		detected := wechatadapter.FromVideoInfo(video, time.Now())
+		if _, err := a.internalAPI.Ingest(a.ctx, detected); err != nil {
+			logger.Warn("Failed to store detected video: %v", err)
 		}
-
-		apiVideo := api.DetectedVideo{
-			ID:           video.ID,
-			Title:        video.Title,
-			Cover:        video.Cover,
-			URL:          video.URL,
-			Source:       video.Source,
-			Quality:      video.Quality,
-			Duration:     video.Duration,
-			Author:       video.Author,
-			AuthorAvatar: video.AuthorAvatar,
-			Timestamp:    video.Timestamp,
-			DecodeKey:    video.DecodeKey,
-			FileSize:     video.FileSize,
-			Width:        video.Width,
-			Height:       video.Height,
-			IsCurrent:    video.IsCurrent,
-			FileFormats:  video.FileFormats,
-			Specs:        apiSpecs,
-		}
-		runtime.EventsEmit(a.ctx, "video:detected", apiVideo)
 	})
 
 	// Set download callback for one-click download from video page
@@ -279,42 +233,36 @@ func (a *App) startup(ctx context.Context) {
 			video.Title, video.ID, video.PageKey, video.Source,
 		)
 
-		// Create unique ID
-		id := fmt.Sprintf("wechat_%d", time.Now().UnixNano())
-
-		// Add to download manager with decodeKey
-		task, err := a.downloadManager.AddTaskWithDecodeKey(
-			id,
+		platformData, err := wechat.MarshalPlatformData(
 			video.URL,
-			video.Title,
-			video.CoverURL,
-			"wechat",
-			"",
+			map[string]string{"Referer": "https://channels.weixin.qq.com/"},
 			video.DecodeKey,
+			"",
 		)
 		if err != nil {
-			logger.Error("Failed to add download task: %v", err)
+			logger.Error("Failed to prepare download task: %v", err)
 			runtime.EventsEmit(a.ctx, "download:error", map[string]interface{}{
-				"error": err.Error(),
+				"error": "无法创建微信下载任务",
 			})
 			return
 		}
-
-		// Start downloading immediately
-		if err := a.downloadManager.StartTask(id); err != nil {
+		task, err := a.createAndStartDownload(downloader.TaskCreationInput{
+			ID: fmt.Sprintf("wechat_%d", time.Now().UnixNano()), PlatformID: downloadtask.PlatformWeChat,
+			Title: video.Title, Cover: video.CoverURL, DisplaySource: "wechat",
+			SuggestedFilename: video.Title, SuggestedExtension: ".mp4",
+			PlatformDataVersion: 1, PlatformData: platformData,
+		})
+		if err != nil {
 			logger.Error("Failed to start download task: %v", err)
 			runtime.EventsEmit(a.ctx, "download:error", map[string]interface{}{
-				"task":  task.TaskToJSON(),
-				"error": err.Error(),
+				"error": "无法启动微信下载任务",
 			})
 			return
 		}
-
-		// Notify frontend
-		runtime.EventsEmit(a.ctx, "download:start", task.TaskToJSON())
+		logger.Info("Started WeChat download task: %s", task.ID)
 
 		// Show notification
-		if a.showNotification && a.trayManager != nil {
+		if a.notificationsEnabled() && a.trayManager != nil {
 			a.trayManager.ShowNotification("开始下载", video.Title)
 		}
 	})
@@ -359,6 +307,12 @@ func (a *App) initTray() {
 // shutdown is called when the app is closing
 func (a *App) shutdown(ctx context.Context) {
 	if a.downloadManager != nil {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		result := a.downloadManager.Shutdown(shutdownCtx)
+		cancel()
+		if !result.Completed {
+			logger.Warn("Download shutdown timed out; recoverable tasks remain: %v", result.TimedOutTaskIDs)
+		}
 		if err := a.downloadManager.SaveState(); err != nil {
 			logger.Warn("Failed to save download state on shutdown: %v", err)
 		}
@@ -385,16 +339,365 @@ func (a *App) shutdown(ctx context.Context) {
 	logger.Debug("App shutdown complete")
 }
 
+func (a *App) currentConfig() *config.Config {
+	if a.configManager == nil {
+		return config.DefaultConfig()
+	}
+	return a.configManager.Get()
+}
+
+func (a *App) currentSettings() settings.Snapshot {
+	return settings.FromConfig(a.currentConfig())
+}
+
+func (a *App) currentDownloadDir() string {
+	return a.currentSettings().DownloadDir
+}
+
+func (a *App) notificationsEnabled() bool {
+	return a.currentSettings().ShowNotification
+}
+
+func (a *App) updateRuntimeMetadataBestEffort(patch config.RuntimeMetadataPatch) {
+	if a.configManager == nil {
+		return
+	}
+	if err := a.configManager.UpdateRuntimeMetadata(context.Background(), patch); err != nil {
+		logger.Warn("Failed to update runtime metadata: %v", err)
+	}
+}
+
+type appSettingsEffectPlanner struct {
+	app          *App
+	proxyRuntime appSettingsProxyRuntime
+}
+
+type appSettingsProxyRuntime interface {
+	IsRunning() bool
+	GetPort() int
+	SetPort(int) error
+	SetUpstreamProxy(string)
+	SetDebug(bool)
+}
+
+func (p appSettingsEffectPlanner) currentProxyRuntime() appSettingsProxyRuntime {
+	if p.proxyRuntime != nil {
+		return p.proxyRuntime
+	}
+	if p.app == nil {
+		return nil
+	}
+	return p.app.proxyServer
+}
+
+type appCriticalSettingsEffect struct {
+	name      string
+	preflight func(context.Context) error
+	apply     func(context.Context) error
+	rollback  func(context.Context) error
+	commit    func(context.Context) error
+}
+
+func (e appCriticalSettingsEffect) Name() string { return e.name }
+func (e appCriticalSettingsEffect) Preflight(ctx context.Context) error {
+	if e.preflight == nil {
+		return ctx.Err()
+	}
+	return e.preflight(ctx)
+}
+func (e appCriticalSettingsEffect) Apply(ctx context.Context) error {
+	if e.apply == nil {
+		return ctx.Err()
+	}
+	return e.apply(ctx)
+}
+func (e appCriticalSettingsEffect) Rollback(ctx context.Context) error {
+	if e.rollback == nil {
+		return ctx.Err()
+	}
+	return e.rollback(ctx)
+}
+func (e appCriticalSettingsEffect) Commit(ctx context.Context) error {
+	if e.commit == nil {
+		return nil
+	}
+	return e.commit(ctx)
+}
+
+type appDeferredSettingsEffect struct {
+	requirement settings.RestartRequirement
+}
+
+func (e appDeferredSettingsEffect) Requirement() settings.RestartRequirement {
+	return e.requirement
+}
+
+type appBestEffortSettingsEffect struct {
+	name  string
+	apply func(context.Context) error
+}
+
+func (e appBestEffortSettingsEffect) Name() string { return e.name }
+func (e appBestEffortSettingsEffect) Apply(ctx context.Context) error {
+	if e.apply == nil {
+		return ctx.Err()
+	}
+	return e.apply(ctx)
+}
+
+func (p appSettingsEffectPlanner) Plan(current, candidate settings.SettingsSnapshot, changed settings.Changed) (settings.SettingsEffectPlan, error) {
+	plan := settings.SettingsEffectPlan{}
+	if p.app == nil {
+		return plan, fmt.Errorf("app settings effect planner is not initialized")
+	}
+	fieldEffects := settings.DefaultFieldEffectRegistry()
+	if err := settings.ValidateChangedFields(changed, fieldEffects); err != nil {
+		return plan, err
+	}
+	handled := settings.Changed{}
+	markHandled := func(fields ...string) {
+		for _, field := range fields {
+			if changed.Has(field) {
+				handled[field] = true
+			}
+		}
+	}
+
+	checkContext := func(ctx context.Context) error { return ctx.Err() }
+	proxyRuntime := p.currentProxyRuntime()
+	if changed.Has("downloadDir") || changed.Has("maxConcurrent") {
+		var runtimeUpdate *downloader.RuntimeConfigUpdate
+		runtimePatch := downloader.RuntimeConfigPatch{}
+		if changed.Has("downloadDir") {
+			downloadDir := candidate.DownloadDir
+			runtimePatch.DownloadDir = &downloadDir
+		}
+		if changed.Has("maxConcurrent") {
+			maxConcurrent := candidate.MaxConcurrent
+			runtimePatch.MaxConcurrent = &maxConcurrent
+		}
+		plan.CriticalReversible = append(plan.CriticalReversible, appCriticalSettingsEffect{
+			name: "download_runtime_config",
+			preflight: func(ctx context.Context) error {
+				if err := checkContext(ctx); err != nil {
+					return err
+				}
+				if p.app.downloadManager == nil {
+					return fmt.Errorf("download manager is not initialized")
+				}
+				if changed.Has("downloadDir") {
+					if err := config.ValidateDownloadDir(candidate.DownloadDir); err != nil {
+						return err
+					}
+				}
+				return nil
+			},
+			apply: func(ctx context.Context) error {
+				if err := checkContext(ctx); err != nil {
+					return err
+				}
+				var err error
+				runtimeUpdate, err = p.app.downloadManager.BeginRuntimeConfigUpdate(runtimePatch)
+				return err
+			},
+			rollback: func(context.Context) error {
+				if runtimeUpdate == nil {
+					return nil
+				}
+				return runtimeUpdate.Rollback()
+			},
+			commit: func(context.Context) error {
+				if runtimeUpdate == nil {
+					return nil
+				}
+				return runtimeUpdate.Commit()
+			},
+		})
+		markHandled("downloadDir", "maxConcurrent")
+	}
+	if changed.Has("upstreamProxy") || changed.Has("useUpstreamProxy") {
+		proxyValue := func(snapshot settings.SettingsSnapshot) string {
+			if snapshot.UseUpstreamProxy {
+				return snapshot.UpstreamProxy
+			}
+			return ""
+		}
+		plan.CriticalReversible = append(plan.CriticalReversible, appCriticalSettingsEffect{
+			name: "upstream_proxy",
+			preflight: func(ctx context.Context) error {
+				if err := checkContext(ctx); err != nil {
+					return err
+				}
+				if proxyRuntime == nil {
+					return fmt.Errorf("proxy server is not initialized")
+				}
+				return nil
+			},
+			apply: func(ctx context.Context) error {
+				if err := checkContext(ctx); err != nil {
+					return err
+				}
+				proxyRuntime.SetUpstreamProxy(proxyValue(candidate))
+				return nil
+			},
+			rollback: func(ctx context.Context) error {
+				if err := checkContext(ctx); err != nil {
+					return err
+				}
+				proxyRuntime.SetUpstreamProxy(proxyValue(current))
+				return nil
+			},
+		})
+		markHandled("upstreamProxy", "useUpstreamProxy")
+	}
+	if changed.Has("proxyDebug") {
+		applyDebug := func(enabled bool) {
+			if enabled {
+				logger.GetGlobalLogger().SetLevel(logger.LevelDebug)
+			} else {
+				logger.GetGlobalLogger().SetLevel(logger.LevelInfo)
+			}
+			proxyRuntime.SetDebug(enabled)
+		}
+		plan.CriticalReversible = append(plan.CriticalReversible, appCriticalSettingsEffect{
+			name: "proxy_debug",
+			preflight: func(ctx context.Context) error {
+				if err := checkContext(ctx); err != nil {
+					return err
+				}
+				if proxyRuntime == nil {
+					return fmt.Errorf("proxy server is not initialized")
+				}
+				return nil
+			},
+			apply: func(ctx context.Context) error {
+				if err := checkContext(ctx); err != nil {
+					return err
+				}
+				applyDebug(candidate.ProxyDebug)
+				return nil
+			},
+			rollback: func(ctx context.Context) error {
+				if err := checkContext(ctx); err != nil {
+					return err
+				}
+				applyDebug(current.ProxyDebug)
+				return nil
+			},
+		})
+		markHandled("proxyDebug")
+	}
+
+	if changed.Has("proxyPort") {
+		if proxyRuntime == nil {
+			return plan, fmt.Errorf("proxy server is not initialized")
+		}
+		if proxyRuntime.IsRunning() {
+			if proxyRuntime.GetPort() != candidate.ProxyPort {
+				plan.DeferredRestart = append(plan.DeferredRestart, appDeferredSettingsEffect{requirement: settings.RestartRequirement{
+					Scope: "proxy", Fields: []string{"proxyPort"}, Reason: "stop and start the proxy to bind the new proxy port",
+				}})
+			}
+		} else {
+			plan.CriticalReversible = append(plan.CriticalReversible, appCriticalSettingsEffect{
+				name: "proxy_port",
+				preflight: func(ctx context.Context) error {
+					if err := checkContext(ctx); err != nil {
+						return err
+					}
+					if proxyRuntime.IsRunning() {
+						return fmt.Errorf("proxy started while applying proxyPort")
+					}
+					return nil
+				},
+				apply: func(ctx context.Context) error {
+					if err := checkContext(ctx); err != nil {
+						return err
+					}
+					return proxyRuntime.SetPort(candidate.ProxyPort)
+				},
+				rollback: func(ctx context.Context) error {
+					if err := checkContext(ctx); err != nil {
+						return err
+					}
+					return proxyRuntime.SetPort(current.ProxyPort)
+				},
+			})
+		}
+		markHandled("proxyPort")
+	}
+	if changed.Has("apiPort") {
+		plan.DeferredRestart = append(plan.DeferredRestart, appDeferredSettingsEffect{requirement: settings.RestartRequirement{
+			Scope: "app", Fields: []string{"apiPort"}, Reason: "restart the application to bind the new internal API port",
+		}})
+		markHandled("apiPort")
+	}
+	for field, didChange := range changed {
+		if !didChange || !settings.RequiresSpecificPlannerEffect(fieldEffects[field]) {
+			continue
+		}
+		if !handled.Has(field) {
+			return plan, fmt.Errorf("settings field %q was classified but not handled by the app effect planner", field)
+		}
+	}
+
+	plan.BestEffort = append(plan.BestEffort, appBestEffortSettingsEffect{
+		name: "publish_settings_changed",
+		apply: func(ctx context.Context) error {
+			if err := checkContext(ctx); err != nil {
+				return err
+			}
+			if p.app.ctx == nil {
+				return fmt.Errorf("Wails context is not initialized")
+			}
+			runtime.EventsEmit(p.app.ctx, "settings:changed", map[string]interface{}{
+				"settings": candidate,
+				"changed":  changed,
+			})
+			return nil
+		},
+	})
+	return plan, nil
+}
+
+type SettingsDiagnostic struct {
+	Code           string   `json:"code"`
+	Message        string   `json:"message"`
+	RollbackErrors []string `json:"rollbackErrors,omitempty"`
+}
+
+func (a *App) reportSettingsTransactionError(err error) {
+	var transactionErr *settings.TransactionError
+	if !errors.As(err, &transactionErr) {
+		return
+	}
+	diagnostic := SettingsDiagnostic{Code: "settings.inconsistent", Message: transactionErr.Error()}
+	for _, rollbackErr := range transactionErr.RollbackErrors {
+		diagnostic.RollbackErrors = append(diagnostic.RollbackErrors, rollbackErr.Error())
+	}
+	logger.Error("Settings transaction rollback was incomplete: %s", diagnostic.Message)
+	if a.ctx != nil {
+		runtime.EventsEmit(a.ctx, "settings:diagnostic", diagnostic)
+	}
+}
+
 // ==================== Proxy Methods ====================
 
 // StartProxy starts the MITM proxy server
 func (a *App) StartProxy() error {
+	a.settingsRuntimeMu.Lock()
+	defer a.settingsRuntimeMu.Unlock()
+
+	current := a.currentSettings()
+	if err := prepareProxyRuntimeForStart(a.proxyServer, current); err != nil {
+		return fmt.Errorf("prepare proxy listener: %w", err)
+	}
 	if err := a.proxyServer.Start(); err != nil {
 		return err
 	}
 
 	// Enable system proxy
-	proxyAddr := fmt.Sprintf("127.0.0.1:%d", a.proxyPort)
+	proxyAddr := fmt.Sprintf("127.0.0.1:%d", current.ProxyPort)
 	if err := a.systemProxy.Enable(proxyAddr); err != nil {
 		a.proxyServer.Stop()
 		return fmt.Errorf("failed to enable system proxy: %w", err)
@@ -408,8 +711,18 @@ func (a *App) StartProxy() error {
 	return nil
 }
 
+func prepareProxyRuntimeForStart(proxyRuntime appSettingsProxyRuntime, current settings.SettingsSnapshot) error {
+	if proxyRuntime == nil {
+		return fmt.Errorf("proxy server is not initialized")
+	}
+	return proxyRuntime.SetPort(current.ProxyPort)
+}
+
 // StopProxy stops the MITM proxy server
 func (a *App) StopProxy() error {
+	a.settingsRuntimeMu.Lock()
+	defer a.settingsRuntimeMu.Unlock()
+
 	// Disable system proxy first
 	if err := a.systemProxy.Disable(); err != nil {
 		logger.Warn("Failed to disable system proxy: %v", err)
@@ -428,11 +741,6 @@ func (a *App) StopProxy() error {
 // IsProxyRunning returns whether the proxy is running
 func (a *App) IsProxyRunning() bool {
 	return a.proxyServer != nil && a.proxyServer.IsRunning()
-}
-
-// GetProxyPort returns the proxy port
-func (a *App) GetProxyPort() int {
-	return a.proxyPort
 }
 
 // ==================== Certificate Methods ====================
@@ -455,9 +763,8 @@ func (a *App) InstallCert() error {
 	err := a.certManager.InstallCert()
 	if err == nil {
 		// Cache the installation status immediately
-		if a.configManager != nil {
-			_ = a.configManager.Set("certInstalled", true)
-		}
+		installed := true
+		a.updateRuntimeMetadataBestEffort(config.RuntimeMetadataPatch{CertInstalled: &installed})
 	}
 	return err
 }
@@ -467,9 +774,8 @@ func (a *App) UninstallCert() error {
 	err := a.certManager.UninstallCert()
 	if err == nil {
 		// Cache the uninstallation status immediately
-		if a.configManager != nil {
-			_ = a.configManager.Set("certInstalled", false)
-		}
+		installed := false
+		a.updateRuntimeMetadataBestEffort(config.RuntimeMetadataPatch{CertInstalled: &installed})
 	}
 	return err
 }
@@ -482,156 +788,104 @@ func (a *App) GetCertPath() string {
 // ==================== Video Detection Methods ====================
 
 // GetDetectedVideos returns all detected videos
-func (a *App) GetDetectedVideos() []api.DetectedVideo {
-	return a.internalAPI.GetDetectedVideos()
+func (a *App) GetDetectedVideos() detection.PublicSnapshot {
+	return a.internalAPI.GetDetectionSnapshot()
 }
 
 // ClearDetectedVideos clears all detected videos
-func (a *App) ClearDetectedVideos() {
-	a.internalAPI.ClearVideos()
+func (a *App) ClearDetectedVideos() (detection.PublicChange, error) {
+	return a.internalAPI.ClearVideos()
 }
 
 // RemoveDetectedVideo removes a detected video by ID
-func (a *App) RemoveDetectedVideo(id string) {
-	a.internalAPI.RemoveVideo(id)
+func (a *App) RemoveDetectedVideo(id string) (detection.PublicChange, error) {
+	return a.internalAPI.RemoveVideo(id)
 }
 
 // ==================== Download Methods ====================
 
-func (a *App) markUnresumableRestoredCustomTasks() {
+func (a *App) createAndStartDownload(input downloader.TaskCreationInput) (*downloader.DownloadTask, error) {
 	if a.downloadManager == nil {
-		return
+		return nil, fmt.Errorf("download manager is not initialized")
 	}
-	changed := false
-	for _, task := range a.downloadManager.GetAllTasks() {
-		status := task.GetStatus()
-		if status == downloader.StatusCompleted || status == downloader.StatusCancelled {
-			continue
-		}
-		source := strings.ToLower(strings.TrimSpace(task.Source))
-		if (source == "douyin" || source == "xiaohongshu") && task.GetCustomDownloader() == nil {
-			task.SetStatus(downloader.StatusFailed)
-			task.SetError("应用重启后需要重新解析后再下载")
-			changed = true
-		}
-	}
-	if changed {
-		if err := a.downloadManager.SaveState(); err != nil {
-			logger.Warn("Failed to save restored custom task state: %v", err)
-		}
-	}
-}
-
-func (a *App) ensureBilibiliTaskDownloader(task *downloader.DownloadTask) error {
-	if task == nil || strings.ToLower(strings.TrimSpace(task.Source)) != "bilibili" || task.GetCustomDownloader() != nil {
-		return nil
-	}
-
-	quality := 80
-	fmt.Sscanf(task.Quality, "%d", &quality)
-
-	partIndex := parseBilibiliTaskPartIndex(task.ID)
-	var video *bilibili.BilibiliVideo
-	var err error
-	if partIndex >= 0 {
-		video, err = a.getBilibiliVideoInfoWithPartsForDownload(task.URL)
-	} else {
-		video, err = a.GetBilibiliVideoInfo(task.URL)
-		if err == nil && video.IsBangumi {
-			partIndex = video.CurrentPartIndex
-		}
-	}
-	if err != nil {
-		return fmt.Errorf("failed to get Bilibili video info: %w", err)
-	}
-	task.SetCustomDownloader(a.createBilibiliDownloader(video, quality, partIndex))
-	return nil
-}
-
-// DownloadVideo adds a video to the download queue
-func (a *App) DownloadVideo(id, url, title, cover, source, quality string) (map[string]interface{}, error) {
-	return a.DownloadVideoWithKey(id, url, title, cover, source, quality, "")
-}
-
-// DownloadVideoWithKey adds a video to the download queue with optional decryption key
-func (a *App) DownloadVideoWithKey(id, url, title, cover, source, quality, decodeKey string) (map[string]interface{}, error) {
-	task, err := a.downloadManager.AddTaskWithDecodeKey(id, url, title, cover, source, quality, decodeKey)
+	task, err := a.downloadManager.CreateAndStartTask(input)
 	if err != nil {
 		return nil, err
 	}
-
-	// Start downloading
-	if err := a.downloadManager.StartTask(id); err != nil {
-		return nil, err
+	if a.ctx != nil {
+		runtime.EventsEmit(a.ctx, "download:start", a.downloadManager.PublicTaskSnapshot(task))
 	}
-
-	return task.TaskToJSON(), nil
+	return task, nil
 }
 
-// PauseDownload pauses a download
-func (a *App) PauseDownload(id string) error {
-	return a.downloadManager.PauseTask(id)
+// StartDetectedDownload resolves an opaque candidate ID entirely in the
+// backend. Wails clients never provide media URLs, request headers, or keys.
+func (a *App) StartDetectedDownload(detectionID, candidateID string) (downloader.PublicDownloadTask, error) {
+	video, candidate, err := a.detectionStore.ResolveCandidate(context.Background(), detectionID, candidateID)
+	if err != nil {
+		return downloader.PublicDownloadTask{}, &downloadtask.TaskError{
+			Code: "detection.candidate_expired", Category: downloadtask.TaskErrorCategoryPlatform,
+			Message: "检测到的资源已失效", Retryable: false, UserAction: "请重新检测后再下载",
+		}
+	}
+	platformID := downloadtask.PlatformGeneric
+	platformData, err := downloader.MarshalGenericPlatformData(candidate.URL, candidate.Headers)
+	if strings.EqualFold(video.Platform, string(downloadtask.PlatformWeChat)) {
+		platformID = downloadtask.PlatformWeChat
+		platformData, err = wechat.MarshalPlatformData(
+			candidate.URL, candidate.Headers, candidate.DecodeKey, candidate.FileFormat,
+		)
+	}
+	if err != nil {
+		return downloader.PublicDownloadTask{}, err
+	}
+	task, err := a.createAndStartDownload(downloader.TaskCreationInput{
+		ID: fmt.Sprintf("detected_%d", time.Now().UnixNano()), PlatformID: platformID,
+		Title: video.Title, Cover: video.CoverURL, DisplaySource: video.Platform,
+		SuggestedFilename: video.Title, SuggestedExtension: ".mp4",
+		PlatformDataVersion: 1, PlatformData: platformData,
+	})
+	if err != nil {
+		return downloader.PublicDownloadTask{}, err
+	}
+	return a.downloadManager.PublicTaskSnapshot(task), nil
+}
+
+// PauseDownload accepts an asynchronous stop operation. The terminal paused
+// state arrives through download:lifecycle.
+func (a *App) PauseDownload(id string, instance, generation uint64) (downloader.StopReceipt, error) {
+	return a.downloadManager.RequestPauseTaskExpected(id, instance, generation)
 }
 
 // ResumeDownload resumes a paused download
-func (a *App) ResumeDownload(id string) error {
-	task, err := a.downloadManager.GetTask(id)
-	if err != nil {
-		return err
-	}
-
-	// For Bilibili tasks, ensure custom downloader is set (may be lost after app restart).
-	if err := a.ensureBilibiliTaskDownloader(task); err != nil {
-		return err
-	}
-
-	if task.GetCustomDownloader() == nil {
-		source := strings.ToLower(strings.TrimSpace(task.Source))
-		if source == "douyin" || source == "xiaohongshu" {
-			return fmt.Errorf("%s 任务在应用重启后需要重新解析后再下载", task.Source)
-		}
-	}
-
-	// Use unified resume logic for all sources
-	return a.downloadManager.ResumeTask(id)
+func (a *App) ResumeDownload(id string, instance, generation uint64) error {
+	return a.downloadManager.ResumeTaskExpected(id, instance, generation)
 }
 
 // CancelDownload cancels a download
-func (a *App) CancelDownload(id string) error {
-	return a.downloadManager.CancelTask(id)
+func (a *App) CancelDownload(id string, instance, generation uint64) (downloader.StopReceipt, error) {
+	return a.downloadManager.RequestCancelTaskExpected(id, instance, generation)
 }
 
 // RetryDownload retries a failed download task.
-func (a *App) RetryDownload(id string) error {
-	task, err := a.downloadManager.GetTask(id)
-	if err != nil {
-		return err
-	}
-	if err := a.ensureBilibiliTaskDownloader(task); err != nil {
-		return err
-	}
-	if task.GetCustomDownloader() == nil {
-		source := strings.ToLower(strings.TrimSpace(task.Source))
-		if source == "douyin" || source == "xiaohongshu" {
-			return fmt.Errorf("%s 任务在应用重启后需要重新解析后再下载", task.Source)
-		}
-	}
-	return a.downloadManager.RetryTask(id)
+func (a *App) RetryDownload(id string, instance, generation uint64) error {
+	return a.downloadManager.RetryTaskExpected(id, instance, generation)
 }
 
 // RemoveDownload removes a download from the list
-func (a *App) RemoveDownload(id string) error {
-	return a.downloadManager.RemoveTask(id)
+func (a *App) RemoveDownload(id string, instance, generation uint64) (downloader.StopReceipt, error) {
+	return a.downloadManager.RequestRemoveTaskExpected(id, instance, generation)
 }
 
 // GetDownloads returns all download tasks
-func (a *App) GetDownloads() []map[string]interface{} {
-	tasks := a.downloadManager.GetAllTasks()
-	result := make([]map[string]interface{}, len(tasks))
-	for i, task := range tasks {
-		result[i] = task.TaskToJSON()
-	}
-	return result
+func (a *App) GetDownloads() []downloader.PublicDownloadTask {
+	return a.downloadManager.GetPublicTaskSnapshots()
+}
+
+// TakeLegacyDownloadNotice returns the one-shot v1 preservation notice shown
+// on the download page after the v2 activation.
+func (a *App) TakeLegacyDownloadNotice() *downloader.LegacyTaskStateNotice {
+	return a.downloadManager.TakeLegacyStateNotice()
 }
 
 // ==================== Bilibili Methods ====================
@@ -724,22 +978,19 @@ func (a *App) DownloadBilibiliVideo(rawURL string, quality int) (string, error) 
 		id = fmt.Sprintf("bilibili_%s_p%d_%d", idKey, video.Parts[partIndex].Page, time.Now().UnixNano())
 	}
 
-	// Create custom downloader function for Bilibili DASH format
-	bilibiliDownloader := a.createBilibiliDownloader(video, quality, partIndex)
-
-	// Add task with custom downloader
-	task, err := a.downloadManager.AddTaskWithDownloader(id, rawURL, title, cover, "bilibili", fmt.Sprintf("%d", quality), bilibiliDownloader)
+	platformData, err := bilibili.MarshalTaskData(video, quality, partIndex)
 	if err != nil {
 		return "", err
 	}
-
-	// Start download via DownloadManager (handles progress, completion, retry automatically)
-	if err := a.downloadManager.StartTask(id); err != nil {
+	_, err = a.createAndStartDownload(downloader.TaskCreationInput{
+		ID: id, PlatformID: downloadtask.PlatformBilibili,
+		Title: title, Cover: cover, DisplaySource: "bilibili",
+		SuggestedFilename: title, SuggestedExtension: ".mp4",
+		PlatformDataVersion: 1, PlatformData: platformData,
+	})
+	if err != nil {
 		return "", err
 	}
-
-	// Emit start event for frontend
-	runtime.EventsEmit(a.ctx, "download:start", task.TaskToJSON())
 
 	return id, nil
 }
@@ -764,22 +1015,19 @@ func (a *App) DownloadBilibiliPart(rawURL string, partIndex int, quality int) (s
 	title := formatBilibiliTaskTitle(video, part)
 	cover := formatBilibiliTaskCover(video, part)
 
-	// Create custom downloader function for this specific part
-	bilibiliDownloader := a.createBilibiliDownloader(video, quality, partIndex)
-
-	// Add task with custom downloader
-	task, err := a.downloadManager.AddTaskWithDownloader(id, rawURL, title, cover, "bilibili", fmt.Sprintf("%d", quality), bilibiliDownloader)
+	platformData, err := bilibili.MarshalTaskData(video, quality, partIndex)
 	if err != nil {
 		return "", err
 	}
-
-	// Start download via DownloadManager
-	if err := a.downloadManager.StartTask(id); err != nil {
+	_, err = a.createAndStartDownload(downloader.TaskCreationInput{
+		ID: id, PlatformID: downloadtask.PlatformBilibili,
+		Title: title, Cover: cover, DisplaySource: "bilibili",
+		SuggestedFilename: title, SuggestedExtension: ".mp4",
+		PlatformDataVersion: 1, PlatformData: platformData,
+	})
+	if err != nil {
 		return "", err
 	}
-
-	// Emit start event for frontend
-	runtime.EventsEmit(a.ctx, "download:start", task.TaskToJSON())
 
 	return id, nil
 }
@@ -829,62 +1077,6 @@ func formatBilibiliTaskIDKey(video *bilibili.BilibiliVideo, part bilibili.Bilibi
 		return part.BV
 	}
 	return "unknown"
-}
-
-func parseBilibiliTaskPartIndex(id string) int {
-	marker := strings.LastIndex(id, "_p")
-	if marker < 0 {
-		return -1
-	}
-	rest := id[marker+2:]
-	if sep := strings.Index(rest, "_"); sep >= 0 {
-		rest = rest[:sep]
-	}
-	page, err := strconv.Atoi(rest)
-	if err != nil || page <= 0 {
-		return -1
-	}
-	return page - 1
-}
-
-// createBilibiliDownloader creates a custom download function for Bilibili videos
-// partIndex: -1 for first part (single video), >= 0 for specific part
-func (a *App) createBilibiliDownloader(video *bilibili.BilibiliVideo, quality int, partIndex int) downloader.DownloadFunc {
-	return func(ctx context.Context, task *downloader.DownloadTask, onProgress func(downloaded, total int64), onComplete func(outputPath string)) error {
-		var outputPath string
-		var downloadErr error
-
-		// Track progress - Bilibili reports percentage, we convert to bytes
-		var totalSize int64 = 0
-
-		progressCallback := func(progress float64) {
-			if totalSize > 0 {
-				downloaded := int64(progress / 100 * float64(totalSize))
-				onProgress(downloaded, totalSize)
-			}
-		}
-
-		sizeCallback := func(size int64) {
-			totalSize = size
-			onProgress(0, size)
-		}
-
-		// 使用 task.FilePath 作为输出路径，确保临时文件名与最终文件名一致
-		if partIndex < 0 {
-			// Download first/single part
-			outputPath, downloadErr = a.bilibiliDownloader.DownloadWithContext(ctx, video, quality, task.FilePath, progressCallback, sizeCallback)
-		} else {
-			// Download specific part
-			outputPath, downloadErr = a.bilibiliDownloader.DownloadPartWithContext(ctx, video, partIndex, quality, task.FilePath, progressCallback, sizeCallback)
-		}
-
-		if downloadErr != nil {
-			return downloadErr
-		}
-
-		onComplete(outputPath)
-		return nil
-	}
 }
 
 // SetBilibiliSessData sets the Bilibili session cookie
@@ -960,49 +1152,24 @@ func (a *App) DownloadDouyinVideo(shareText string, qualityKey string) (string, 
 
 	id := fmt.Sprintf("douyin_%s_%d", item.ID, time.Now().UnixNano())
 
-	douyinDownloadFunc := a.createDouyinDownloader(item, qualityKey)
-	task, err := a.downloadManager.AddTaskWithDownloader(id, shareText, item.Title, item.Cover, "douyin", qualityKey, douyinDownloadFunc)
+	platformData, err := douyin.MarshalTaskData(item, qualityKey, nil, false)
 	if err != nil {
 		return "", err
 	}
-
-	// Update file extension and album fields for album type
+	extension := ".mp4"
 	if item.Type == "album" || len(item.Images) > 0 {
-		task.IsAlbum = true
-		task.AlbumTotal = len(item.Images)
-		task.AlbumCompleted = 0
-		if task.FileName != "" {
-			ext := filepath.Ext(task.FileName)
-			base := task.FileName
-			if ext != "" {
-				base = task.FileName[:len(task.FileName)-len(ext)]
-			}
-			task.FileName = base + ".zip"
-			task.FilePath = filepath.Join(a.downloadDir, task.FileName)
-		}
+		extension = ".zip"
 	}
-
-	if err := a.downloadManager.StartTask(id); err != nil {
+	_, err = a.createAndStartDownload(downloader.TaskCreationInput{
+		ID: id, PlatformID: downloadtask.PlatformDouyin,
+		Title: item.Title, Cover: item.Cover, DisplaySource: "douyin",
+		SuggestedFilename: item.Title, SuggestedExtension: extension,
+		PlatformDataVersion: 1, PlatformData: platformData,
+	})
+	if err != nil {
 		return "", err
 	}
-
-	runtime.EventsEmit(a.ctx, "download:start", task.TaskToJSON())
 	return id, nil
-}
-
-func (a *App) createDouyinDownloader(item *douyin.DouyinItem, qualityKey string) downloader.DownloadFunc {
-	base := a.douyinDownloader.BuildDownloadFunc(item, qualityKey, a.downloadDir)
-	return func(ctx context.Context, task *downloader.DownloadTask, onProgress func(downloaded, total int64), onComplete func(outputPath string)) error {
-		return base(ctx, task, onProgress, func(outputPath string) {
-			if task != nil && outputPath != "" {
-				task.FilePath = outputPath
-				task.FileName = filepath.Base(outputPath)
-			}
-			if onComplete != nil {
-				onComplete(outputPath)
-			}
-		})
-	}
 }
 
 // DownloadDouyinAlbumPartial downloads a subset of album images (0-based indices) into a ZIP.
@@ -1039,79 +1206,20 @@ func (a *App) DownloadDouyinAlbumPartial(shareText string, indices []int) (strin
 
 	id := fmt.Sprintf("douyin_%s_partial_%d", item.ID, time.Now().UnixNano())
 
-	douyinDownloadFunc := a.createDouyinAlbumPartialDownloader(item, unique)
-	task, err := a.downloadManager.AddTaskWithDownloader(id, shareText, item.Title, item.Cover, "douyin", "partial", douyinDownloadFunc)
+	platformData, err := douyin.MarshalTaskData(item, "partial", unique, true)
 	if err != nil {
 		return "", err
 	}
-
-	// Set album fields and force ZIP output
-	task.IsAlbum = true
-	task.AlbumTotal = len(unique)
-	task.AlbumCompleted = 0
-	if task.FileName != "" {
-		ext := filepath.Ext(task.FileName)
-		base := task.FileName
-		if ext != "" {
-			base = task.FileName[:len(task.FileName)-len(ext)]
-		}
-		task.FileName = base + ".zip"
-		task.FilePath = filepath.Join(a.downloadDir, task.FileName)
-	}
-
-	if err := a.downloadManager.StartTask(id); err != nil {
+	_, err = a.createAndStartDownload(downloader.TaskCreationInput{
+		ID: id, PlatformID: downloadtask.PlatformDouyin,
+		Title: item.Title, Cover: item.Cover, DisplaySource: "douyin",
+		SuggestedFilename: item.Title, SuggestedExtension: ".zip",
+		PlatformDataVersion: 1, PlatformData: platformData,
+	})
+	if err != nil {
 		return "", err
 	}
-
-	runtime.EventsEmit(a.ctx, "download:start", task.TaskToJSON())
 	return id, nil
-}
-
-func (a *App) createDouyinAlbumPartialDownloader(item *douyin.DouyinItem, indices []int) downloader.DownloadFunc {
-	indicesCopy := append([]int(nil), indices...)
-	return func(ctx context.Context, task *downloader.DownloadTask, onProgress func(downloaded, total int64), onComplete func(outputPath string)) error {
-		if item == nil {
-			return fmt.Errorf("nil douyin item")
-		}
-
-		destPath := filepath.Join(a.downloadDir, fmt.Sprintf("%s.zip", item.ID))
-		if task != nil && task.FilePath != "" {
-			destPath = task.FilePath
-			ext := filepath.Ext(destPath)
-			if ext == "" {
-				destPath = destPath + ".zip"
-			} else if ext != ".zip" {
-				destPath = destPath[:len(destPath)-len(ext)] + ".zip"
-			}
-		}
-
-		total := int64(len(indicesCopy))
-		progressCallback := func(p float64) {
-			completedCount := int(p/100*float64(total) + 0.5)
-			if completedCount > int(total) {
-				completedCount = int(total)
-			}
-			if task != nil {
-				task.AlbumCompleted = completedCount
-				task.Progress = p // Update progress percentage
-			}
-		}
-
-		if err := a.douyinDownloader.DownloadAlbumPartialWithBytes(ctx, item, indicesCopy, destPath, progressCallback, onProgress); err != nil {
-			return err
-		}
-
-		if task != nil {
-			task.AlbumCompleted = int(total)
-			task.Progress = 100
-			task.FilePath = destPath
-			task.FileName = filepath.Base(destPath)
-		}
-		if onComplete != nil {
-			onComplete(destPath)
-		}
-		return nil
-	}
 }
 
 // ==================== Xiaohongshu Methods ====================
@@ -1161,46 +1269,25 @@ func (a *App) DownloadXHSNote(item *xiaohongshu.XHSItem, selectedImages []int, q
 		}
 	}
 
-	outputDir := a.downloadDir
-	if saveDir != "" {
-		utils.EnsureDir(saveDir)
-		outputDir = saveDir
-	}
-
 	id := fmt.Sprintf("xiaohongshu_%s_%d", item.ID, time.Now().UnixNano())
-	downloadFunc := a.xhsDownloader.BuildDownloadFunc(item, selectedImages, quality, outputDir)
-	task, err := a.downloadManager.AddTaskWithDownloader(id, item.ID, item.Title, item.Cover, "xiaohongshu", quality, downloadFunc)
+	platformData, err := xiaohongshu.MarshalTaskData(item, selectedImages, quality)
 	if err != nil {
-		logger.Warn("DownloadXHSNote add task failed: %v", err)
+		logger.Warn("DownloadXHSNote marshal task data failed: %v", err)
 		return err
 	}
-
-	// Configure album fields and force ZIP output for image notes.
+	extension := ".mp4"
 	if item.IsAlbum() {
-		task.IsAlbum = true
-		task.AlbumTotal = item.SelectedCount(selectedImages)
-		task.AlbumCompleted = 0
-		if task.FileName != "" {
-			ext := filepath.Ext(task.FileName)
-			base := task.FileName
-			if ext != "" {
-				base = task.FileName[:len(task.FileName)-len(ext)]
-			}
-			task.FileName = base + ".zip"
-		}
+		extension = ".zip"
 	}
-
-	if outputDir != "" && task.FileName != "" {
-		task.FilePath = filepath.Join(outputDir, task.FileName)
-	}
-
-	if err := a.downloadManager.StartTask(id); err != nil {
+	_, err = a.createAndStartDownload(downloader.TaskCreationInput{
+		ID: id, PlatformID: downloadtask.PlatformXiaohongshu,
+		Title: item.Title, Cover: item.Cover, DisplaySource: "xiaohongshu",
+		OutputDirectory: saveDir, SuggestedFilename: item.Title, SuggestedExtension: extension,
+		PlatformDataVersion: 1, PlatformData: platformData,
+	})
+	if err != nil {
 		logger.Warn("DownloadXHSNote start task failed: %v", err)
 		return err
-	}
-
-	if a.ctx != nil {
-		runtime.EventsEmit(a.ctx, "download:start", task.TaskToJSON())
 	}
 	return nil
 }
@@ -1209,10 +1296,10 @@ func (a *App) DownloadXHSNote(item *xiaohongshu.XHSItem, selectedImages []int, q
 func (a *App) IsFFmpegAvailable() bool {
 	available := a.bilibiliDownloader.IsFFmpegAvailable()
 	// Cache the FFmpeg path to config for faster startup next time
-	if available && a.configManager != nil && a.ffmpegManager != nil {
+	if available && a.ffmpegManager != nil {
 		path := a.ffmpegManager.GetPath()
 		if path != "" {
-			_ = a.configManager.Set("ffmpegPath", path)
+			a.updateRuntimeMetadataBestEffort(config.RuntimeMetadataPatch{FFmpegPath: &path})
 		}
 	}
 	return available
@@ -1229,9 +1316,7 @@ func (a *App) InstallFFmpeg() (string, error) {
 		return "", err
 	}
 
-	if a.configManager != nil {
-		_ = a.configManager.Set("ffmpegPath", path)
-	}
+	a.updateRuntimeMetadataBestEffort(config.RuntimeMetadataPatch{FFmpegPath: &path})
 	if a.ctx != nil {
 		runtime.EventsEmit(a.ctx, "ffmpeg:ready", true)
 	}
@@ -1240,41 +1325,66 @@ func (a *App) InstallFFmpeg() (string, error) {
 
 // ==================== Settings Methods ====================
 
-// GetDownloadDir returns the download directory
-func (a *App) GetDownloadDir() string {
-	return a.downloadDir
+func (a *App) GetSettings() (settings.SettingsSnapshot, error) {
+	if a.settingsModule == nil {
+		return a.currentSettings(), nil
+	}
+	return a.settingsModule.GetSettings(context.Background())
 }
 
-// SetDownloadDir sets the download directory
-func (a *App) SetDownloadDir(dir string) error {
-	if err := a.downloadManager.SetDownloadDir(dir); err != nil {
-		return err
+func (a *App) UpdateSettings(patch settings.SettingsPatch) (settings.SettingsUpdateResult, error) {
+	if a.settingsModule == nil {
+		return settings.SettingsUpdateResult{}, fmt.Errorf("settings module is not initialized")
 	}
-	a.downloadDir = dir
-	if a.configManager != nil {
-		_ = a.configManager.Set("downloadDir", dir)
+	a.settingsRuntimeMu.Lock()
+	defer a.settingsRuntimeMu.Unlock()
+	result, err := a.settingsModule.UpdateSettings(context.Background(), patch)
+	if err != nil {
+		a.reportSettingsTransactionError(err)
+		return result, err
 	}
-	return nil
+	// Return the complete current runtime drift, not only requirements created
+	// by this patch. This lets an unrelated update preserve a pending restart and
+	// lets reverting a port to the actually bound value clear it deterministically.
+	result.RestartRequirements = a.runtimeRestartRequirements(result.Settings)
+	result.RestartRequired = len(result.RestartRequirements) > 0
+	for _, warning := range result.Warnings {
+		logger.Warn("Settings update warning [%s/%s]: %s", warning.Code, warning.Effect, warning.Message)
+	}
+	return result, nil
 }
 
-// SelectDownloadDir opens a folder dialog to select download directory
+func (a *App) runtimeRestartRequirements(snapshot settings.SettingsSnapshot) []settings.RestartRequirement {
+	requirements := make([]settings.RestartRequirement, 0, 2)
+	if a.internalAPI != nil && a.internalAPI.GetPort() != snapshot.APIPort {
+		requirements = append(requirements, settings.RestartRequirement{
+			Scope: "app", Fields: []string{"apiPort"}, Reason: "restart the application to bind the new internal API port",
+		})
+	}
+	if a.proxyServer != nil && a.proxyServer.IsRunning() && a.proxyServer.GetPort() != snapshot.ProxyPort {
+		requirements = append(requirements, settings.RestartRequirement{
+			Scope: "proxy", Fields: []string{"proxyPort"}, Reason: "stop and start the proxy to bind the new proxy port",
+		})
+	}
+	return requirements
+}
+
+// SelectDownloadDir opens a folder dialog and returns the selected directory.
+// Persisting the setting is handled by UpdateSettings.
 func (a *App) SelectDownloadDir() (string, error) {
 	dir, err := runtime.OpenDirectoryDialog(a.ctx, runtime.OpenDialogOptions{
 		Title:            "选择下载目录",
-		DefaultDirectory: a.downloadDir,
+		DefaultDirectory: a.currentDownloadDir(),
 	})
 	if err != nil {
 		return "", err
-	}
-	if dir != "" {
-		a.SetDownloadDir(dir)
 	}
 	return dir, nil
 }
 
 // OpenDownloadDir opens the download directory in file explorer
 func (a *App) OpenDownloadDir() error {
-	return utils.OpenFolder(a.downloadDir)
+	return utils.OpenFolder(a.currentDownloadDir())
 }
 
 // OpenFile opens a file with the default application
@@ -1284,41 +1394,36 @@ func (a *App) OpenFile(path string) error {
 
 // ==================== System Methods ====================
 
-// GetAppInfo returns app information
-func (a *App) GetAppInfo() map[string]interface{} {
-	ffmpegPath := ""
-	if a.ffmpegManager != nil {
-		ffmpegPath = a.ffmpegManager.GetPath()
-	}
-	apiToken := ""
-	if a.internalAPI != nil {
-		apiToken = a.internalAPI.GetToken()
-	}
-	certPath := ""
-	if a.certManager != nil {
-		certPath = a.certManager.GetCertPath()
-	}
+type AppRuntimeInfo struct {
+	Version         string `json:"version"`
+	APIPort         int    `json:"apiPort"`
+	APIToken        string `json:"apiToken,omitempty"`
+	FFmpegPath      string `json:"ffmpegPath,omitempty"`
+	CertPath        string `json:"certPath,omitempty"`
+	CertInstalled   bool   `json:"certInstalled"`
+	FFmpegAvailable bool   `json:"ffmpegAvailable"`
+}
 
-	return map[string]interface{}{
-		"version":              "1.0.0",
-		"proxyPort":            a.proxyPort,
-		"apiPort":              a.apiPort,
-		"apiToken":             apiToken,
-		"downloadDir":          a.downloadDir,
-		"ffmpegPath":           ffmpegPath,
-		"certPath":             certPath,
-		"minimizeToTray":       a.minimizeToTray,
-		"showNotification":     a.showNotification,
-		"firstRunComplete":     a.firstRunComplete,
-		"dontRemindCertWizard": a.dontRemindCertWizard,
-		"theme":                a.theme,
-		"language":             a.language,
-		"upstreamProxy":        a.upstreamProxy,
-		"useUpstreamProxy":     a.useUpstreamProxy,
-		"proxyDebug":           a.proxyDebug,
-		"closeAction":          a.closeAction,
-		"dontAskOnClose":       a.dontAskOnClose,
+// GetAppInfo returns runtime metadata only. User settings are exposed solely
+// through GetSettings and UpdateSettings.
+func (a *App) GetAppInfo() AppRuntimeInfo {
+	cfg := a.currentConfig()
+	info := AppRuntimeInfo{Version: cfg.Version, APIPort: cfg.APIPort}
+	if a.ffmpegManager != nil {
+		info.FFmpegPath = a.ffmpegManager.GetPath()
 	}
+	if a.internalAPI != nil {
+		info.APIPort = a.internalAPI.GetPort()
+		info.APIToken = a.internalAPI.GetToken()
+	}
+	if a.certManager != nil {
+		info.CertPath = a.certManager.GetCertPath()
+		info.CertInstalled = a.certManager.IsCertInstalled()
+	}
+	if a.bilibiliDownloader != nil {
+		info.FFmpegAvailable = a.bilibiliDownloader.IsFFmpegAvailable()
+	}
+	return info
 }
 
 // ==================== Tray Methods ====================
@@ -1349,43 +1454,6 @@ func (a *App) RestoreFromTray() {
 
 func (a *App) applyRestoreFromTray(ctx context.Context) {
 	runtime.WindowShow(ctx)
-}
-
-// SetMinimizeToTray sets whether to minimize to tray on close
-func (a *App) SetMinimizeToTray(enabled bool) {
-	a.minimizeToTray = enabled
-	if a.configManager != nil {
-		_ = a.configManager.Set("minimizeToTray", enabled)
-	}
-}
-
-// SetShowNotification sets whether to show notifications
-func (a *App) SetShowNotification(enabled bool) {
-	a.showNotification = enabled
-	if a.configManager != nil {
-		_ = a.configManager.Set("showNotification", enabled)
-	}
-}
-
-// SetFirstRunComplete marks first run setup as complete
-func (a *App) SetFirstRunComplete(complete bool) {
-	a.firstRunComplete = complete
-	if a.configManager != nil {
-		_ = a.configManager.Set("firstRunComplete", complete)
-	}
-}
-
-// IsDontRemindCertWizard returns whether to suppress the certificate welcome wizard prompt
-func (a *App) IsDontRemindCertWizard() bool {
-	return a.dontRemindCertWizard
-}
-
-// SetDontRemindCertWizard sets whether to suppress the certificate welcome wizard prompt
-func (a *App) SetDontRemindCertWizard(dontRemind bool) {
-	a.dontRemindCertWizard = dontRemind
-	if a.configManager != nil {
-		_ = a.configManager.Set("dontRemindCertWizard", dontRemind)
-	}
 }
 
 // ==================== Log Methods ====================
@@ -1422,133 +1490,11 @@ func (a *App) ClearLogs() error {
 	return nil
 }
 
-// ==================== Appearance Methods ====================
-
-// GetTheme returns the current theme
-func (a *App) GetTheme() string {
-	return a.theme
-}
-
-// SetTheme sets the theme (dark or light)
-func (a *App) SetTheme(theme string) error {
-	if theme != "dark" && theme != "light" {
-		return fmt.Errorf("invalid theme: must be 'dark' or 'light'")
-	}
-	a.theme = theme
-	if a.configManager != nil {
-		_ = a.configManager.Set("theme", theme)
-	}
-	return nil
-}
-
-// GetLanguage returns the current language
-func (a *App) GetLanguage() string {
-	return a.language
-}
-
-// SetLanguage sets the language (zh-CN or en-US)
-func (a *App) SetLanguage(lang string) error {
-	if lang != "zh-CN" && lang != "en-US" {
-		return fmt.Errorf("invalid language: must be 'zh-CN' or 'en-US'")
-	}
-	a.language = lang
-	if a.configManager != nil {
-		_ = a.configManager.Set("language", lang)
-	}
-	return nil
-}
-
-// ==================== Proxy Chain Methods ====================
-
-// GetUpstreamProxy returns the upstream proxy URL
-func (a *App) GetUpstreamProxy() string {
-	return a.upstreamProxy
-}
-
-// SetUpstreamProxy sets the upstream proxy URL
-func (a *App) SetUpstreamProxy(proxyURL string) {
-	a.upstreamProxy = proxyURL
-	if a.useUpstreamProxy && a.proxyServer != nil {
-		a.proxyServer.SetUpstreamProxy(proxyURL)
-	}
-	if a.configManager != nil {
-		_ = a.configManager.Set("upstreamProxy", proxyURL)
-	}
-}
-
-// IsUseUpstreamProxy returns whether upstream proxy is enabled
-func (a *App) IsUseUpstreamProxy() bool {
-	return a.useUpstreamProxy
-}
-
-// SetUseUpstreamProxy enables or disables the upstream proxy
-func (a *App) SetUseUpstreamProxy(enabled bool) {
-	a.useUpstreamProxy = enabled
-	if a.proxyServer != nil {
-		if enabled && a.upstreamProxy != "" {
-			a.proxyServer.SetUpstreamProxy(a.upstreamProxy)
-		} else {
-			a.proxyServer.SetUpstreamProxy("")
-		}
-	}
-	if a.configManager != nil {
-		_ = a.configManager.Set("useUpstreamProxy", enabled)
-	}
-}
-
-// ==================== Proxy Diagnostics Methods ====================
-
-func (a *App) GetProxyDebug() bool {
-	return a.proxyDebug
-}
-
-func (a *App) SetProxyDebug(enabled bool) {
-	a.proxyDebug = enabled
-	if a.proxyServer != nil {
-		a.proxyServer.SetDebug(enabled)
-	}
-	if a.configManager != nil {
-		_ = a.configManager.Set("proxyDebug", enabled)
-	}
-}
-
 // ==================== Frontend Logging ====================
 
 // LogFrontend logs a message from the frontend to the persistent log file
 func (a *App) LogFrontend(message string) {
 	logger.Info("[Frontend] %s", message)
-}
-
-// ==================== Close Behavior Methods ====================
-
-// GetCloseAction returns the current close action setting
-func (a *App) GetCloseAction() string {
-	return a.closeAction
-}
-
-// SetCloseAction sets the close action ("exit", "minimize", or "" for ask)
-func (a *App) SetCloseAction(action string) error {
-	if action != "" && action != "exit" && action != "minimize" {
-		return fmt.Errorf("invalid close action: must be '', 'exit', or 'minimize'")
-	}
-	a.closeAction = action
-	if a.configManager != nil {
-		_ = a.configManager.Set("closeAction", action)
-	}
-	return nil
-}
-
-// IsDontAskOnClose returns whether to skip the close confirmation dialog
-func (a *App) IsDontAskOnClose() bool {
-	return a.dontAskOnClose
-}
-
-// SetDontAskOnClose sets whether to skip the close confirmation dialog
-func (a *App) SetDontAskOnClose(dontAsk bool) {
-	a.dontAskOnClose = dontAsk
-	if a.configManager != nil {
-		_ = a.configManager.Set("dontAskOnClose", dontAsk)
-	}
 }
 
 // RequestClose is called from frontend when user confirms close action

@@ -1,17 +1,28 @@
 package bilibili
 
 import (
+	"EasyDownload/internal/download/fetch"
 	"EasyDownload/internal/infra/credential"
 	"EasyDownload/internal/infra/logger"
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
+	"time"
 )
+
+const DefaultAPIRequestTimeout = 30 * time.Second
+
+// NewAPIHTTPClient returns the bounded transport used for Bilibili JSON and
+// authentication requests. Media bytes use the shared Fetcher instead.
+func NewAPIHTTPClient() *http.Client {
+	return &http.Client{Timeout: DefaultAPIRequestTimeout}
+}
 
 // BilibiliDownloader handles Bilibili video parsing and downloading.
 // It supports authenticated downloads for higher quality streams and provides
@@ -34,17 +45,50 @@ type BilibiliDownloader struct {
 	sessDataMu    sync.RWMutex           // Mutex for thread-safe sessData access
 	ffmpegPath    string                 // Path to FFmpeg executable (cached after first lookup)
 	ffmpegManager FFmpegManagerInterface // Optional FFmpeg manager for advanced merging
-	configManager ConfigManagerInterface // Optional config manager for settings persistence
+	configManager ConfigManagerInterface // Optional read-only configuration view
 	rateLimiter   *QRCodeRateLimiter     // Rate limiter to prevent excessive QR code polling
+	httpDoer      fetch.HTTPDoer         // Injectable HTTP transport for API/auth requests
+	fileFetcher   fetch.Fetcher          // Compatibility seam; task execution passes Fetcher explicitly
+	storeSessData func(string) error     // Injectable credential write used by auth tests
 }
 
 // NewBilibiliDownloader creates a new BilibiliDownloader instance.
 // The downloader is initialized with a rate limiter for QR code polling.
 // Call SetSessData(), LoadSessData(), or use QR code login to authenticate.
-func NewBilibiliDownloader() *BilibiliDownloader {
-	return &BilibiliDownloader{
-		rateLimiter: NewQRCodeRateLimiter(),
+func NewBilibiliDownloader(doers ...fetch.HTTPDoer) *BilibiliDownloader {
+	doer := fetch.HTTPDoer(NewAPIHTTPClient())
+	if len(doers) > 0 && doers[0] != nil {
+		doer = doers[0]
 	}
+	return &BilibiliDownloader{
+		rateLimiter:   NewQRCodeRateLimiter(),
+		httpDoer:      doer,
+		storeSessData: credential.StoreBilibiliSessData,
+	}
+}
+
+// SetHTTPDoer injects the transport used by Bilibili API/auth requests.
+// File downloads use the shared fetch module and pass this doer separately.
+func (bd *BilibiliDownloader) SetHTTPDoer(doer fetch.HTTPDoer) {
+	if doer == nil {
+		doer = NewAPIHTTPClient()
+	}
+	bd.httpDoer = doer
+}
+
+// SetFileFetcher exists for direct-library compatibility. Task adapters do not
+// mutate downloader-global state; they pass TaskExecutionContext.Fetcher()
+// explicitly to avoid cross-task transport coupling.
+func (bd *BilibiliDownloader) SetFileFetcher(fetcher fetch.Fetcher) {
+	bd.fileFetcher = fetcher
+}
+
+func (bd *BilibiliDownloader) do(req *http.Request) (*http.Response, error) {
+	doer := bd.httpDoer
+	if doer == nil {
+		doer = NewAPIHTTPClient()
+	}
+	return doer.Do(req)
 }
 
 // SetConfigManager sets the configuration manager for settings persistence.
@@ -63,7 +107,11 @@ func (bd *BilibiliDownloader) SaveSessData(sessData string) error {
 	bd.sessDataMu.Unlock()
 
 	// Store to secure credential storage (Windows Credential Manager, macOS Keychain, etc.)
-	if err := credential.StoreBilibiliSessData(sessData); err != nil {
+	store := bd.storeSessData
+	if store == nil {
+		store = credential.StoreBilibiliSessData
+	}
+	if err := store(sessData); err != nil {
 		logger.Error("Failed to store SESSDATA: credential storage unavailable")
 		return fmt.Errorf("failed to store credential securely")
 	}
@@ -216,7 +264,7 @@ func (bd *BilibiliDownloader) DownloadPartWithContext(ctx context.Context, video
 	part := video.Parts[partIndex]
 	logger.Info("Starting download for video: %s, Part %d: %s (quality: %d)", video.Title, part.Page, part.PartName, quality)
 
-	return bd.downloadCore(ctx, video, partIndex, quality, outputPath, onProgress, onSizeKnown)
+	return bd.downloadCore(ctx, bd.fileFetcher, video, partIndex, quality, outputPath, onProgress, onSizeKnown)
 }
 
 // downloadCore is the core download method that handles DASH format downloads.
@@ -239,6 +287,7 @@ func (bd *BilibiliDownloader) DownloadPartWithContext(ctx context.Context, video
 // 5. Clean up temporary files
 func (bd *BilibiliDownloader) downloadCore(
 	ctx context.Context,
+	fileFetcher fetch.Fetcher,
 	video *BilibiliVideo,
 	partIndex int,
 	quality int,
@@ -279,8 +328,32 @@ func (bd *BilibiliDownloader) downloadCore(
 		logger.Error("No available stream for video: %s", video.Title)
 		return "", fmt.Errorf("no available stream")
 	}
+	if fileFetcher == nil {
+		return "", fmt.Errorf("fetcher is required")
+	}
+	return bd.downloadResolvedStream(ctx, fileFetcher, video.Title, stream, outputPath, onProgress, onSizeKnown)
+}
+
+// downloadResolvedStream receives one platform-selected quality. It may use
+// only that stream's Bilibili-declared backup CDN URLs as byte-equivalent
+// mirrors; it never chooses another quality or media candidate.
+func (bd *BilibiliDownloader) downloadResolvedStream(
+	ctx context.Context,
+	fileFetcher fetch.Fetcher,
+	videoTitle string,
+	stream *BilibiliStream,
+	outputPath string,
+	onProgress func(float64),
+	onSizeKnown func(int64),
+) (string, error) {
+	if stream == nil {
+		return "", fmt.Errorf("no available stream")
+	}
+	if fileFetcher == nil {
+		return "", fmt.Errorf("fetcher is required")
+	}
 	if (stream.BiliDRMURI != "" || stream.DRMTechType == 2) && stream.DRMKey == "" {
-		logger.Error("DRM stream detected without decryption key for video: %s", video.Title)
+		logger.Error("DRM stream detected without decryption key for video: %s", videoTitle)
 		return "", fmt.Errorf("this stream is DRM-protected and cannot be downloaded yet")
 	}
 
@@ -290,14 +363,14 @@ func (bd *BilibiliDownloader) downloadCore(
 		outputPath = outputPath + ".mp4"
 	}
 
-	// 使用传入的 outputPath，确保与 task.FilePath 一致
+	// 使用调用方分配的任务临时输出路径。
 	// 从 outputPath 派生临时文件路径
 	basePath := strings.TrimSuffix(outputPath, ".mp4")
 	logger.Debug("Using output path: %s, base path: %s", outputPath, basePath)
 
 	// 处理旧格式（无音频）
 	if stream.AudioURL == "" && len(stream.AudioBackupURLs) == 0 {
-		return bd.downloadFileWithFallback(ctx, stream.VideoURL, stream.BackupURLs, outputPath, 0, onProgress)
+		return bd.downloadFileWithFallback(ctx, fileFetcher, stream.VideoURL, stream.BackupURLs, outputPath, 0, onProgress)
 	}
 
 	// DASH 格式 - 需要分别下载视频和音频，然后合并
@@ -308,8 +381,8 @@ func (bd *BilibiliDownloader) downloadCore(
 	logger.Debug("Using DASH format, will merge video and audio")
 
 	// 获取内容长度以进行精确的进度计算；主 URL 获取失败时尝试备用 URL
-	videoSize := bd.getContentLengthWithFallback(stream.VideoURL, stream.BackupURLs)
-	audioSize := bd.getContentLengthWithFallback(stream.AudioURL, stream.AudioBackupURLs)
+	videoSize := bd.getContentLengthWithFallback(ctx, fileFetcher, stream.VideoURL, stream.BackupURLs)
+	audioSize := bd.getContentLengthWithFallback(ctx, fileFetcher, stream.AudioURL, stream.AudioBackupURLs)
 	logger.Debug("Video size: %d, Audio size: %d", videoSize, audioSize)
 
 	// 通知调用者总文件大小
@@ -320,7 +393,7 @@ func (bd *BilibiliDownloader) downloadCore(
 	// 创建进度追踪器
 	tracker := NewDASHProgressTracker(videoSize, audioSize, onProgress)
 
-	// 临时文件路径 - 使用 basePath 确保与 task.FilePath 一致
+	// DASH 中间文件与任务临时输出共享同一私有前缀。
 	videoPath := basePath + "_video.m4s"
 	audioPath := basePath + "_audio.m4s"
 	logger.Debug("Temp files: video=%s, audio=%s", videoPath, audioPath)
@@ -331,12 +404,14 @@ func (bd *BilibiliDownloader) downloadCore(
 		os.Remove(audioPath)
 		os.Remove(videoPath + ".edstate.json")
 		os.Remove(audioPath + ".edstate.json")
+		os.Remove(videoPath + ".resume.json")
+		os.Remove(audioPath + ".resume.json")
 		logger.Debug("Cleaned up temp files: %s, %s", videoPath, audioPath)
 	}
 
 	// 下载视频
 	logger.Debug("Downloading video stream to: %s (backups: %d)", videoPath, len(stream.BackupURLs))
-	if _, err := bd.downloadFileWithFallback(ctx, stream.VideoURL, stream.BackupURLs, videoPath, videoSize, func(p float64) {
+	if _, err := bd.downloadFileWithFallback(ctx, fileFetcher, stream.VideoURL, stream.BackupURLs, videoPath, videoSize, func(p float64) {
 		tracker.UpdateVideoProgress(p)
 	}); err != nil {
 		// 如果上下文被取消（暂停/取消），保留临时文件以便恢复
@@ -359,7 +434,7 @@ func (bd *BilibiliDownloader) downloadCore(
 
 	// 下载音频
 	logger.Debug("Downloading audio stream to: %s (backups: %d)", audioPath, len(stream.AudioBackupURLs))
-	if _, err := bd.downloadFileWithFallback(ctx, stream.AudioURL, stream.AudioBackupURLs, audioPath, audioSize, func(p float64) {
+	if _, err := bd.downloadFileWithFallback(ctx, fileFetcher, stream.AudioURL, stream.AudioBackupURLs, audioPath, audioSize, func(p float64) {
 		tracker.UpdateAudioProgress(p)
 	}); err != nil {
 		// 如果上下文被取消（暂停/取消），保留临时文件以便恢复
@@ -484,5 +559,5 @@ func (bd *BilibiliDownloader) Download(video *BilibiliVideo, quality int, output
 // See Download for parameter descriptions.
 func (bd *BilibiliDownloader) DownloadWithContext(ctx context.Context, video *BilibiliVideo, quality int, outputPath string, onProgress func(progress float64), onSizeKnown func(totalSize int64)) (string, error) {
 	logger.Info("Starting download for video: %s (quality: %d)", video.Title, quality)
-	return bd.downloadCore(ctx, video, -1, quality, outputPath, onProgress, onSizeKnown)
+	return bd.downloadCore(ctx, bd.fileFetcher, video, -1, quality, outputPath, onProgress, onSizeKnown)
 }

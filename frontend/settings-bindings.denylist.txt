@@ -1,0 +1,23 @@
+# Removed field-level Wails settings bindings. Keep one exact exported name per line.
+GetProxyPort
+GetDownloadDir
+SetDownloadDir
+SetMinimizeToTray
+SetShowNotification
+SetFirstRunComplete
+IsDontRemindCertWizard
+SetDontRemindCertWizard
+GetTheme
+SetTheme
+GetLanguage
+SetLanguage
+GetUpstreamProxy
+SetUpstreamProxy
+IsUseUpstreamProxy
+SetUseUpstreamProxy
+GetProxyDebug
+SetProxyDebug
+GetCloseAction
+SetCloseAction
+IsDontAskOnClose
+SetDontAskOnClose

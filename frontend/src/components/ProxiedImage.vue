@@ -25,7 +25,8 @@ const globalImageCache = (() => {
   return (window as any)[key] as Map<string, 'loading' | 'loaded' | 'error'>
 })()
 
-// Get the API port from app info
+// Both values describe the currently running internal API. A newly committed
+// settings port is not effective until the application restarts.
 const apiPort = computed(() => {
   return store.appInfo?.apiPort || 18899
 })

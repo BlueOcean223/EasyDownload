@@ -3,10 +3,10 @@
 // This package implements the XiaoHongShu content parser and downloader, which supports:
 //   - Parsing XiaoHongShu share URLs and extracting note metadata
 //   - Downloading videos with codec/weight-aware quality selection
-//   - Fallback downloads via backup CDN URLs when primary stream URLs fail
+//   - Byte-equivalent backup CDN mirrors with validator-aware resume
 //   - Downloading image albums with resumable support and image URL fallback
 //   - ZIP packaging for album downloads, including Live Photo video sidecars when present
-//   - Integration with DownloadManager for unified task management
+//   - Platform adapter integration for unified task management
 //
 // Supported Content Types:
 //   - Video notes: downloaded as .mp4 files
@@ -21,7 +21,15 @@
 //   - Resumable downloads with state persistence
 //   - Partial download support (select specific images by index)
 //   - Sequential image downloading to respect rate limits
-//   - Atomic ZIP creation for crash safety
+//   - Temporary ZIP creation followed by manager-owned PublishFinal
+//
+// TaskData persists the parsed note, selected images, and quality in the v2
+// snapshot. Semantic stream selection stays in this package; all media bytes use
+// the injected Fetcher with the configured no-progress timeout (two minutes by
+// default); timeout remains compatible with ErrNoProgressTimeout at this boundary.
+// EquivalentMirrorURLs must identify the same byte entity. Final MP4/ZIP output
+// uses the manager reservation and no-replace PublishFinal transaction.
+// The adapter rejects an unknown PlatformDataVersion before decoding TaskData.
 //
 // Usage with DownloadManager:
 //
@@ -31,7 +39,13 @@
 //	    return err
 //	}
 //
-//	downloader := xiaohongshu.NewDownloader()
-//	downloadFunc := downloader.BuildDownloadFunc(item, nil, "hd_115", outputDir)
-//	manager.AddTaskWithDownloader(id, url, title, cover, "xiaohongshu", quality, downloadFunc)
+//	platformDownloader := xiaohongshu.NewDownloader()
+//	adapter := xiaohongshu.NewAdapter(platformDownloader)
+//	manager.RegisterPlatformAdapter(adapter)
+//	data, err := xiaohongshu.MarshalTaskData(item, nil, "hd_115")
+//	manager.CreateTask(downloader.TaskCreationInput{
+//	    ID: id, PlatformID: adapter.ID(), Title: title, Cover: cover,
+//	    DisplaySource: "xiaohongshu", SuggestedFilename: title,
+//	    SuggestedExtension: ".mp4", PlatformDataVersion: 1, PlatformData: data,
+//	})
 package xiaohongshu

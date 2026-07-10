@@ -27,8 +27,7 @@ watch(() => props.show, (newVal) => {
 async function handleConfirm() {
   // Save preference if "remember" is checked
   if (rememberChoice.value) {
-    await store.setCloseAction(selectedAction.value)
-    await store.setDontAskOnClose(true)
+    await store.setCloseBehavior(selectedAction.value)
   }
   
   // Close dialog

@@ -1,11 +1,15 @@
 package api
 
 import (
+	"EasyDownload/internal/detection"
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -23,8 +27,8 @@ func TestInternalAPICreation(t *testing.T) {
 	if api.port != 18899 {
 		t.Errorf("port = %d, want 18899", api.port)
 	}
-	if api.detectedVideos == nil {
-		t.Error("detectedVideos is nil")
+	if api.detectionStore == nil {
+		t.Error("detectionStore is nil")
 	}
 }
 
@@ -96,7 +100,7 @@ func TestHandleHealth(t *testing.T) {
 func TestHandleDetect(t *testing.T) {
 	api := NewInternalAPI(18899)
 
-	video := DetectedVideo{
+	video := ProxyDetectedVideoRequest{
 		ID:        "test-id",
 		Title:     "Test Video",
 		URL:       "http://example.com/video.mp4",
@@ -116,12 +120,16 @@ func TestHandleDetect(t *testing.T) {
 	}
 
 	// Verify video was added
-	videos := api.GetDetectedVideos()
+	videos := api.getDetectedVideos()
 	if len(videos) != 1 {
 		t.Errorf("detected videos count = %d, want 1", len(videos))
 	}
-	if videos[0].ID != "test-id" {
-		t.Errorf("video ID = %s, want test-id", videos[0].ID)
+	wantID := detection.StableID(detection.Identity{
+		Source: detection.SourceWeChatProxy, Platform: "wechat", PlatformContentID: "test-id",
+		PrimaryURL: "http://example.com/video.mp4",
+	})
+	if videos[0].ID != wantID {
+		t.Errorf("video ID = %s, want %s", videos[0].ID, wantID)
 	}
 }
 
@@ -129,7 +137,7 @@ func TestHandleDetect(t *testing.T) {
 func TestHandleDetectDuplicate(t *testing.T) {
 	api := NewInternalAPI(18899)
 
-	video := DetectedVideo{
+	video := ProxyDetectedVideoRequest{
 		ID:        "test-id",
 		Title:     "Test Video",
 		URL:       "http://example.com/video.mp4",
@@ -152,9 +160,105 @@ func TestHandleDetectDuplicate(t *testing.T) {
 	api.handleDetect(w2, req2)
 
 	// Should still have only 1 video
-	videos := api.GetDetectedVideos()
+	videos := api.getDetectedVideos()
 	if len(videos) != 1 {
 		t.Errorf("detected videos count = %d, want 1 (no duplicates)", len(videos))
+	}
+}
+
+func TestProxyRequestKeepsExecutionSecretsPrivateAndPublishesCandidates(t *testing.T) {
+	api := NewInternalAPI(18899)
+	request := ProxyDetectedVideoRequest{
+		ID: "private-1", Title: "Private", URL: "https://private.example/video.mp4?token=secret",
+		Source: "wechat", DecodeKey: "decode-secret", Width: 1920, Height: 1080,
+		FileFormats: []string{"hd", "sd"},
+		Specs:       []ProxyVideoSpec{{FileFormat: "hd", Width: 1280, Height: 720, DurationMs: 1000}},
+	}
+	body, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	api.handleDetect(recorder, httptest.NewRequest(http.MethodPost, "/api/detect", bytes.NewReader(body)))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	snapshot := api.GetDetectionSnapshot()
+	if len(snapshot.Videos) != 1 || len(snapshot.Videos[0].Candidates) != 3 {
+		t.Fatalf("unexpected public snapshot: %#v", snapshot)
+	}
+	if !snapshot.Videos[0].Candidates[0].Default || !snapshot.Videos[0].Candidates[0].Encrypted {
+		t.Fatalf("default/encrypted hint missing: %#v", snapshot.Videos[0].Candidates[0])
+	}
+	publicJSON, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serialized := strings.ToLower(string(publicJSON))
+	for _, forbidden := range []string{"private.example", "decode-secret", "headers", "decodekey", `"url"`} {
+		if strings.Contains(serialized, forbidden) {
+			t.Fatalf("public projection leaked %q: %s", forbidden, serialized)
+		}
+	}
+
+	videoID := snapshot.Videos[0].ID
+	formatCandidate := snapshot.Videos[0].Candidates[1]
+	_, privateCandidate, err := api.detectionStore.ResolveCandidate(context.Background(), videoID, formatCandidate.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if privateCandidate.URL != request.URL || privateCandidate.DecodeKey != request.DecodeKey || privateCandidate.FileFormat != "hd" {
+		t.Fatalf("private candidate was not preserved: %#v", privateCandidate)
+	}
+}
+
+func TestProxyRequestStableIDDoesNotDependOnPresentationFields(t *testing.T) {
+	now := time.Date(2026, 7, 10, 8, 0, 0, 0, time.UTC)
+	first := (ProxyDetectedVideoRequest{PageURL: "https://example.test/watch/7", URL: "https://cdn.test/a?token=1"}).toDomain(now)
+	second := (ProxyDetectedVideoRequest{PageURL: "https://example.test/watch/7", URL: "https://cdn.test/a?token=2", Title: "filled", CoverURL: "https://cover.test/a"}).toDomain(now)
+	if first.ID != second.ID {
+		t.Fatalf("presentation/signed media changes changed stable page identity: %q != %q", first.ID, second.ID)
+	}
+}
+
+func TestVideoCallbackCanBeReplacedConcurrentlyWithIngest(t *testing.T) {
+	api := NewInternalAPI(0, detection.NewMemoryStore(256))
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			api.SetVideoCallback(func(detection.Change) {})
+		}()
+		go func(index int) {
+			defer wg.Done()
+			_, err := api.Ingest(context.Background(), detectedFixture(
+				fmt.Sprintf("race-%d", index), "Race", fmt.Sprintf("https://example.test/%d.mp4", index),
+			))
+			if err != nil {
+				t.Errorf("ingest failed: %v", err)
+			}
+		}(i)
+	}
+	wg.Wait()
+}
+
+func TestWeChatHTTPIngressSharesSignedURLIdentityRule(t *testing.T) {
+	now := time.Date(2026, 7, 10, 8, 0, 0, 0, time.UTC)
+	first := (ProxyDetectedVideoRequest{
+		Source: "wechat",
+		URL:    "https://finder.video.qq.com/7/stodownload?encfilekey=private-stable&m=media&token=one",
+	}).toDomain(now)
+	second := (ProxyDetectedVideoRequest{
+		Source: "wechat",
+		URL:    "https://finder.video.qq.com/7/stodownload?encfilekey=private-stable&m=media&token=two",
+	}).toDomain(now.Add(time.Minute))
+	if first.ID != second.ID {
+		t.Fatalf("HTTP and proxy adapter identity rule split signed URL rotation: %q != %q", first.ID, second.ID)
+	}
+	if strings.Contains(first.ID, "private-stable") {
+		t.Fatalf("opaque public identity leaked WeChat identity material: %q", first.ID)
 	}
 }
 
@@ -176,13 +280,8 @@ func TestHandleDetectMethodNotAllowed(t *testing.T) {
 func TestHandleGetVideos(t *testing.T) {
 	api := NewInternalAPI(18899)
 
-	// Add some videos
-	api.videosMu.Lock()
-	api.detectedVideos = []DetectedVideo{
-		{ID: "1", Title: "Video 1", URL: "http://example.com/1.mp4"},
-		{ID: "2", Title: "Video 2", URL: "http://example.com/2.mp4"},
-	}
-	api.videosMu.Unlock()
+	_, _ = api.Ingest(context.Background(), detectedFixture("1", "Video 1", "http://example.com/1.mp4"))
+	_, _ = api.Ingest(context.Background(), detectedFixture("2", "Video 2", "http://example.com/2.mp4"))
 
 	req := httptest.NewRequest(http.MethodGet, "/api/videos", nil)
 	w := httptest.NewRecorder()
@@ -193,13 +292,23 @@ func TestHandleGetVideos(t *testing.T) {
 		t.Errorf("status code = %d, want %d", w.Code, http.StatusOK)
 	}
 
-	var videos []DetectedVideo
-	if err := json.NewDecoder(w.Body).Decode(&videos); err != nil {
+	responseBody := w.Body.Bytes()
+	serialized := strings.ToLower(string(responseBody))
+	for _, forbidden := range []string{"example.com", "decodekey", "headers", `"url"`} {
+		if strings.Contains(serialized, forbidden) {
+			t.Fatalf("public videos response leaked forbidden value %q: %s", forbidden, serialized)
+		}
+	}
+	var snapshot detection.PublicSnapshot
+	if err := json.Unmarshal(responseBody, &snapshot); err != nil {
 		t.Fatalf("Failed to decode response: %v", err)
 	}
 
-	if len(videos) != 2 {
-		t.Errorf("videos count = %d, want 2", len(videos))
+	if len(snapshot.Videos) != 2 {
+		t.Errorf("videos count = %d, want 2", len(snapshot.Videos))
+	}
+	if snapshot.Revision != 2 {
+		t.Errorf("revision = %d, want 2", snapshot.Revision)
 	}
 }
 
@@ -207,12 +316,7 @@ func TestHandleGetVideos(t *testing.T) {
 func TestHandleClear(t *testing.T) {
 	api := NewInternalAPI(18899)
 
-	// Add some videos
-	api.videosMu.Lock()
-	api.detectedVideos = []DetectedVideo{
-		{ID: "1", Title: "Video 1", URL: "http://example.com/1.mp4"},
-	}
-	api.videosMu.Unlock()
+	_, _ = api.Ingest(context.Background(), detectedFixture("1", "Video 1", "http://example.com/1.mp4"))
 
 	req := httptest.NewRequest(http.MethodPost, "/api/clear", nil)
 	w := httptest.NewRecorder()
@@ -223,7 +327,7 @@ func TestHandleClear(t *testing.T) {
 		t.Errorf("status code = %d, want %d", w.Code, http.StatusOK)
 	}
 
-	videos := api.GetDetectedVideos()
+	videos := api.getDetectedVideos()
 	if len(videos) != 0 {
 		t.Errorf("videos count after clear = %d, want 0", len(videos))
 	}
@@ -233,16 +337,12 @@ func TestHandleClear(t *testing.T) {
 func TestClearVideos(t *testing.T) {
 	api := NewInternalAPI(18899)
 
-	api.videosMu.Lock()
-	api.detectedVideos = []DetectedVideo{
-		{ID: "1", Title: "Video 1", URL: "http://example.com/1.mp4"},
-		{ID: "2", Title: "Video 2", URL: "http://example.com/2.mp4"},
-	}
-	api.videosMu.Unlock()
+	_, _ = api.Ingest(context.Background(), detectedFixture("1", "Video 1", "http://example.com/1.mp4"))
+	_, _ = api.Ingest(context.Background(), detectedFixture("2", "Video 2", "http://example.com/2.mp4"))
 
 	api.ClearVideos()
 
-	videos := api.GetDetectedVideos()
+	videos := api.getDetectedVideos()
 	if len(videos) != 0 {
 		t.Errorf("videos count after ClearVideos = %d, want 0", len(videos))
 	}
@@ -252,17 +352,17 @@ func TestClearVideos(t *testing.T) {
 func TestRemoveVideo(t *testing.T) {
 	api := NewInternalAPI(18899)
 
-	api.videosMu.Lock()
-	api.detectedVideos = []DetectedVideo{
-		{ID: "1", Title: "Video 1", URL: "http://example.com/1.mp4"},
-		{ID: "2", Title: "Video 2", URL: "http://example.com/2.mp4"},
-		{ID: "3", Title: "Video 3", URL: "http://example.com/3.mp4"},
+	for _, video := range []detection.Video{
+		detectedFixture("1", "Video 1", "http://example.com/1.mp4"),
+		detectedFixture("2", "Video 2", "http://example.com/2.mp4"),
+		detectedFixture("3", "Video 3", "http://example.com/3.mp4"),
+	} {
+		_, _ = api.Ingest(context.Background(), video)
 	}
-	api.videosMu.Unlock()
 
 	api.RemoveVideo("2")
 
-	videos := api.GetDetectedVideos()
+	videos := api.getDetectedVideos()
 	if len(videos) != 2 {
 		t.Errorf("videos count after RemoveVideo = %d, want 2", len(videos))
 	}
@@ -280,11 +380,11 @@ func TestSetVideoCallback(t *testing.T) {
 	api := NewInternalAPI(18899)
 
 	callbackCalled := false
-	api.SetVideoCallback(func(v DetectedVideo) {
+	api.SetVideoCallback(func(v detection.Change) {
 		callbackCalled = true
 	})
 
-	video := DetectedVideo{
+	video := ProxyDetectedVideoRequest{
 		ID:    "test-id",
 		Title: "Test Video",
 		URL:   "http://example.com/video.mp4",
@@ -314,9 +414,8 @@ func TestVideoDuplicationProperty(t *testing.T) {
 			api := NewInternalAPI(18899)
 
 			// Add all videos
-			for i, url := range urls {
-				video := DetectedVideo{
-					ID:    string(rune('0' + i%10)),
+			for _, url := range urls {
+				video := ProxyDetectedVideoRequest{
 					Title: "Video",
 					URL:   url,
 				}
@@ -330,10 +429,12 @@ func TestVideoDuplicationProperty(t *testing.T) {
 			// Count unique URLs
 			uniqueURLs := make(map[string]bool)
 			for _, url := range urls {
-				uniqueURLs[url] = true
+				if strings.TrimSpace(url) != "" {
+					uniqueURLs[url] = true
+				}
 			}
 
-			videos := api.GetDetectedVideos()
+			videos := api.getDetectedVideos()
 			return len(videos) == len(uniqueURLs)
 		},
 		gen.SliceOf(gen.AnyString()),
@@ -355,22 +456,25 @@ func TestClearResetProperty(t *testing.T) {
 
 			// Add videos
 			for i := 0; i < count; i++ {
-				api.videosMu.Lock()
-				api.detectedVideos = append(api.detectedVideos, DetectedVideo{
-					ID:  string(rune('a' + i%26)),
-					URL: "http://example.com/" + string(rune('a'+i%26)) + ".mp4",
-				})
-				api.videosMu.Unlock()
+				id := string(rune('a' + i%26))
+				_, _ = api.Ingest(context.Background(), detectedFixture(id, "", "http://example.com/"+id+".mp4"))
 			}
 
 			api.ClearVideos()
 
-			return len(api.GetDetectedVideos()) == 0
+			return len(api.getDetectedVideos()) == 0
 		},
 		gen.IntRange(0, 100),
 	))
 
 	properties.TestingRun(t)
+}
+
+func detectedFixture(id, title, rawURL string) detection.Video {
+	return detection.Video{
+		ID: id, Source: detection.SourceWeChatProxy, Platform: "wechat", Title: title,
+		Candidates: []detection.Resource{{ID: "original", URL: rawURL, Default: true}},
+	}
 }
 
 // **Feature: video-capture-fix, Property 8: 图片代理请求头**

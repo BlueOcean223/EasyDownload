@@ -2,17 +2,20 @@ package downloader
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
-	"math"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"EasyDownload/internal/download/wechat"
+	"EasyDownload/internal/download/fetch"
+	downloadtask "EasyDownload/internal/download/task"
 	"EasyDownload/internal/infra/logger"
 	"EasyDownload/internal/utils"
 )
@@ -20,19 +23,20 @@ import (
 // DownloadStatus represents the current state of a download task.
 // The status transitions follow a state machine pattern:
 //
-//	pending -> downloading -> completed
-//	                      \-> failed -> (manual retry) -> pending
-//	                      \-> paused -> (resume) -> downloading
-//	downloading -> retrying -> downloading (automatic retry on transient errors)
-//	any state -> cancelled (user-initiated cancellation)
+//	pending -> running -> completed
+//	                    \-> failed -> (manual retry) -> pending
+//	                    \-> paused -> (resume) -> running
+//	any state -> canceled (user-initiated cancellation)
 type DownloadStatus string
 
 // Download status constants define all possible states for a download task.
 const (
 	// StatusPending indicates the task is queued but not yet started.
 	StatusPending DownloadStatus = "pending"
-	// StatusDownloading indicates the task is actively downloading.
-	StatusDownloading DownloadStatus = "downloading"
+	// StatusDownloading indicates the task is actively running. The constant
+	// name is retained for internal call-site compatibility; the serialized
+	// lifecycle value is "running".
+	StatusDownloading DownloadStatus = "running"
 	// StatusPaused indicates the task was paused by the user and can be resumed.
 	StatusPaused DownloadStatus = "paused"
 	// StatusCompleted indicates the download finished successfully.
@@ -40,32 +44,7 @@ const (
 	// StatusFailed indicates the download failed after exhausting all retry attempts.
 	StatusFailed DownloadStatus = "failed"
 	// StatusCancelled indicates the user cancelled the download.
-	StatusCancelled DownloadStatus = "cancelled"
-	// StatusRetrying indicates the task is waiting to retry after a transient error.
-	StatusRetrying DownloadStatus = "retrying"
-)
-
-// DownloadFunc is a custom download function type for sources that need special handling (e.g., Bilibili DASH)
-// Parameters:
-//   - ctx: context for cancellation
-//   - task: the download task (for reading metadata, NOT for writing - use callbacks instead)
-//   - onProgress: callback to report progress (downloaded bytes, total bytes)
-//   - onComplete: callback when download completes (output file path)
-//
-// Returns error if download fails, nil on success
-type DownloadFunc func(ctx context.Context, task *DownloadTask, onProgress func(downloaded, total int64), onComplete func(outputPath string)) error
-
-// Default retry configuration constants.
-// These values provide sensible defaults for automatic retry behavior.
-const (
-	// DefaultMaxRetry is the default number of retry attempts before marking a task as failed.
-	DefaultMaxRetry = 3
-	// DefaultBaseDelay is the initial delay before the first retry attempt.
-	DefaultBaseDelay = time.Second
-	// DefaultMaxDelay is the maximum delay between retry attempts (caps exponential backoff).
-	DefaultMaxDelay = 30 * time.Second
-	// DefaultRetryEnabled indicates whether automatic retry is enabled by default.
-	DefaultRetryEnabled = true
+	StatusCancelled DownloadStatus = "canceled"
 )
 
 // DownloadManager manages all download tasks and coordinates concurrent downloads.
@@ -82,6 +61,7 @@ type DownloadManager struct {
 	// tasksMu protects the tasks map for concurrent access.
 	tasksMu sync.RWMutex
 	// downloadDir is the directory where downloaded files are saved.
+	configMu    sync.RWMutex
 	downloadDir string
 	// maxConcurrent is the maximum number of simultaneous downloads allowed.
 	maxConcurrent int
@@ -93,20 +73,35 @@ type DownloadManager struct {
 	queuedTasks []*DownloadTask
 	// queuedTaskIDs prevents the same task from being queued more than once.
 	queuedTaskIDs map[string]struct{}
-
-	// Retry configuration
-	// autoRetry enables automatic retry on transient download failures.
-	autoRetry bool
-	// maxRetry is the maximum number of retry attempts per task.
-	maxRetry int
-	// baseDelay is the initial delay for exponential backoff.
-	baseDelay time.Duration
-	// maxDelay caps the maximum delay between retry attempts.
-	maxDelay time.Duration
+	// startTransitionMu serializes slot/queue transitions with their durable
+	// snapshot. It also prevents CreateAndStart from racing a dispatcher while
+	// holding the persistence transaction.
+	startTransitionMu sync.Mutex
 
 	// State persistence
 	// statePath is the file path for saving/loading download state.
-	statePath string
+	statePath       string
+	legacyStatePath string
+	taskStore       *TaskStore
+	persistenceMu   sync.Mutex
+	revision        atomic.Uint64
+	eventRevision   atomic.Uint64
+	taskInstance    atomic.Uint64
+	legacyNoticeMu  sync.Mutex
+	legacyNotified  bool
+	// platformRegistry holds platform-specific task hooks registered by the
+	// composition root. DownloadManager does not import platform packages.
+	platformRegistry *PlatformRegistry
+	outputAllocator  *OutputPathAllocator
+	fetcher          fetch.Fetcher
+	ffmpeg           downloadtask.FFmpegLocator
+	credentials      downloadtask.CredentialStore
+
+	lifecycleMu       sync.Mutex
+	stopWaitTimeout   time.Duration
+	cleanupTimeout    time.Duration
+	onStopEvent       func(StopEvent)
+	beforeStopCleanup func()
 
 	// Event callbacks for external notification
 	// onProgress is called periodically during download with updated progress.
@@ -115,8 +110,6 @@ type DownloadManager struct {
 	onComplete func(task *DownloadTask)
 	// onError is called when a download fails after all retries.
 	onError func(task *DownloadTask, err error)
-	// onRetry is called before each retry attempt with the delay duration.
-	onRetry func(task *DownloadTask, attempt int, delay time.Duration)
 }
 
 // NewDownloadManager creates a new DownloadManager with the specified download directory
@@ -132,45 +125,132 @@ func NewDownloadManager(downloadDir string, maxConcurrent int) *DownloadManager 
 	if maxConcurrent <= 0 {
 		maxConcurrent = 3
 	}
-
 	return &DownloadManager{
-		tasks:         make(map[string]*DownloadTask),
-		downloadDir:   downloadDir,
-		maxConcurrent: maxConcurrent,
-		queuedTasks:   make([]*DownloadTask, 0),
-		queuedTaskIDs: make(map[string]struct{}),
-		autoRetry:     DefaultRetryEnabled,
-		maxRetry:      DefaultMaxRetry,
-		baseDelay:     DefaultBaseDelay,
-		maxDelay:      DefaultMaxDelay,
+		tasks:            make(map[string]*DownloadTask),
+		downloadDir:      downloadDir,
+		maxConcurrent:    maxConcurrent,
+		queuedTasks:      make([]*DownloadTask, 0),
+		queuedTaskIDs:    make(map[string]struct{}),
+		platformRegistry: NewPlatformRegistry(),
+		outputAllocator:  NewOutputPathAllocator(),
+		fetcher:          fetch.New(nil),
+		stopWaitTimeout:  2 * time.Second,
+		cleanupTimeout:   30 * time.Second,
 	}
 }
 
-// SetRetryConfig configures the automatic retry behavior for failed downloads.
-//
-// Parameters:
-//   - autoRetry: whether to automatically retry failed downloads
-//   - maxRetry: maximum number of retry attempts (ignored if <= 0)
-//   - baseDelay: initial delay before first retry, used for exponential backoff (ignored if <= 0)
-//   - maxDelay: maximum delay between retries, caps exponential growth (ignored if <= 0)
-func (dm *DownloadManager) SetRetryConfig(autoRetry bool, maxRetry int, baseDelay, maxDelay time.Duration) {
-	dm.autoRetry = autoRetry
-	if maxRetry > 0 {
-		dm.maxRetry = maxRetry
+func (dm *DownloadManager) RegisterPlatformAdapter(adapter downloadtask.PlatformAdapter) error {
+	if dm.platformRegistry == nil {
+		dm.platformRegistry = NewPlatformRegistry()
 	}
-	if baseDelay > 0 {
-		dm.baseDelay = baseDelay
+	return dm.platformRegistry.Register(adapter)
+}
+
+func taskSnapshot(task *DownloadTask) downloadtask.TaskSnapshot {
+	task.mu.RLock()
+	defer task.mu.RUnlock()
+	return taskSnapshotLocked(task)
+}
+
+func taskSnapshotLocked(task *DownloadTask) downloadtask.TaskSnapshot {
+	snapshot := downloadtask.TaskSnapshot{
+		ID:                  task.ID,
+		PlatformID:          downloadtask.PlatformID(task.PlatformID),
+		Title:               task.Title,
+		Cover:               task.Cover,
+		DisplaySource:       task.DisplaySource,
+		CreatedAt:           task.CreatedAt,
+		CompletedAt:         task.CompletedAt,
+		Status:              downloadtask.TaskStatus(task.Status),
+		OutputPolicy:        task.OutputPolicy,
+		Progress:            task.ProgressSummary,
+		Artifacts:           task.Artifacts,
+		LastError:           cloneTaskError(task.LastErrorDetail),
+		PlatformDataVersion: task.PlatformDataVersion,
+		PlatformData:        task.PlatformData,
+		PlatformCheckpoint:  task.PlatformCheckpoint,
+		PublishIntent:       task.PublishIntent,
 	}
-	if maxDelay > 0 {
-		dm.maxDelay = maxDelay
+	return downloadtask.CloneSnapshot(snapshot)
+}
+
+func (dm *DownloadManager) adapterForTask(task *DownloadTask) (downloadtask.PlatformAdapter, bool) {
+	return dm.adapterForSnapshot(taskSnapshot(task))
+}
+
+func (dm *DownloadManager) adapterForSnapshot(snapshot downloadtask.TaskSnapshot) (downloadtask.PlatformAdapter, bool) {
+	return dm.platformRegistry.Get(snapshot.PlatformID)
+}
+
+func (dm *DownloadManager) SetExecutionCapabilities(fetcherInstance fetch.Fetcher, ffmpeg downloadtask.FFmpegLocator, credentials downloadtask.CredentialStore) {
+	if fetcherInstance != nil {
+		dm.fetcher = fetcherInstance
 	}
+	dm.ffmpeg = ffmpeg
+	dm.credentials = credentials
 }
 
 // SetStatePath sets the file path for persisting download state.
 // When set, the manager will automatically save state after task completion,
 // pause, or failure, enabling recovery after application restart.
 func (dm *DownloadManager) SetStatePath(path string) {
-	dm.statePath = path
+	path = filepath.Clean(strings.TrimSpace(path))
+	dm.legacyStatePath = ""
+	if strings.EqualFold(filepath.Base(path), "downloads.json") {
+		dm.legacyStatePath = path
+		dm.statePath = filepath.Join(filepath.Dir(path), "downloads.v2.json")
+	} else {
+		dm.statePath = path
+	}
+	dm.taskStore = NewTaskStore(dm.statePath)
+	dm.legacyNoticeMu.Lock()
+	dm.legacyNotified = false
+	dm.legacyNoticeMu.Unlock()
+}
+
+func (dm *DownloadManager) StatePath() string { return dm.statePath }
+
+func (dm *DownloadManager) LegacyStatePath() string { return dm.legacyStatePath }
+
+func (dm *DownloadManager) HasLegacyState() bool {
+	if strings.TrimSpace(dm.legacyStatePath) == "" {
+		return false
+	}
+	info, err := os.Stat(dm.legacyStatePath)
+	return err == nil && info.Size() > 0 && !info.IsDir()
+}
+
+type LegacyTaskStateNotice struct {
+	Code              string `json:"code"`
+	LegacyPath        string `json:"legacyPath"`
+	V2Path            string `json:"v2Path"`
+	Imported          bool   `json:"imported"`
+	Preserved         bool   `json:"preserved"`
+	RollbackAvailable bool   `json:"rollbackAvailable"`
+	Message           string `json:"message"`
+}
+
+// TakeLegacyStateNotice returns a typed, one-shot activation notice when a
+// non-empty downloads.json was deliberately left untouched beside downloads.v2.json.
+func (dm *DownloadManager) TakeLegacyStateNotice() *LegacyTaskStateNotice {
+	if dm == nil || !dm.HasLegacyState() {
+		return nil
+	}
+	dm.legacyNoticeMu.Lock()
+	defer dm.legacyNoticeMu.Unlock()
+	if dm.legacyNotified {
+		return nil
+	}
+	dm.legacyNotified = true
+	return &LegacyTaskStateNotice{
+		Code:              "download.legacy_state_preserved",
+		LegacyPath:        dm.legacyStatePath,
+		V2Path:            dm.statePath,
+		Imported:          false,
+		Preserved:         true,
+		RollbackAvailable: true,
+		Message:           "旧版下载任务未导入并已原样保留；需要回退时仍可使用。",
+	}
 }
 
 func (dm *DownloadManager) saveStateBestEffort() {
@@ -182,21 +262,20 @@ func (dm *DownloadManager) saveStateBestEffort() {
 	}
 }
 
-// SetRetryCallback sets a callback function that is invoked before each retry attempt.
-// The callback receives the task, the current attempt number, and the delay before retry.
-func (dm *DownloadManager) SetRetryCallback(callback func(task *DownloadTask, attempt int, delay time.Duration)) {
-	dm.onRetry = callback
-}
-
-// GetMaxRetry returns the maximum number of retry attempts configured for the manager.
-func (dm *DownloadManager) GetMaxRetry() int {
-	return dm.maxRetry
+func (dm *DownloadManager) persistIfConfiguredWithLock(persistenceLocked bool) error {
+	if dm == nil || dm.statePath == "" {
+		return nil
+	}
+	if persistenceLocked {
+		return dm.saveStateSnapshotLocked("")
+	}
+	return dm.SaveState()
 }
 
 // GetMaxConcurrent returns the maximum number of concurrent downloads allowed.
 func (dm *DownloadManager) GetMaxConcurrent() int {
-	dm.activeTasksMu.Lock()
-	defer dm.activeTasksMu.Unlock()
+	dm.configMu.RLock()
+	defer dm.configMu.RUnlock()
 	return dm.maxConcurrent
 }
 
@@ -207,10 +286,11 @@ func (dm *DownloadManager) SetMaxConcurrent(max int) {
 	if max <= 0 {
 		return
 	}
-	dm.activeTasksMu.Lock()
-	dm.maxConcurrent = max
-	dm.activeTasksMu.Unlock()
-	dm.dispatchQueued()
+	update, err := dm.BeginRuntimeConfigUpdate(RuntimeConfigPatch{MaxConcurrent: &max})
+	if err != nil {
+		return
+	}
+	_ = update.Commit()
 }
 
 // GetActiveTaskCount returns the number of downloads currently in progress.
@@ -226,16 +306,16 @@ func (dm *DownloadManager) GetActiveTaskCount() int {
 //
 // Returns an error if the directory cannot be created.
 func (dm *DownloadManager) SetDownloadDir(dir string) error {
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("failed to create download directory: %w", err)
+	update, err := dm.BeginRuntimeConfigUpdate(RuntimeConfigPatch{DownloadDir: &dir})
+	if err != nil {
+		return fmt.Errorf("failed to update download directory: %w", err)
 	}
-	dm.downloadDir = dir
-	return nil
+	return update.Commit()
 }
 
 // GetDownloadDir returns the current download directory path.
 func (dm *DownloadManager) GetDownloadDir() string {
-	return dm.downloadDir
+	return dm.RuntimeConfig().DownloadDir
 }
 
 // SetProgressCallback sets a callback function that is invoked periodically
@@ -257,101 +337,92 @@ func (dm *DownloadManager) SetErrorCallback(callback func(task *DownloadTask, er
 	dm.onError = callback
 }
 
-// AddTask adds a new download task to the manager.
-// This is a convenience wrapper around AddTaskWithDecodeKey with no decryption key.
-//
-// Parameters:
-//   - id: unique identifier for the task
-//   - rawURL: the download URL
-//   - title: display name for the download
-//   - cover: URL of the cover/thumbnail image
-//   - source: content source identifier (e.g., "wechat", "bilibili", "douyin")
-//   - quality: quality-specific metadata
-//
-// Returns the created task and nil on success, or nil and an error if the task
-// already exists or the URL is invalid.
-func (dm *DownloadManager) AddTask(id, rawURL, title, cover, source, quality string) (*DownloadTask, error) {
-	return dm.AddTaskWithDecodeKey(id, rawURL, title, cover, source, quality, "")
+// TaskCreationInput is the backend-only v2 creation contract. Platform URLs,
+// headers, credentials, and decryption material belong inside PlatformData and
+// must not be copied into a Wails DTO.
+type TaskCreationInput struct {
+	ID                  string
+	PlatformID          downloadtask.PlatformID
+	Title               string
+	Cover               string
+	DisplaySource       string
+	OutputDirectory     string
+	SuggestedFilename   string
+	SuggestedExtension  string
+	PlatformDataVersion int
+	PlatformData        json.RawMessage
 }
 
-// AddTaskWithDecodeKey adds a new download task with an optional decryption key.
-// The decryption key is used for WeChat videos that are encrypted.
-//
-// Parameters:
-//   - id: unique identifier for the task
-//   - rawURL: the download URL
-//   - title: display name for the download
-//   - cover: URL of the cover/thumbnail image
-//   - source: content source identifier (e.g., "wechat", "bilibili", "douyin")
-//   - quality: quality-specific metadata (for WeChat, this is the fileFormat value)
-//   - decodeKey: Base64-encoded decryption key (empty string if not encrypted)
-//
-// Returns the created task and nil on success, or nil and an error if:
-//   - A task with the same ID already exists
-//   - The URL fails validation for the specified source
-func (dm *DownloadManager) AddTaskWithDecodeKey(id, rawURL, title, cover, source, quality, decodeKey string) (*DownloadTask, error) {
-	dm.tasksMu.Lock()
-	added := false
-	defer func() {
+func (dm *DownloadManager) CreateTask(input TaskCreationInput) (*DownloadTask, error) {
+	dm.configMu.RLock()
+	defer dm.configMu.RUnlock()
+	return dm.createTaskLocked(input, true)
+}
+
+// CreateAndStartTask commits creation together with the initial running/queued
+// transition. No intermediate pending task is exposed to persistence, so a
+// synchronous start failure cannot leave an orphan whose ID the caller never
+// received.
+func (dm *DownloadManager) CreateAndStartTask(input TaskCreationInput) (*DownloadTask, error) {
+	dm.configMu.RLock()
+	defer dm.configMu.RUnlock()
+	dm.startTransitionMu.Lock()
+	defer dm.startTransitionMu.Unlock()
+
+	// persistenceMu also serializes task identity/reservation ownership when no
+	// state file is configured; this prevents remove/recreate ABA on the same ID.
+	persistenceLocked := true
+	dm.persistenceMu.Lock()
+	defer dm.persistenceMu.Unlock()
+
+	task, err := dm.createTaskLocked(input, false)
+	if err != nil {
+		return nil, err
+	}
+	if err := dm.startTaskLocked(task.ID, persistenceLocked); err != nil {
+		dm.tasksMu.Lock()
+		if dm.tasks[task.ID] == task {
+			delete(dm.tasks, task.ID)
+		}
 		dm.tasksMu.Unlock()
-		if added {
-			dm.saveStateBestEffort()
-		}
-	}()
+		dm.outputAllocator.Release(task.ID)
+		return nil, fmt.Errorf("start newly created task %s: %w", task.ID, err)
+	}
+	return task, nil
+}
 
-	// Prevent duplicate task IDs
-	if _, exists := dm.tasks[id]; exists {
-		return nil, fmt.Errorf("task with ID %s already exists", id)
+func (dm *DownloadManager) createTaskLocked(input TaskCreationInput, persist bool) (*DownloadTask, error) {
+	input.ID = strings.TrimSpace(input.ID)
+	if input.ID == "" {
+		return nil, errors.New("task id is required")
+	}
+	if input.PlatformID == "" {
+		return nil, errors.New("platform id is required")
+	}
+	input.PlatformData = append(json.RawMessage(nil), input.PlatformData...)
+	if len(input.PlatformData) == 0 || !json.Valid(input.PlatformData) {
+		return nil, fmt.Errorf("platform data for task %s must be valid non-empty JSON", input.ID)
+	}
+	if input.PlatformDataVersion <= 0 {
+		input.PlatformDataVersion = 1
+	}
+	extension := strings.TrimSpace(input.SuggestedExtension)
+	if extension == "" {
+		extension = ".mp4"
+	} else if !strings.HasPrefix(extension, ".") {
+		extension = "." + extension
 	}
 
-	// Validate WeChat URLs to prevent downloading corrupt/partial files
-	if strings.ToLower(strings.TrimSpace(source)) == "wechat" {
-		if ok, reason := wechat.IsValidVODURL(rawURL); !ok {
-			return nil, fmt.Errorf("invalid wechat video url (%s)", reason)
-		}
-	}
-
-	// Process URL for WeChat videos with quality selection
-	// The X-snsvideoflag parameter tells WeChat server which quality to return
-	downloadURL := rawURL
-	if strings.ToLower(strings.TrimSpace(source)) == "wechat" {
-		// Remove any existing quality parameter to avoid duplicates
-		if strings.Contains(downloadURL, "X-snsvideoflag=") {
-			parsedURL, err := url.Parse(downloadURL)
-			if err == nil {
-				query := parsedURL.Query()
-				query.Del("X-snsvideoflag")
-				parsedURL.RawQuery = query.Encode()
-				downloadURL = parsedURL.String()
-			}
-		}
-
-		// Append the selected quality parameter if specified
-		if quality != "" {
-			if strings.Contains(downloadURL, "?") {
-				downloadURL = downloadURL + "&X-snsvideoflag=" + quality
-			} else {
-				downloadURL = downloadURL + "?X-snsvideoflag=" + quality
-			}
-			logger.Info("[WeChat Download] Using quality format: %s", quality)
-		} else {
-			logger.Info("[WeChat Download] No quality specified, using original URL")
-		}
-		logger.Debug("[WeChat Download] Final URL: %s", downloadURL)
-	}
-
-	// Generate a safe, unique filename from the title
-	baseName := utils.SanitizeFileName(title, 100)
+	baseName := utils.SanitizeFileName(input.SuggestedFilename, 100)
 	usedFallbackName := false
 	if baseName == "" {
-		// Fallback: generate filename from source and ID hash when title is empty/invalid
 		usedFallbackName = true
-		safeSource := utils.SanitizeFileName(source, 100)
+		safeSource := utils.SanitizeFileName(input.DisplaySource, 100)
 		if safeSource == "" {
 			safeSource = "video"
 		}
 		h := fnv.New32a()
-		_, _ = h.Write([]byte(id))
+		_, _ = h.Write([]byte(input.ID))
 		hash := fmt.Sprintf("%08x", h.Sum32())
 		baseName = fmt.Sprintf("video_%s_%d_%s", safeSource, time.Now().Unix(), hash)
 	}
@@ -360,55 +431,81 @@ func (dm *DownloadManager) AddTaskWithDecodeKey(id, rawURL, title, cover, source
 	if baseName == "" {
 		baseName = fmt.Sprintf("video_%d", time.Now().UnixNano())
 	}
-	// Ensure unique filename in the download directory and among tasks that may
-	// not have created their output file yet.
-	fileName := dm.ensureUniqueFileNameLocked(baseName, ".mp4")
-	if usedFallbackName {
-		logger.Info("Filename fallback used: id=%q -> %q", shortenForLog(id, 120), fileName)
+	fileName := baseName + extension
+
+	lockCreation := persist
+	if lockCreation {
+		dm.persistenceMu.Lock()
+		defer dm.persistenceMu.Unlock()
 	}
-
-	// Create the task with initial pending status
-	task := &DownloadTask{
-		ID:         id,
-		URL:        downloadURL,
-		Title:      title,
-		Cover:      cover,
-		Source:     source,
-		Quality:    quality,
-		FileName:   fileName,
-		FilePath:   filepath.Join(dm.downloadDir, fileName),
-		Status:     StatusPending,
-		CreatedAt:  time.Now().Unix(),
-		RetryCount: 0,
-		MaxRetry:   dm.maxRetry,
-		DecodeKey:  decodeKey,
+	dm.tasksMu.Lock()
+	if _, exists := dm.tasks[input.ID]; exists {
+		dm.tasksMu.Unlock()
+		return nil, fmt.Errorf("task with ID %s already exists", input.ID)
 	}
-
-	dm.tasks[id] = task
-	added = true
-	return task, nil
-}
-
-// AddTaskWithDownloader adds a new download task with a custom downloader function.
-// This is used for sources that need special handling (e.g., Bilibili DASH format
-// which requires separate audio/video stream downloads and merging).
-//
-// Parameters:
-//   - id: unique identifier for the task
-//   - url: the download URL
-//   - title: display name for the download
-//   - cover: URL of the cover/thumbnail image
-//   - source: content source identifier
-//   - quality: quality-specific metadata
-//   - downloader: custom download function to use instead of default HTTP download
-//
-// Returns the created task and nil on success, or nil and an error on failure.
-func (dm *DownloadManager) AddTaskWithDownloader(id, url, title, cover, source, quality string, downloader DownloadFunc) (*DownloadTask, error) {
-	task, err := dm.AddTask(id, url, title, cover, source, quality)
+	outputDirectory := strings.TrimSpace(input.OutputDirectory)
+	if outputDirectory == "" {
+		outputDirectory = dm.downloadDir
+	}
+	outputPolicy, err := dm.outputAllocator.Reserve(input.ID, outputDirectory, fileName, downloadtask.ConflictStrategyAutoRename)
 	if err != nil {
+		dm.tasksMu.Unlock()
 		return nil, err
 	}
-	task.customDownloader = downloader
+	releaseReservation := true
+	defer func() {
+		if releaseReservation {
+			dm.outputAllocator.Release(input.ID)
+		}
+	}()
+	if usedFallbackName {
+		idForLog := input.ID
+		if runes := []rune(idForLog); len(runes) > 120 {
+			idForLog = string(runes[:120]) + "..."
+		}
+		logger.Info("Filename fallback used: id=%q -> %q", idForLog, outputPolicy.PlannedFilename)
+	}
+
+	task := &DownloadTask{
+		eventInstance:       dm.taskInstance.Add(1),
+		PlatformID:          string(input.PlatformID),
+		PlatformDataVersion: input.PlatformDataVersion,
+		PlatformData:        input.PlatformData,
+		OutputPolicy:        outputPolicy,
+		ID:                  input.ID,
+		Title:               input.Title,
+		Cover:               input.Cover,
+		DisplaySource:       input.DisplaySource,
+		Status:              StatusPending,
+		ProgressSummary: downloadtask.TaskProgressSummary{
+			CurrentStage: "queued",
+			StageLabel:   "等待中",
+		},
+		CreatedAt: time.Now().Unix(),
+	}
+	adapter, ok := dm.platformRegistry.Get(input.PlatformID)
+	if !ok {
+		dm.tasksMu.Unlock()
+		return nil, fmt.Errorf("no platform adapter registered for %s", input.PlatformID)
+	}
+	if err := adapter.ValidateTask(downloadtask.CloneSnapshot(taskSnapshot(task))); err != nil {
+		dm.tasksMu.Unlock()
+		return nil, err
+	}
+	dm.tasks[input.ID] = task
+	dm.tasksMu.Unlock()
+	releaseReservation = false
+	if persist && dm.statePath != "" {
+		if err := dm.saveStateSnapshotLocked(""); err != nil {
+			dm.tasksMu.Lock()
+			if dm.tasks[input.ID] == task {
+				delete(dm.tasks, input.ID)
+			}
+			dm.tasksMu.Unlock()
+			dm.outputAllocator.Release(input.ID)
+			return nil, fmt.Errorf("persist new task: %w", err)
+		}
+	}
 	return task, nil
 }
 
@@ -418,11 +515,24 @@ func (dm *DownloadManager) AddTaskWithDownloader(id, url, title, cover, source, 
 //
 // Returns an error if:
 //   - The task ID is not found
-//   - The task is already downloading/retrying or in a terminal state
+//   - The task is already running or in a terminal state
 //
-// The task status transitions from pending/paused/failed to downloading when a
+// The task status transitions from pending/paused/failed to running when a
 // slot is acquired, or to pending while queued.
 func (dm *DownloadManager) StartTask(id string) error {
+	dm.configMu.RLock()
+	defer dm.configMu.RUnlock()
+	dm.startTransitionMu.Lock()
+	defer dm.startTransitionMu.Unlock()
+	persistenceLocked := dm.statePath != ""
+	if persistenceLocked {
+		dm.persistenceMu.Lock()
+		defer dm.persistenceMu.Unlock()
+	}
+	return dm.startTaskLocked(id, persistenceLocked)
+}
+
+func (dm *DownloadManager) startTaskLocked(id string, persistenceLocked bool) error {
 	dm.tasksMu.RLock()
 	task, exists := dm.tasks[id]
 	dm.tasksMu.RUnlock()
@@ -441,18 +551,34 @@ func (dm *DownloadManager) StartTask(id string) error {
 	}
 
 	task.mu.Lock()
+	previousStatus := task.Status
+	previousError := task.Error
+	previousLastError := task.LastError
+	previousLastErrorDetail := cloneTaskError(task.LastErrorDetail)
+	previousProgress := task.ProgressSummary
+	previousSpeed := task.Speed
+	previousGenerationCounter := task.generationCounter
+	previousQueuedGeneration := task.queuedGeneration
 	switch task.Status {
-	case StatusDownloading, StatusRetrying:
+	case StatusDownloading:
 		task.mu.Unlock()
 		dm.activeTasksMu.Unlock()
-		return fmt.Errorf("task %s is already downloading", id)
+		return fmt.Errorf("task %s is already running", id)
 	case StatusCompleted, StatusCancelled:
 		status := task.Status
 		task.mu.Unlock()
 		dm.activeTasksMu.Unlock()
 		return fmt.Errorf("task %s is %s", id, status)
 	case StatusPending, StatusPaused, StatusFailed:
-		// eligible
+		// A terminal callback may already have published failed/completed state
+		// while the worker defer has not closed its done barrier yet. Do not let a
+		// retry replace that generation (or a stop coordinator that is still
+		// finalizing it).
+		if task.execution != nil {
+			task.mu.Unlock()
+			dm.activeTasksMu.Unlock()
+			return workerStoppingTaskError()
+		}
 	default:
 		status := task.Status
 		task.mu.Unlock()
@@ -462,25 +588,69 @@ func (dm *DownloadManager) StartTask(id string) error {
 
 	if dm.activeTasks < dm.maxConcurrent {
 		dm.activeTasks++
+		execution := newTaskExecutionLocked(task)
 		task.Status = StatusDownloading
 		task.Error = ""
 		task.LastError = ""
+		task.LastErrorDetail = nil
+		task.ProgressSummary.CurrentStage = "running"
+		task.ProgressSummary.StageLabel = "下载中"
 		task.mu.Unlock()
+		if err := dm.persistIfConfiguredWithLock(persistenceLocked); err != nil {
+			task.mu.Lock()
+			if task.execution == execution {
+				task.execution = nil
+				task.cancel = nil
+				task.Status = previousStatus
+				task.Error = previousError
+				task.LastError = previousLastError
+				task.LastErrorDetail = previousLastErrorDetail
+				task.ProgressSummary = previousProgress
+				task.Speed = previousSpeed
+				task.generationCounter = previousGenerationCounter
+				task.queuedGeneration = previousQueuedGeneration
+			}
+			task.mu.Unlock()
+			execution.cancel()
+			execution.finish()
+			dm.activeTasks--
+			dm.activeTasksMu.Unlock()
+			return fmt.Errorf("persist running task transition: %w", err)
+		}
 		dm.activeTasksMu.Unlock()
-		dm.saveStateBestEffort()
-		go dm.downloadTask(task)
+		go dm.downloadTask(task, execution)
 		return nil
 	}
 
 	// Queue for later dispatch instead of failing the add/start flow.
+	task.generationCounter++
+	task.queuedGeneration = task.generationCounter
 	task.Status = StatusPending
+	task.Error = ""
+	task.LastError = ""
+	task.LastErrorDetail = nil
+	task.ProgressSummary.CurrentStage = "queued"
+	task.ProgressSummary.StageLabel = "等待中"
 	task.Speed = 0
 	dm.queuedTasks = append(dm.queuedTasks, task)
 	dm.queuedTaskIDs[id] = struct{}{}
 	task.mu.Unlock()
+	if err := dm.persistIfConfiguredWithLock(persistenceLocked); err != nil {
+		dm.removeQueuedTaskLocked(id)
+		task.mu.Lock()
+		task.Status = previousStatus
+		task.Error = previousError
+		task.LastError = previousLastError
+		task.LastErrorDetail = previousLastErrorDetail
+		task.ProgressSummary = previousProgress
+		task.Speed = previousSpeed
+		task.generationCounter = previousGenerationCounter
+		task.queuedGeneration = previousQueuedGeneration
+		task.mu.Unlock()
+		dm.activeTasksMu.Unlock()
+		return fmt.Errorf("persist queued task transition: %w", err)
+	}
 	dm.activeTasksMu.Unlock()
-
-	dm.saveStateBestEffort()
 	logger.Info("Queued download task: %s (%s)", task.ID, task.Title)
 	return nil
 }
@@ -501,10 +671,32 @@ func (dm *DownloadManager) removeQueuedTaskLocked(id string) {
 	}
 }
 
+// removeQueuedTaskInstanceLocked removes only the exact task object that owns
+// a stop request. A removed ID may be reused, so an old request must never
+// dequeue a newer task that happens to have the same string ID.
+func (dm *DownloadManager) removeQueuedTaskInstanceLocked(expected *DownloadTask) {
+	if expected == nil || dm.queuedTaskIDs == nil {
+		return
+	}
+	for i, task := range dm.queuedTasks {
+		if task == expected {
+			dm.queuedTasks = append(dm.queuedTasks[:i], dm.queuedTasks[i+1:]...)
+			delete(dm.queuedTaskIDs, expected.ID)
+			return
+		}
+	}
+}
+
 func (dm *DownloadManager) dispatchQueued() {
 	for {
 		var taskToStart *DownloadTask
 
+		dm.configMu.RLock()
+		dm.startTransitionMu.Lock()
+		persistenceLocked := dm.statePath != ""
+		if persistenceLocked {
+			dm.persistenceMu.Lock()
+		}
 		dm.activeTasksMu.Lock()
 		if dm.queuedTaskIDs == nil {
 			dm.queuedTaskIDs = make(map[string]struct{})
@@ -523,20 +715,65 @@ func (dm *DownloadManager) dispatchQueued() {
 				continue
 			}
 			dm.activeTasks++
+			execution := newQueuedTaskExecutionLocked(task)
 			task.Status = StatusDownloading
 			task.Error = ""
 			task.LastError = ""
+			task.LastErrorDetail = nil
+			task.ProgressSummary.CurrentStage = "running"
+			task.ProgressSummary.StageLabel = "下载中"
 			task.mu.Unlock()
 			taskToStart = task
+			_ = execution
 			break
 		}
-		dm.activeTasksMu.Unlock()
-
 		if taskToStart == nil {
+			dm.activeTasksMu.Unlock()
+			if persistenceLocked {
+				dm.persistenceMu.Unlock()
+			}
+			dm.startTransitionMu.Unlock()
+			dm.configMu.RUnlock()
 			return
 		}
-		dm.saveStateBestEffort()
-		go dm.downloadTask(taskToStart)
+		taskToStart.mu.RLock()
+		execution := taskToStart.execution
+		taskToStart.mu.RUnlock()
+		if err := dm.persistIfConfiguredWithLock(persistenceLocked); err != nil {
+			taskToStart.mu.Lock()
+			if taskToStart.execution == execution {
+				taskToStart.execution = nil
+				taskToStart.cancel = nil
+				taskToStart.Status = StatusFailed
+				failure := persistenceTaskError("persist dispatched task transition", err)
+				taskToStart.Error = failure.Message
+				taskToStart.LastError = failure.Message
+				taskToStart.LastErrorDetail = failure
+				taskToStart.ProgressSummary.CurrentStage = "persistence_failed"
+				taskToStart.ProgressSummary.StageLabel = "状态保存失败"
+			}
+			taskToStart.mu.Unlock()
+			execution.cancel()
+			execution.finish()
+			dm.activeTasks--
+			dm.activeTasksMu.Unlock()
+			if persistenceLocked {
+				dm.persistenceMu.Unlock()
+			}
+			dm.startTransitionMu.Unlock()
+			dm.configMu.RUnlock()
+			if dm.onError != nil {
+				dm.onError(taskToStart, err)
+			}
+			return
+		}
+		dm.activeTasksMu.Unlock()
+		if persistenceLocked {
+			dm.persistenceMu.Unlock()
+		}
+		dm.startTransitionMu.Unlock()
+		dm.configMu.RUnlock()
+		go dm.downloadTask(taskToStart, execution)
 	}
 }
 
@@ -545,88 +782,12 @@ func (dm *DownloadManager) dispatchQueued() {
 //
 // Returns an error if:
 //   - The task ID is not found
-//   - The task is not currently downloading or retrying
+//   - The task is not currently running
 //
 // The task status transitions to paused and state is automatically saved.
 func (dm *DownloadManager) PauseTask(id string) error {
-	dm.tasksMu.RLock()
-	task, exists := dm.tasks[id]
-	dm.tasksMu.RUnlock()
-
-	if !exists {
-		return fmt.Errorf("task %s not found", id)
-	}
-
-	task.mu.Lock()
-	// Only downloading or retrying tasks can be paused
-	if task.Status != StatusDownloading && task.Status != StatusRetrying {
-		task.mu.Unlock()
-		return fmt.Errorf("task %s is not downloading", id)
-	}
-
-	// Cancel the download context to stop the active download
-	if task.cancel != nil {
-		task.cancel()
-	}
-	task.Status = StatusPaused
-	task.Speed = 0 // Reset speed display when paused
-	downloaded := task.Downloaded
-	task.mu.Unlock()
-
-	logger.Info("Task %s paused at %d bytes", id, downloaded)
-
-	// Persist state immediately after pause for recovery
-	dm.saveStateBestEffort()
-
-	return nil
-}
-
-// cleanupTempFilesByPrefix removes temporary files in the given directory that match
-// the specified prefix and any of the given suffixes.
-// Uses os.ReadDir with exact string matching to avoid glob metacharacter injection attacks.
-//
-// Parameters:
-//   - dir: directory to search for temp files
-//   - prefix: filename prefix to match
-//   - suffixes: list of filename suffixes to match
-//
-// This function is used during task cancellation to clean up intermediate files
-// created by multipart downloads (e.g., Bilibili DASH video/audio streams).
-func cleanupTempFilesByPrefix(dir, prefix string, suffixes []string) {
-	if strings.TrimSpace(dir) == "" || strings.TrimSpace(prefix) == "" || len(suffixes) == 0 {
-		return
-	}
-
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		logger.Warn("[CancelTask] Failed to read dir for cleanup: dir=%s, err=%v", dir, err)
-		return
-	}
-
-	// Iterate through directory entries looking for matching temp files
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		name := entry.Name()
-		// Check if filename starts with our prefix
-		if !strings.HasPrefix(name, prefix) {
-			continue
-		}
-		// Check if filename ends with any of our target suffixes
-		for _, suffix := range suffixes {
-			if strings.HasSuffix(name, suffix) {
-				fullPath := filepath.Join(dir, name)
-				logger.Debug("[CancelTask] Removing temp file: %s", fullPath)
-				if err := os.Remove(fullPath); err != nil && !os.IsNotExist(err) {
-					logger.Warn("[CancelTask] Failed to remove %s: %v", fullPath, err)
-				} else if err == nil {
-					logger.Debug("[CancelTask] Successfully removed: %s", fullPath)
-				}
-				break // Found matching suffix, move to next file
-			}
-		}
-	}
+	_, err := dm.RequestPauseTask(id)
+	return err
 }
 
 // CancelTask cancels a download task and cleans up all associated files.
@@ -638,144 +799,8 @@ func cleanupTempFilesByPrefix(dir, prefix string, suffixes []string) {
 //
 // Returns an error if the task ID is not found.
 func (dm *DownloadManager) CancelTask(id string) error {
-	dm.tasksMu.RLock()
-	task, exists := dm.tasks[id]
-	dm.tasksMu.RUnlock()
-
-	if !exists {
-		return fmt.Errorf("task %s not found", id)
-	}
-
-	dm.activeTasksMu.Lock()
-	dm.removeQueuedTaskLocked(id)
-	dm.activeTasksMu.Unlock()
-
-	// Capture fields under lock, then release before file operations
-	// to avoid holding the lock during potentially slow I/O
-	task.mu.Lock()
-	logger.Info("[CancelTask] Cancelling task: id=%s, status=%s, filePath=%s", id, task.Status, task.FilePath)
-	// Stop the active download by cancelling its context
-	if task.cancel != nil {
-		task.cancel()
-	}
-	task.Status = StatusCancelled
-	filePath := task.FilePath
-	title := task.Title
-	source := strings.ToLower(strings.TrimSpace(task.Source))
-	task.mu.Unlock()
-
-	// All file cleanup operations are done outside the lock to avoid blocking
-
-	// Remove the main download file (partial or complete)
-	logger.Debug("[CancelTask] Removing main file: %s", filePath)
-	if err := os.Remove(filePath); err != nil && !os.IsNotExist(err) {
-		logger.Warn("[CancelTask] Failed to remove main file: %v", err)
-	}
-
-	// Clean up Bilibili DASH temporary files
-	// DASH format downloads create separate _video.m4s and _audio.m4s files
-	// that need to be merged into the final .mp4
-	if strings.HasSuffix(filePath, ".mp4") {
-		basePath := strings.TrimSuffix(filePath, ".mp4")
-		dir := filepath.Dir(filePath)
-		baseName := filepath.Base(basePath)
-
-		logger.Debug("[CancelTask] basePath=%s, dir=%s, baseName=%s", basePath, dir, baseName)
-
-		// Remove known temp files for single-file downloads
-		tempFiles := []string{
-			basePath + "_video.m4s",
-			basePath + "_audio.m4s",
-			basePath + "_video.m4s.edstate.json",
-			basePath + "_audio.m4s.edstate.json",
-		}
-		for _, tf := range tempFiles {
-			logger.Debug("[CancelTask] Attempting to remove: %s", tf)
-			if err := os.Remove(tf); err != nil && !os.IsNotExist(err) {
-				logger.Warn("[CancelTask] Failed to remove %s: %v", tf, err)
-			} else if err == nil {
-				logger.Debug("[CancelTask] Successfully removed: %s", tf)
-			}
-		}
-
-		// Handle Bilibili multi-part video cleanup:
-		// Multi-part titles have format: "视频标题 - P2 分P名"
-		// Temp files have format: "视频标题_P2_分P名_video.m4s"
-		// We must match only the specific part being cancelled, not all parts
-		cleanupPrefix := baseName
-
-		// Detect multi-part download by checking for " - P" separator in title
-		if idx := strings.Index(title, " - P"); idx > 0 {
-			// Extract the base video title (before " - P")
-			videoBaseTitle := title[:idx]
-			// Extract part info (after " - P")
-			partInfo := title[idx+3:]
-
-			// Parse the part number from the part info (e.g., "9 代码" -> "9")
-			partNum := ""
-			for i, c := range partInfo {
-				if c >= '0' && c <= '9' {
-					partNum += string(c)
-				} else {
-					// Non-digit found, stop parsing
-					if i > 0 && len(partInfo) > i {
-						break
-					}
-				}
-			}
-
-			// Build cleanup prefix for this specific part only
-			if partNum != "" {
-				sanitizedBaseTitle := utils.SanitizeFileName(videoBaseTitle, 100)
-				cleanupPrefix = sanitizedBaseTitle + "_P" + partNum + "_"
-			}
-		}
-
-		// Define suffixes for temp files that should be cleaned up
-		cleanupSuffixes := []string{
-			"_video.m4s",
-			"_audio.m4s",
-			"_video.m4s.edstate.json",
-			"_audio.m4s.edstate.json",
-			".edstate.json",
-		}
-		logger.Debug("[CancelTask] Cleaning temp files by prefix: dir=%s, prefix=%s", dir, cleanupPrefix)
-		cleanupTempFilesByPrefix(dir, cleanupPrefix, cleanupSuffixes)
-	}
-
-	// Remove multipart download state file
-	// This JSON file tracks chunk download progress for resumable downloads
-	stateFile := filePath + ".edstate.json"
-	logger.Debug("[CancelTask] Removing state file: %s", stateFile)
-	if err := os.Remove(stateFile); err != nil && !os.IsNotExist(err) {
-		logger.Warn("[CancelTask] Failed to remove state file: %v", err)
-	}
-
-	// Remove Douyin album temp directory (.albumtmp)
-	// This contains downloaded images and state.json for album downloads
-	if strings.HasSuffix(filePath, ".zip") {
-		albumTmp := filePath + ".albumtmp"
-		logger.Debug("[CancelTask] Removing album temp dir: %s", albumTmp)
-		if err := os.RemoveAll(albumTmp); err != nil {
-			logger.Warn("[CancelTask] Failed to remove album temp dir: %v", err)
-		}
-	}
-
-	// XiaoHongShu cleanup:
-	// - .albumtmp directory for resumable album downloads
-	// - partial video files (written directly, not .tmp)
-	if source == "xiaohongshu" {
-		// Clean up album temp directory
-		albumTmp := utils.AlbumTempDir(filePath)
-		logger.Debug("[CancelTask] Removing xiaohongshu album temp dir: %s", albumTmp)
-		if err := os.RemoveAll(albumTmp); err != nil {
-			logger.Warn("[CancelTask] Failed to remove xiaohongshu album temp dir: %v", err)
-		}
-	}
-
-	dm.saveStateBestEffort()
-	logger.Info("[CancelTask] Task cancelled successfully: id=%s", id)
-	return nil
+	_, err := dm.RequestCancelTask(id)
+	return err
 }
 
 // RemoveTask removes a task from the manager completely.
@@ -784,30 +809,8 @@ func (dm *DownloadManager) CancelTask(id string) error {
 //
 // Returns an error if the task ID is not found.
 func (dm *DownloadManager) RemoveTask(id string) error {
-	dm.tasksMu.Lock()
-	task, exists := dm.tasks[id]
-	if !exists {
-		dm.tasksMu.Unlock()
-		return fmt.Errorf("task %s not found", id)
-	}
-
-	dm.activeTasksMu.Lock()
-	dm.removeQueuedTaskLocked(id)
-	dm.activeTasksMu.Unlock()
-
-	// Stop any active download before removing and mark the task so a racing
-	// goroutine cannot overwrite it as completed.
-	task.mu.Lock()
-	if task.cancel != nil {
-		task.cancel()
-	}
-	task.Status = StatusCancelled
-	task.mu.Unlock()
-
-	delete(dm.tasks, id)
-	dm.tasksMu.Unlock()
-	dm.saveStateBestEffort()
-	return nil
+	_, err := dm.RequestRemoveTask(id)
+	return err
 }
 
 // GetTask retrieves a task by its ID.
@@ -839,60 +842,27 @@ func (dm *DownloadManager) GetAllTasks() []*DownloadTask {
 	return tasks
 }
 
-// calculateBackoffDelay calculates the delay for exponential backoff.
-// The formula is: baseDelay * 2^attempt, capped at maxDelay.
-//
-// Example with baseDelay=1s and maxDelay=30s:
-//   - attempt 0: 1s
-//   - attempt 1: 2s
-//   - attempt 2: 4s
-//   - attempt 3: 8s (and so on, up to 30s max)
-func (dm *DownloadManager) calculateBackoffDelay(attempt int) time.Duration {
-	delay := dm.baseDelay * time.Duration(math.Pow(2, float64(attempt)))
-	if delay > dm.maxDelay {
-		delay = dm.maxDelay
-	}
-	return delay
-}
-
-func waitForRetryDelay(task *DownloadTask, delay time.Duration) bool {
-	if delay <= 0 {
-		return true
-	}
-	deadline := time.Now().Add(delay)
-	for {
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			return true
-		}
-		step := remaining
-		if step > 200*time.Millisecond {
-			step = 200 * time.Millisecond
-		}
-		time.Sleep(step)
-
-		task.mu.RLock()
-		status := task.Status
-		task.mu.RUnlock()
-		if status == StatusCancelled || status == StatusPaused {
-			return false
-		}
-	}
-}
-
 // downloadTask is the main download loop that runs in a goroutine.
-// It handles the retry logic with exponential backoff when downloads fail.
-//
-// The loop continues retrying until:
-//   - Download succeeds
-//   - Task is cancelled or paused
-//   - Maximum retry attempts are exhausted
-//
-// This method decrements activeTasks when it exits (via defer).
-func (dm *DownloadManager) downloadTask(task *DownloadTask) {
+// DownloadManager does not perform automatic network retries; fetchers and
+// platform adapters own bounded lower-level retry/fallback behavior. This method
+// decrements activeTasks when it exits (via defer).
+func (dm *DownloadManager) downloadTask(task *DownloadTask, execution *taskExecution) {
 	// Ensure we decrement the active task counter when this goroutine exits,
 	// then dispatch the next queued task if capacity is available.
 	defer func() {
+		if execution != nil {
+			execution.cancel()
+			task.mu.Lock()
+			// done is the authoritative worker barrier. Close it before detaching
+			// the execution so a concurrent stop can never mistake a callback-phase
+			// worker for an already joined generation.
+			execution.finish()
+			if task.execution == execution && !execution.stopRequested {
+				task.execution = nil
+				task.cancel = nil
+			}
+			task.mu.Unlock()
+		}
 		dm.activeTasksMu.Lock()
 		if dm.activeTasks > 0 {
 			dm.activeTasks--
@@ -903,122 +873,98 @@ func (dm *DownloadManager) downloadTask(task *DownloadTask) {
 
 	logger.Info("Starting download task: %s (%s)", task.ID, task.Title)
 
-	// Retry loop: keeps attempting download until success or terminal condition
-	for {
-		err := dm.performDownload(task)
-		if err == nil {
-			// Download completed successfully - exit the retry loop
-			return
-		}
-
-		// Check if task was cancelled or paused during download
-		task.mu.RLock()
-		status := task.Status
-		task.mu.RUnlock()
-
-		if status == StatusCancelled || status == StatusPaused {
-			// User-initiated stop - exit without error handling
-			return
-		}
-
-		// Determine if we should retry based on configuration and attempt count
-		task.mu.Lock()
-		task.LastError = err.Error()
-		canRetry := dm.autoRetry && task.RetryCount < task.MaxRetry
-		task.mu.Unlock()
-
-		if !canRetry {
-			// No more retries - mark as failed and exit
-			dm.handleError(task, err)
-			return
-		}
-
-		// Prepare for retry with exponential backoff
-		task.mu.Lock()
-		task.RetryCount++
-		currentRetry := task.RetryCount
-		task.Status = StatusRetrying
-		task.mu.Unlock()
-
-		// Calculate backoff delay (increases exponentially with each attempt)
-		delay := dm.calculateBackoffDelay(currentRetry - 1)
-		logger.Info("Retrying download task %s (attempt %d/%d) after %v: %v",
-			task.ID, currentRetry, task.MaxRetry, delay, err)
-
-		// Notify callback if registered
-		if dm.onRetry != nil {
-			dm.onRetry(task, currentRetry, delay)
-		}
-
-		// Wait before retry, but allow pause/cancel to interrupt the delay.
-		if !waitForRetryDelay(task, delay) {
-			return
-		}
-		// Continue to next iteration for retry attempt
+	err := dm.performDownload(task, execution)
+	if err == nil {
+		return
 	}
+
+	task.mu.RLock()
+	stopping := execution == nil || task.execution != execution || execution.stopRequested || execution.phase == executionStopping
+	task.mu.RUnlock()
+	if stopping {
+		return
+	}
+	task.mu.Lock()
+	if task.execution == execution {
+		execution.phase = executionFinished
+		execution.mutationOpen = false
+	}
+	task.mu.Unlock()
+	dm.handleError(task, err)
 }
 
 // performDownload executes a single download attempt.
 // It creates a new context for cancellation and dispatches to either
-// the custom downloader or the default HTTP downloader.
+// the registered platform adapter or the default HTTP downloader.
 //
 // On success, marks the task as completed and invokes the completion callback.
 // On failure, returns the error for retry handling by the caller.
-func (dm *DownloadManager) performDownload(task *DownloadTask) error {
-	// Create a cancellable context for this download attempt
-	ctx, cancel := context.WithCancel(context.Background())
-	defer func() {
-		cancel()
-		task.mu.Lock()
-		task.cancel = nil
-		task.mu.Unlock()
-	}()
-
-	// Store cancel function and update status under lock. If the task was
-	// cancelled/paused before this goroutine got scheduled, do not resurrect it.
+func (dm *DownloadManager) performDownload(task *DownloadTask, execution *taskExecution) error {
+	if execution == nil {
+		return errors.New("download execution is nil")
+	}
 	task.mu.Lock()
-	if task.Status == StatusCancelled || task.Status == StatusPaused {
+	if task.execution != execution || execution.phase != executionRunning || !execution.mutationOpen {
 		task.mu.Unlock()
 		return context.Canceled
 	}
-	task.cancel = cancel
 	task.Status = StatusDownloading
-	customDownloader := task.customDownloader
+	task.ProgressSummary.CurrentStage = "running"
+	task.ProgressSummary.StageLabel = "下载中"
 	task.mu.Unlock()
 
 	var err error
 
 	// Dispatch to appropriate download method
-	if customDownloader != nil {
-		// Use custom downloader (e.g., Bilibili DASH format)
-		err = dm.performCustomDownload(ctx, task, customDownloader)
+	if adapter, ok := dm.adapterForTask(task); ok {
+		err = dm.performPlatformDownload(execution.ctx, task, execution, adapter)
 	} else {
-		// Use default HTTP download (e.g., WeChat videos)
-		err = dm.performHTTPDownload(ctx, task)
+		err = fmt.Errorf("no platform adapter registered for task %s", task.ID)
 	}
 
 	if err != nil {
-		return err
+		task.mu.RLock()
+		completionCommitted := task.execution == execution &&
+			task.Status == StatusCompleted && task.PublishIntent == nil &&
+			hasPrimaryFinalArtifact(task.Artifacts)
+		task.mu.RUnlock()
+		if !completionCommitted {
+			return err
+		}
+		// The adapter crossed the irreversible primary-publish boundary before
+		// returning an error. Completion wins; the later error is diagnostic only
+		// and must not downgrade a durable completed task to failed.
+		logger.Warn("Adapter returned after primary publish: task=%s err=%v", task.ID, err)
 	}
 
 	// Download successful - mark task as completed unless the user cancelled or
 	// paused while the lower-level downloader was returning.
 	task.mu.Lock()
-	if task.Status == StatusCancelled || task.Status == StatusPaused {
+	if task.execution != execution || execution.stopRequested || execution.phase == executionStopping {
 		task.mu.Unlock()
 		return context.Canceled
 	}
+	if !hasPrimaryFinalArtifact(task.Artifacts) {
+		task.mu.Unlock()
+		return errors.New("platform adapter returned without publishing a primary final artifact")
+	}
+	execution.phase = executionFinished
+	execution.mutationOpen = false
 	task.Status = StatusCompleted
-	task.Progress = 100
-	task.CompletedAt = time.Now().Unix()
+	task.ProgressSummary.Percent = 100
+	task.ProgressSummary.CurrentStage = "completed"
+	task.ProgressSummary.StageLabel = "已完成"
+	if task.CompletedAt == 0 {
+		task.CompletedAt = time.Now().Unix()
+	}
+	outputPath := primaryFinalArtifactPath(task.Artifacts)
 	task.mu.Unlock()
+	dm.outputAllocator.Release(task.ID)
 
-	logger.Info("Download completed: %s (%s)", task.Title, task.FilePath)
+	logger.Info("Download completed: %s (%s)", task.Title, outputPath)
 
-	// Persist state after successful completion
-	dm.saveStateBestEffort()
-
-	// Invoke completion callback
+	// PublishFinal persisted the primary artifact and completed status in one
+	// synchronous commit. Only emit completion after that commit has succeeded.
 	if dm.onComplete != nil {
 		dm.onComplete(task)
 	}
@@ -1026,368 +972,326 @@ func (dm *DownloadManager) performDownload(task *DownloadTask) error {
 	return nil
 }
 
-// performCustomDownload executes a custom download function provided by the caller.
-// This is used for sources requiring special handling (e.g., Bilibili DASH format
-// which downloads separate video/audio streams and merges them).
-//
-// The function receives progress and completion callbacks to report status back
-// to the download manager.
-func (dm *DownloadManager) performCustomDownload(ctx context.Context, task *DownloadTask, downloader DownloadFunc) error {
-	// Track timing for speed calculation
-	lastUpdate := time.Now()
-	var lastDownloaded int64 = 0
-
-	err := downloader(ctx, task,
-		// onProgress callback: updates task progress and calculates speed
-		func(downloaded, total int64) {
-			task.mu.Lock()
-			task.Downloaded = downloaded
-			task.FileSize = total
-			if total > 0 {
-				task.Progress = float64(downloaded) / float64(total) * 100
-			}
-			task.mu.Unlock()
-
-			// Calculate and update speed every second
-			if time.Since(lastUpdate) >= time.Second {
-				task.mu.Lock()
-				task.Speed = downloaded - lastDownloaded
-				task.mu.Unlock()
-
-				lastDownloaded = downloaded
-				lastUpdate = time.Now()
-
-				if dm.onProgress != nil {
-					dm.onProgress(task)
-				}
-			}
-		},
-		// onComplete callback: updates the final output file path
-		func(outputPath string) {
-			task.mu.Lock()
-			task.FilePath = outputPath
-			task.mu.Unlock()
-		},
-	)
-
-	return err
+type managerExecutionContext struct {
+	dm          *DownloadManager
+	task        *DownloadTask
+	fetcher     fetch.Fetcher
+	execution   *taskExecution
+	mu          sync.Mutex
+	lastPersist time.Time
+	lastPercent float64
 }
 
-// performHTTPDownload performs a standard HTTP download with Range support.
-// It automatically decides whether to use multipart (chunked) download for large files
-// or sequential download for smaller files or servers without range support.
-//
-// Decision logic:
-//   - Resuming with existing multipart state: use multipart download
-//   - Resuming without multipart state: use sequential download (continue from offset)
-//   - New download with range support and large file: use multipart download
-//   - New download without range support or small file: use sequential download
-func (dm *DownloadManager) performHTTPDownload(ctx context.Context, task *DownloadTask) error {
-	// Read current task state
-	task.mu.RLock()
-	downloaded := task.Downloaded
-	taskURL := task.URL
-	filePath := task.FilePath
-	fileSize := task.FileSize
-	task.mu.RUnlock()
-
-	// Handle resume scenarios
-	if downloaded > 0 {
-		// Check if we previously started a multipart download
-		// Multipart downloads cannot be resumed with sequential mode because
-		// they fill multiple non-contiguous ranges simultaneously
-		if multipartStateExists(filePath) {
-			totalSize := fileSize
-			// Try to recover total size from state file if not in task
-			if totalSize <= 0 {
-				if st, err := loadMultipartState(filePath); err == nil && st != nil {
-					totalSize = st.TotalSize
-				}
-			}
-			if totalSize > 0 {
-				md := NewMultipartDownloader()
-				md.SetHeaders(map[string]string{
-					"Referer": "https://channels.weixin.qq.com/",
-				})
-				return dm.performMultipartHTTPDownload(ctx, task, md, totalSize)
-			}
-		}
-
-		// No multipart state - resume with sequential download from current offset
-		logger.Debug("Resuming download from %d bytes, using sequential download", downloaded)
-		return dm.performSequentialHTTPDownload(ctx, task)
+func newManagerExecutionContext(dm *DownloadManager, task *DownloadTask, execution *taskExecution) *managerExecutionContext {
+	fetcherInstance := dm.fetcher
+	if fetcherInstance == nil {
+		fetcherInstance = fetch.New(nil)
 	}
-
-	// New download - probe server to determine best download strategy
-	md := NewMultipartDownloader()
-	md.SetHeaders(map[string]string{
-		"Referer": "https://channels.weixin.qq.com/",
-	})
-
-	// Send HEAD request to check range support and get content length
-	checkResult := md.CheckRangeSupport(ctx, taskURL)
-	if checkResult.Error != nil {
-		logger.Debug("Failed to check range support: %v, falling back to sequential", checkResult.Error)
-		return dm.performSequentialHTTPDownload(ctx, task)
+	return &managerExecutionContext{
+		dm:          dm,
+		task:        task,
+		fetcher:     fetcherInstance,
+		execution:   execution,
+		lastPersist: time.Now(),
 	}
-
-	// Update file size in task from server response
-	if checkResult.ContentLength > 0 {
-		task.mu.Lock()
-		task.FileSize = checkResult.ContentLength
-		task.mu.Unlock()
-	}
-
-	// Warn about suspiciously small WeChat files (may indicate chunk/preload URLs)
-	if strings.ToLower(strings.TrimSpace(task.Source)) == "wechat" && checkResult.ContentLength > 0 && checkResult.ContentLength < 3*1024*1024 {
-		logger.Warn("[WeChat Download] Suspiciously small content length (%d bytes) for %s", checkResult.ContentLength, task.Title)
-	}
-
-	// Choose download strategy based on server capabilities and file size
-	if ShouldUseMultipart(checkResult.SupportsRange, checkResult.ContentLength) {
-		logger.Info("Using multipart download for %s (size: %d bytes, supports range: %v)",
-			task.Title, checkResult.ContentLength, checkResult.SupportsRange)
-		return dm.performMultipartHTTPDownload(ctx, task, md, checkResult.ContentLength)
-	}
-
-	// Use sequential download for small files or servers without range support
-	logger.Debug("Using sequential download (size: %d, supports range: %v)",
-		checkResult.ContentLength, checkResult.SupportsRange)
-	return dm.performSequentialHTTPDownload(ctx, task)
 }
 
-// performMultipartHTTPDownload performs a multipart (chunked) download for large files.
-// This method downloads multiple chunks of the file in parallel, improving throughput
-// for large files on servers that support HTTP Range requests.
-//
-// Progress is tracked across all chunks and aggregated for reporting.
-// The multipart state is persisted to enable resume after interruption.
-func (dm *DownloadManager) performMultipartHTTPDownload(ctx context.Context, task *DownloadTask, md *MultipartDownloader, totalSize int64) error {
-	task.mu.RLock()
-	filePath := task.FilePath
-	task.mu.RUnlock()
-
-	// Track timing for speed calculation
-	lastUpdate := time.Now()
-	var lastDownloaded int64 = 0
-
-	// Execute multipart download with progress callback
-	result := md.Download(ctx, task.URL, filePath, totalSize, func(downloaded, total int64) {
-		// Update task progress
-		task.mu.Lock()
-		task.Downloaded = downloaded
-		task.FileSize = total
-		if total > 0 {
-			task.Progress = float64(downloaded) / float64(total) * 100
-		}
-		task.mu.Unlock()
-
-		// Calculate and report speed every second
-		if time.Since(lastUpdate) >= time.Second {
-			task.mu.Lock()
-			task.Speed = downloaded - lastDownloaded
-			task.mu.Unlock()
-
-			lastDownloaded = downloaded
-			lastUpdate = time.Now()
-
-			// Invoke progress callback
-			if dm.onProgress != nil {
-				dm.onProgress(task)
-			}
-		}
-	})
-
-	if result.Error != nil {
-		return result.Error
-	}
-
-	// Post-download processing (e.g., decryption for WeChat videos)
-	return dm.handlePostDownloadDecryption(task)
+func (ctx *managerExecutionContext) Fetcher() fetch.Fetcher {
+	return ctx.fetcher
 }
 
-// performSequentialHTTPDownload performs a standard sequential HTTP download.
-// This is the simplest download method, reading the file in a single stream.
-// It supports resume via HTTP Range requests if the server supports it.
-//
-// Use this method for:
-//   - Small files where multipart overhead isn't worth it
-//   - Servers that don't support Range requests
-//   - Resuming downloads that weren't started with multipart mode
-func (dm *DownloadManager) performSequentialHTTPDownload(ctx context.Context, task *DownloadTask) error {
-	task.mu.RLock()
-	url := task.URL
-	filePath := task.FilePath
-	totalHint := task.FileSize
-	lastDownloaded := task.Downloaded
-	task.mu.RUnlock()
-
-	headers := map[string]string{
-		"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-		"Referer":    "https://channels.weixin.qq.com/",
+func (ctx *managerExecutionContext) FFmpeg() downloadtask.FFmpegLocator {
+	if ctx == nil || ctx.dm == nil {
+		return nil
 	}
+	return ctx.dm.ffmpeg
+}
 
-	lastUpdate := time.Now()
-	_, _, err := DownloadFileResumable(ctx, nil, url, filePath, ResumableDownloadOptions{
-		Headers:         headers,
-		TotalHint:       totalHint,
-		MaxRangeRetries: 3,
-	}, func(downloaded, total int64) {
-		task.mu.Lock()
-		if total > 0 {
-			task.FileSize = total
-		}
-		task.Downloaded = downloaded
-		if task.FileSize > 0 {
-			task.Progress = float64(task.Downloaded) / float64(task.FileSize) * 100
-		}
-		task.mu.Unlock()
+func (ctx *managerExecutionContext) Credentials() downloadtask.CredentialStore {
+	if ctx == nil || ctx.dm == nil {
+		return nil
+	}
+	return ctx.dm.credentials
+}
 
-		// Calculate and report speed every second, and on completion.
-		if time.Since(lastUpdate) >= time.Second || (total > 0 && downloaded >= total) {
-			task.mu.Lock()
-			task.Speed = downloaded - lastDownloaded
-			task.mu.Unlock()
-
-			lastDownloaded = downloaded
-			lastUpdate = time.Now()
-
-			if dm.onProgress != nil {
-				dm.onProgress(task)
-			}
-		}
-	})
-	if err != nil {
+func (ctx *managerExecutionContext) UpdateTaskProgress(update downloadtask.TaskProgressUpdate) error {
+	if ctx == nil || ctx.task == nil {
+		return nil
+	}
+	if err := ctx.lockMutation(); err != nil {
 		return err
 	}
-
-	// Post-download processing (decryption for WeChat if needed)
-	return dm.handlePostDownloadDecryption(task)
-}
-
-// handlePostDownloadDecryption handles optional decryption after download completes.
-// Some WeChat videos are encrypted and require decryption using a decode key.
-//
-// The function:
-//  1. Checks if a decode key is present
-//  2. Validates if the file is already a valid video (skip decryption if so)
-//  3. Decrypts the file in-place if needed
-//  4. Validates the decrypted result
-//
-// Decryption errors fail the task to avoid presenting encrypted/corrupt files
-// as successfully completed.
-func (dm *DownloadManager) handlePostDownloadDecryption(task *DownloadTask) error {
-	task.mu.RLock()
-	decodeKey := task.DecodeKey
-	taskFilePath := task.FilePath
-	task.mu.RUnlock()
-
-	if decodeKey != "" {
-		// Check if file is already a valid video container
-		// Some WeChat URLs return unencrypted content even when a key is provided
-		if wechat.ValidateVideoFormat(taskFilePath) {
-			logger.Info("Skip decryption (already valid video): %s", taskFilePath)
-		} else {
-			// File appears encrypted, attempt decryption
-			logger.Info("Decrypting video file: %s", taskFilePath)
-			decryptor := wechat.NewVideoDecryptor()
-			if err := decryptor.DecryptFile(taskFilePath, decodeKey); err != nil {
-				logger.Error("Failed to decrypt video file: %v", err)
-				// Keep the original file for potential retry with a different key.
-				return fmt.Errorf("failed to decrypt video file: %w", err)
-			} else {
-				logger.Info("Video decryption completed: %s", taskFilePath)
-				// Verify the decrypted file is valid.
-				if !wechat.ValidateVideoFormat(taskFilePath) {
-					logger.Warn("Decrypted file is not a valid video format: %s", taskFilePath)
-					return fmt.Errorf("decrypted file is not a valid video format")
-				}
-			}
-		}
+	percent := ctx.task.ProgressSummary.Percent
+	if update.StagePercent != nil {
+		percent = *update.StagePercent
 	}
+	if update.OverallPercent != nil {
+		percent = *update.OverallPercent
+	}
+	percent = clampPercent(percent)
+	ctx.task.ProgressSummary.Percent = percent
+	ctx.task.ProgressSummary.CurrentStage = strings.TrimSpace(update.StageID)
+	ctx.task.ProgressSummary.StageLabel = strings.TrimSpace(update.StageLabel)
+	if ctx.task.ProgressSummary.CurrentStage == "" {
+		ctx.task.ProgressSummary.CurrentStage = "running"
+	}
+	if ctx.task.ProgressSummary.StageLabel == "" {
+		ctx.task.ProgressSummary.StageLabel = "下载中"
+	}
+	if update.BytesLoaded > 0 || update.BytesTotal > 0 {
+		ctx.task.ProgressSummary.BytesLoaded = update.BytesLoaded
+	}
+	if update.BytesTotal > 0 {
+		ctx.task.ProgressSummary.BytesTotal = update.BytesTotal
+	}
+	if update.ItemsDone > 0 || update.ItemsTotal > 0 {
+		ctx.task.ProgressSummary.ItemsDone = update.ItemsDone
+	}
+	if update.ItemsTotal > 0 {
+		ctx.task.ProgressSummary.ItemsTotal = update.ItemsTotal
+	}
+	ctx.task.mu.Unlock()
 
+	now := time.Now()
+	ctx.mu.Lock()
+	persist := now.Sub(ctx.lastPersist) >= 2*time.Second || absFloat(percent-ctx.lastPercent) >= 1 || percent >= 100
+	if persist {
+		ctx.lastPersist = now
+		ctx.lastPercent = percent
+	}
+	ctx.mu.Unlock()
+
+	if ctx.dm != nil && ctx.dm.onProgress != nil {
+		ctx.dm.onProgress(ctx.task)
+	}
+	if persist && ctx.dm != nil {
+		ctx.dm.saveStateBestEffort()
+	}
 	return nil
 }
 
-// ensureUniqueFileName generates a unique filename in the given directory.
-// If the base filename already exists, it appends a numeric suffix (_2, _3, etc.).
-//
-// Parameters:
-//   - dir: target directory
-//   - base: base filename (without extension)
-//   - ext: file extension (including dot, e.g., ".mp4")
-//
-// Returns a unique filename (just the name, not full path).
-func ensureUniqueFileName(dir, base, ext string) string {
-	return ensureUniqueFileNameWithReserved(dir, base, ext, nil)
+func absFloat(value float64) float64 {
+	if value < 0 {
+		return -value
+	}
+	return value
 }
 
-func (dm *DownloadManager) ensureUniqueFileNameLocked(base, ext string) string {
-	reserved := make(map[string]struct{}, len(dm.tasks))
-	for _, task := range dm.tasks {
-		task.mu.RLock()
-		if task.FileName != "" {
-			reserved[task.FileName] = struct{}{}
-		}
-		if task.FilePath != "" {
-			reserved[filepath.Base(task.FilePath)] = struct{}{}
-		}
-		task.mu.RUnlock()
+func (ctx *managerExecutionContext) RecordArtifact(artifact downloadtask.TaskArtifact) error {
+	if ctx == nil || ctx.task == nil {
+		return nil
 	}
-	return ensureUniqueFileNameWithReserved(dm.downloadDir, base, ext, reserved)
+	artifact, err := prepareTemporaryArtifact(artifact)
+	if err != nil {
+		return err
+	}
+	if err := ctx.lockMutation(); err != nil {
+		return err
+	}
+	ctx.task.Artifacts = upsertArtifact(ctx.task.Artifacts, artifact)
+	ctx.task.mu.Unlock()
+	if ctx.dm != nil {
+		ctx.dm.saveStateBestEffort()
+	}
+	return nil
 }
 
-func ensureUniqueFileNameWithReserved(dir, base, ext string, reserved map[string]struct{}) string {
-	isReserved := func(name string) bool {
-		_, ok := reserved[name]
-		return ok
+// RecordPostPublishCleanupFailure persists a narrowly-scoped diagnostic after
+// primary publication has closed every normal mutation sink. It never reopens
+// progress/checkpoint/artifact mutation and never downgrades completed status.
+func (ctx *managerExecutionContext) RecordPostPublishCleanupFailure(artifact downloadtask.TaskArtifact) error {
+	if ctx == nil || ctx.dm == nil || ctx.task == nil || ctx.execution == nil {
+		return ErrStaleExecution
+	}
+	artifact, err := prepareTemporaryArtifact(artifact)
+	if err != nil {
+		return err
+	}
+	if artifact.Primary {
+		return errors.New("post-publish cleanup diagnostic cannot be a primary artifact")
+	}
+	if strings.TrimSpace(artifact.Metadata["cleanupError"]) == "" {
+		return errors.New("post-publish cleanup diagnostic requires cleanupError metadata")
 	}
 
-	base = utils.SanitizeFileName(base, 100)
-	if base == "" {
-		base = fmt.Sprintf("video_%d", time.Now().UnixNano())
+	persistenceLocked := ctx.dm.statePath != ""
+	if persistenceLocked {
+		ctx.dm.persistenceMu.Lock()
 	}
-	ext = strings.TrimSpace(ext)
-	if ext == "" {
-		ext = ".mp4"
+	ctx.task.mu.Lock()
+	validPhase := ctx.execution.phase == executionFinished || ctx.execution.phase == executionStopping
+	if ctx.task.execution != ctx.execution || !validPhase || ctx.execution.mutationOpen ||
+		ctx.task.Status != StatusCompleted || !hasPrimaryFinalArtifact(ctx.task.Artifacts) {
+		ctx.task.mu.Unlock()
+		if persistenceLocked {
+			ctx.dm.persistenceMu.Unlock()
+		}
+		return fmt.Errorf("%w: post-publish cleanup task=%s generation=%d", ErrStaleExecution, ctx.task.ID, ctx.execution.generation)
 	}
+	previousArtifacts := downloadtask.CloneSnapshot(downloadtask.TaskSnapshot{Artifacts: ctx.task.Artifacts}).Artifacts
+	ctx.task.Artifacts = upsertArtifact(ctx.task.Artifacts, artifact)
+	ctx.task.mu.Unlock()
 
-	exists := func(name string) bool {
-		if isReserved(name) {
+	if err := ctx.dm.persistIfConfiguredWithLock(persistenceLocked); err != nil {
+		ctx.task.mu.Lock()
+		if ctx.task.execution == ctx.execution {
+			ctx.task.Artifacts = previousArtifacts
+		}
+		ctx.task.mu.Unlock()
+		if persistenceLocked {
+			ctx.dm.persistenceMu.Unlock()
+		}
+		logger.Warn("Failed to persist post-publish cleanup diagnostic: task=%s path=%s err=%v", ctx.task.ID, artifact.Path, err)
+		return fmt.Errorf("persist post-publish cleanup diagnostic: %w", err)
+	}
+	if persistenceLocked {
+		ctx.dm.persistenceMu.Unlock()
+	}
+	if ctx.dm.onProgress != nil {
+		ctx.dm.onProgress(ctx.task)
+	}
+	logger.Warn("Post-publish cleanup left a temporary artifact: task=%s path=%s", ctx.task.ID, artifact.Path)
+	return nil
+}
+
+func prepareTemporaryArtifact(artifact downloadtask.TaskArtifact) (downloadtask.TaskArtifact, error) {
+	if strings.TrimSpace(artifact.Path) == "" {
+		return artifact, fmt.Errorf("artifact path is required")
+	}
+	if !filepath.IsAbs(artifact.Path) {
+		return artifact, errors.New("artifact path must be an absolute local path")
+	}
+	artifact.Path = filepath.Clean(artifact.Path)
+	if artifact.Kind == downloadtask.TaskArtifactFinal {
+		return artifact, errors.New("final artifacts must be committed through PublishFinal")
+	}
+	if artifact.Kind != downloadtask.TaskArtifactTemporary {
+		return artifact, fmt.Errorf("unsupported recordable artifact kind %q", artifact.Kind)
+	}
+	if artifact.FileName == "" {
+		artifact.FileName = filepath.Base(artifact.Path)
+	}
+	if artifact.CreatedAt == 0 {
+		artifact.CreatedAt = time.Now().Unix()
+	}
+	if artifact.Metadata != nil {
+		metadata := make(map[string]string, len(artifact.Metadata))
+		for key, value := range artifact.Metadata {
+			metadata[key] = value
+		}
+		artifact.Metadata = metadata
+	}
+	return artifact, nil
+}
+
+func (ctx *managerExecutionContext) RecordCheckpoint(checkpoint downloadtask.PlatformCheckpointEnvelope) error {
+	if ctx == nil || ctx.task == nil {
+		return nil
+	}
+	if checkpoint.Version <= 0 {
+		return fmt.Errorf("checkpoint version must be positive")
+	}
+	if len(checkpoint.Data) > 0 && !json.Valid(checkpoint.Data) {
+		return fmt.Errorf("checkpoint is not valid JSON")
+	}
+	if err := ctx.lockMutation(); err != nil {
+		return err
+	}
+	if checkpointsEqual(ctx.task.PlatformCheckpoint, &checkpoint) {
+		ctx.task.mu.Unlock()
+		return nil
+	}
+	ctx.task.PlatformCheckpoint = cloneCheckpoint(&checkpoint)
+	ctx.task.mu.Unlock()
+	if ctx.dm != nil {
+		ctx.dm.saveStateBestEffort()
+	}
+	return nil
+}
+
+var ErrStaleExecution = errors.New("stale execution")
+
+func (ctx *managerExecutionContext) lockMutation() error {
+	if ctx == nil || ctx.task == nil || ctx.execution == nil {
+		return ErrStaleExecution
+	}
+	ctx.task.mu.Lock()
+	if ctx.task.execution != ctx.execution || ctx.execution.phase != executionRunning || !ctx.execution.mutationOpen {
+		ctx.task.mu.Unlock()
+		return fmt.Errorf("%w: task=%s generation=%d", ErrStaleExecution, ctx.task.ID, ctx.execution.generation)
+	}
+	return nil
+}
+
+func checkpointsEqual(left, right *downloadtask.PlatformCheckpointEnvelope) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return left.Version == right.Version && string(left.Data) == string(right.Data)
+}
+
+func clampPercent(percent float64) float64 {
+	if percent < 0 {
+		return 0
+	}
+	if percent > 100 {
+		return 100
+	}
+	return percent
+}
+
+func hasPrimaryFinalArtifact(artifacts []downloadtask.TaskArtifact) bool {
+	for _, artifact := range artifacts {
+		if artifact.Primary && artifact.Kind == downloadtask.TaskArtifactFinal && strings.TrimSpace(artifact.Path) != "" {
 			return true
 		}
-		_, err := os.Stat(filepath.Join(dir, name))
-		return err == nil
 	}
+	return false
+}
 
-	name := utils.SanitizeFileName(base, 100) + ext
-	if !exists(name) {
-		return name
-	}
-
-	for i := 2; i <= 99; i++ {
-		candidateBase := utils.SanitizeFileName(fmt.Sprintf("%s_%d", base, i), 100)
-		if candidateBase == "" {
-			candidateBase = fmt.Sprintf("video_%d", time.Now().UnixNano())
-		}
-		candidate := candidateBase + ext
-		if !exists(candidate) {
-			return candidate
+func primaryFinalArtifactPath(artifacts []downloadtask.TaskArtifact) string {
+	for _, artifact := range artifacts {
+		if artifact.Primary && artifact.Kind == downloadtask.TaskArtifactFinal {
+			return artifact.Path
 		}
 	}
+	return ""
+}
 
-	for {
-		candidate := fmt.Sprintf("%s_%d%s", utils.SanitizeFileName(base, 100), time.Now().UnixNano(), ext)
-		if !exists(candidate) {
-			return candidate
+func upsertArtifact(artifacts []downloadtask.TaskArtifact, artifact downloadtask.TaskArtifact) []downloadtask.TaskArtifact {
+	if strings.TrimSpace(artifact.Path) == "" {
+		return artifacts
+	}
+	if artifact.FileName == "" {
+		artifact.FileName = filepath.Base(artifact.Path)
+	}
+	if artifact.CreatedAt == 0 {
+		artifact.CreatedAt = time.Now().Unix()
+	}
+	for i, existing := range artifacts {
+		if existing.Path == artifact.Path || (artifact.Primary && existing.Primary && existing.Kind == artifact.Kind) {
+			next := append([]downloadtask.TaskArtifact(nil), artifacts...)
+			next[i] = artifact
+			return next
 		}
 	}
+	return append(append([]downloadtask.TaskArtifact(nil), artifacts...), artifact)
+}
+
+func (dm *DownloadManager) performPlatformDownload(ctx context.Context, task *DownloadTask, generation *taskExecution, adapter downloadtask.PlatformAdapter) error {
+	execution := newManagerExecutionContext(dm, task, generation)
+	if err := adapter.RunTask(ctx, downloadtask.CloneSnapshot(taskSnapshot(task)), execution); err != nil {
+		return err
+	}
+	return nil
 }
 
 // handleError handles download errors by updating task status and invoking the error callback.
 // This is called when a download fails after exhausting all retry attempts.
 func (dm *DownloadManager) handleError(task *DownloadTask, err error) {
-	logger.Error("Download failed for task %s (%s): %v", task.ID, task.Title, err)
+	taskErr := taskErrorFromError(err)
+	publicErr := publicTaskError(taskErr)
+	logger.Error("Download failed: task=%s title=%q code=%s host=%s", task.ID, task.Title, publicErr.Code, publicErr.Metadata["urlHost"])
 
 	// Update task status to failed unless the user paused/cancelled while the
 	// error was being handled.
@@ -1397,8 +1301,15 @@ func (dm *DownloadManager) handleError(task *DownloadTask, err error) {
 		return
 	}
 	task.Status = StatusFailed
-	task.Error = err.Error()
+	task.ProgressSummary.CurrentStage = "failed"
+	task.ProgressSummary.StageLabel = "失败"
+	task.Error = publicErr.Message
+	task.LastError = publicErr.Message
+	task.LastErrorDetail = taskErr
 	task.mu.Unlock()
+	if !taskErr.Retryable {
+		dm.outputAllocator.Release(task.ID)
+	}
 
 	// Persist state for potential recovery
 	dm.saveStateBestEffort()
@@ -1407,6 +1318,114 @@ func (dm *DownloadManager) handleError(task *DownloadTask, err error) {
 	if dm.onError != nil {
 		dm.onError(task, err)
 	}
+}
+
+func taskErrorFromError(err error) *downloadtask.TaskError {
+	if err == nil {
+		return nil
+	}
+	var structured *downloadtask.TaskError
+	if errors.As(err, &structured) {
+		return cloneTaskError(structured)
+	}
+	var fetchErr *fetch.Error
+	if errors.As(err, &fetchErr) {
+		category := downloadtask.TaskErrorCategoryTransport
+		code := "fetch." + string(fetchErr.Kind)
+		if fetchErr.Kind == fetch.ErrorCanceled {
+			category = downloadtask.TaskErrorCategoryCanceled
+			code = "task.canceled"
+		}
+		retryable := fetchErr.Kind == fetch.ErrorNetwork || fetchErr.Kind == fetch.ErrorTimeout ||
+			(fetchErr.Kind == fetch.ErrorStatusCode && fetchErr.StatusCode >= 500 && fetchErr.StatusCode < 600)
+		metadata := map[string]string{}
+		if fetchErr.URL != "" {
+			metadata["url"] = fetchErr.URL
+		}
+		if fetchErr.StatusCode > 0 {
+			metadata["statusCode"] = fmt.Sprintf("%d", fetchErr.StatusCode)
+		}
+		if fetchErr.Attempts > 0 {
+			metadata["attempts"] = fmt.Sprintf("%d", fetchErr.Attempts)
+		}
+		message := "下载请求失败"
+		userAction := "请稍后重试"
+		if fetchErr.Kind == fetch.ErrorCanceled {
+			message = "下载已取消"
+			userAction = ""
+		} else if fetchErr.Kind == fetch.ErrorIntegrity || fetchErr.Kind == fetch.ErrorIdentityMismatch {
+			message = "下载文件校验失败"
+			userAction = "请重试下载"
+		} else if fetchErr.Kind == fetch.ErrorSizeLimit {
+			message = "下载内容超过允许的大小限制"
+			userAction = "请检查下载设置"
+		} else if fetchErr.StatusCode == 401 || fetchErr.StatusCode == 403 {
+			message = "下载凭据已失效"
+			userAction = "请重新登录或刷新凭据"
+		}
+		return &downloadtask.TaskError{
+			Code:       code,
+			Category:   category,
+			Message:    message,
+			Retryable:  retryable,
+			UserAction: userAction,
+			Cause:      err.Error(),
+			Metadata:   metadata,
+		}
+	}
+	return &downloadtask.TaskError{
+		Code:       "task.unexpected_error",
+		Category:   downloadtask.TaskErrorCategoryUnexpected,
+		Message:    "下载任务发生意外错误",
+		Retryable:  false,
+		UserAction: "请重试；如果问题持续出现，请查看日志",
+		Cause:      err.Error(),
+	}
+}
+
+func persistenceTaskError(operation string, err error) *downloadtask.TaskError {
+	cause := strings.TrimSpace(operation)
+	if err != nil {
+		cause += ": " + err.Error()
+	}
+	return &downloadtask.TaskError{
+		Code:       "task.persistence_failed",
+		Category:   downloadtask.TaskErrorCategoryUnexpected,
+		Message:    "无法保存下载任务状态",
+		Retryable:  true,
+		UserAction: "请检查应用数据目录后重试",
+		Cause:      cause,
+	}
+}
+
+func publicTaskError(private *downloadtask.TaskError) *downloadtask.TaskError {
+	if private == nil {
+		return nil
+	}
+	public := &downloadtask.TaskError{
+		Code:       private.Code,
+		Category:   private.Category,
+		Message:    private.Message,
+		Retryable:  private.Retryable,
+		UserAction: private.UserAction,
+	}
+	metadata := make(map[string]string)
+	for _, key := range []string{"statusCode", "attempts", "urlHost"} {
+		if value := strings.TrimSpace(private.Metadata[key]); value != "" {
+			metadata[key] = value
+		}
+	}
+	if _, exists := metadata["urlHost"]; !exists {
+		if rawURL := strings.TrimSpace(private.Metadata["url"]); rawURL != "" {
+			if parsed, err := url.Parse(rawURL); err == nil && parsed.Hostname() != "" {
+				metadata["urlHost"] = parsed.Hostname()
+			}
+		}
+	}
+	if len(metadata) > 0 {
+		public.Metadata = metadata
+	}
+	return public
 }
 
 // RetryTask manually retries a failed task.
@@ -1419,28 +1438,65 @@ func (dm *DownloadManager) handleError(task *DownloadTask, err error) {
 //   - The task ID is not found
 //   - The task is not in failed state
 func (dm *DownloadManager) RetryTask(id string) error {
+	return dm.retryTaskExpected(id, 0, 0)
+}
+
+func (dm *DownloadManager) RetryTaskExpected(id string, instance, generation uint64) error {
+	return dm.retryTaskExpected(id, instance, generation)
+}
+
+func (dm *DownloadManager) retryTaskExpected(id string, expectedInstance, expectedGeneration uint64) error {
+	return dm.startEligibleTaskExpected(id, expectedInstance, expectedGeneration, StatusFailed, true)
+}
+
+func (dm *DownloadManager) startEligibleTaskExpected(
+	id string,
+	expectedInstance, expectedGeneration uint64,
+	requiredStatus DownloadStatus,
+	requireRetryable bool,
+) error {
+	dm.configMu.RLock()
+	defer dm.configMu.RUnlock()
+	dm.startTransitionMu.Lock()
+	defer dm.startTransitionMu.Unlock()
+	// Identity mutation is serialized by persistenceMu even when no state path
+	// is configured. This makes expected-instance validation and StartTask one
+	// compare-and-act transaction.
+	dm.persistenceMu.Lock()
+	defer dm.persistenceMu.Unlock()
+
 	dm.tasksMu.RLock()
 	task, exists := dm.tasks[id]
-	dm.tasksMu.RUnlock()
-
 	if !exists {
+		dm.tasksMu.RUnlock()
 		return fmt.Errorf("task %s not found", id)
 	}
 
-	task.mu.Lock()
-	// Only failed tasks can be manually retried
-	if task.Status != StatusFailed {
-		task.mu.Unlock()
-		return fmt.Errorf("task %s is not in failed state", id)
+	task.mu.RLock()
+	if err := validateExpectedTaskLocked(task, expectedInstance, expectedGeneration); err != nil {
+		task.mu.RUnlock()
+		dm.tasksMu.RUnlock()
+		return err
 	}
-	// Reset all error-related fields for fresh start
-	task.RetryCount = 0
-	task.Status = StatusPending
-	task.Error = ""
-	task.LastError = ""
-	task.mu.Unlock()
+	if task.Status != requiredStatus {
+		status := task.Status
+		task.mu.RUnlock()
+		dm.tasksMu.RUnlock()
+		return fmt.Errorf("task %s has status %s, want %s", id, status, requiredStatus)
+	}
+	if requireRetryable && (task.LastErrorDetail == nil || !task.LastErrorDetail.Retryable) {
+		task.mu.RUnlock()
+		dm.tasksMu.RUnlock()
+		return fmt.Errorf("task %s failure is not retryable; follow the required user action or create a new task", id)
+	}
+	resumeFrom := task.ProgressSummary.BytesLoaded
+	task.mu.RUnlock()
+	dm.tasksMu.RUnlock()
 
-	return dm.StartTask(id)
+	if requiredStatus == StatusPaused {
+		logger.Info("Resuming task %s from %d bytes", id, resumeFrom)
+	}
+	return dm.startTaskLocked(id, true)
 }
 
 // GetPendingTasks returns all tasks that are eligible to be started or resumed.
@@ -1467,86 +1523,28 @@ func (dm *DownloadManager) GetPendingTasks() []*DownloadTask {
 // ResumeTask resumes a paused task from where it left off.
 // This validates the partial file exists and adjusts progress if needed.
 //
-// For multipart downloads, the resume state is tracked separately in a state file.
-// For custom downloaders (e.g., Bilibili), file verification is skipped as the
-// final file may not exist until merging completes.
+// For adapter-owned tasks, platform temporary artifacts are managed by the
+// adapter, so generic final-file verification is skipped.
+// For generic multipart downloads, the resume state is tracked separately in a
+// state file.
 //
 // Returns an error if:
 //   - The task ID is not found
 //   - The task is not in paused state
 //   - The partial file cannot be accessed
 func (dm *DownloadManager) ResumeTask(id string) error {
-	dm.tasksMu.RLock()
-	task, exists := dm.tasks[id]
-	dm.tasksMu.RUnlock()
+	return dm.resumeTaskExpected(id, 0, 0)
+}
 
-	if !exists {
-		return fmt.Errorf("task %s not found", id)
-	}
+func (dm *DownloadManager) ResumeTaskExpected(id string, instance, generation uint64) error {
+	return dm.resumeTaskExpected(id, instance, generation)
+}
 
-	task.mu.Lock()
-	// Only paused tasks can be resumed
-	if task.Status != StatusPaused {
-		task.mu.Unlock()
-		return fmt.Errorf("task %s is not paused", id)
-	}
-
-	// Capture state for file verification
-	downloaded := task.Downloaded
-	filePath := task.FilePath
-	customDownloader := task.customDownloader
-	task.mu.Unlock()
-
-	// Skip file verification for custom downloaders (e.g., Bilibili DASH)
-	// Their final output file doesn't exist until video/audio streams are merged
-	if downloaded > 0 && customDownloader == nil {
-		fileInfo, err := os.Stat(filePath)
-		if err != nil {
-			if os.IsNotExist(err) {
-				// Check for multipart state file - if present, keep progress
-				if multipartStateExists(filePath) {
-					// Multipart state tracks chunks, so progress is valid
-				} else {
-					// File was deleted, reset progress to start fresh
-					task.mu.Lock()
-					task.Downloaded = 0
-					task.Progress = 0
-					task.mu.Unlock()
-					logger.Info("Partial file not found for task %s, restarting from beginning", id)
-				}
-			} else {
-				return fmt.Errorf("failed to check partial file: %w", err)
-			}
-		} else if fileInfo.Size() != downloaded {
-			// File size mismatch - adjust based on download type
-			if multipartStateExists(filePath) {
-				// Multipart downloads pre-allocate, so file size != downloaded is normal
-			} else {
-				// Sequential download: use actual file size for accuracy
-				task.mu.Lock()
-				task.Downloaded = fileInfo.Size()
-				if task.FileSize > 0 {
-					task.Progress = float64(task.Downloaded) / float64(task.FileSize) * 100
-				}
-				task.mu.Unlock()
-				logger.Info("Adjusted progress for task %s to match file size: %d bytes", id, fileInfo.Size())
-			}
-		}
-	}
-
-	// Transition task to pending and start the download
-	task.mu.Lock()
-	task.Status = StatusPending
-	resumeFrom := task.Downloaded
-	task.mu.Unlock()
-
-	logger.Info("Resuming task %s from %d bytes", id, resumeFrom)
-
-	return dm.StartTask(id)
+func (dm *DownloadManager) resumeTaskExpected(id string, expectedInstance, expectedGeneration uint64) error {
+	return dm.startEligibleTaskExpected(id, expectedInstance, expectedGeneration, StatusPaused, false)
 }
 
 // GetDownloadingTaskCount returns the number of tasks currently in active download state.
-// This includes both downloading and retrying tasks.
 // Thread-safe.
 func (dm *DownloadManager) GetDownloadingTaskCount() int {
 	dm.tasksMu.RLock()
@@ -1555,8 +1553,7 @@ func (dm *DownloadManager) GetDownloadingTaskCount() int {
 	count := 0
 	for _, task := range dm.tasks {
 		task.mu.RLock()
-		// Count both downloading and retrying as active
-		if task.Status == StatusDownloading || task.Status == StatusRetrying {
+		if task.Status == StatusDownloading {
 			count++
 		}
 		task.mu.RUnlock()

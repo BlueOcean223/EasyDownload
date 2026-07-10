@@ -2,7 +2,7 @@
 import { computed } from 'vue'
 import { useAppStore } from '@/stores/app'
 import {
-  NButton, NEmpty, NTabs, NTabPane, useMessage
+  NAlert, NButton, NEmpty, NTabs, NTabPane, useMessage
 } from 'naive-ui'
 import {
   FolderOpenOutline,
@@ -47,6 +47,14 @@ async function handleCancel(task: DownloadTask) {
   }
 }
 
+async function handleRetry(task: DownloadTask) {
+  try {
+    await store.retryDownloadTask(task.id)
+  } catch (e: any) {
+    message.error(e.message || '重试失败')
+  }
+}
+
 async function handleRemove(task: DownloadTask) {
   try {
     await store.removeDownloadTask(task.id)
@@ -56,9 +64,12 @@ async function handleRemove(task: DownloadTask) {
 }
 
 async function handleOpenFile(task: DownloadTask) {
-  if (task.filePath) {
+  const artifact = task.artifacts?.find(item => item.kind === 'final' && item.primary)
+    ?? task.artifacts?.find(item => item.kind === 'final')
+  const path = artifact?.path || task.outputPolicy?.plannedFinalPath
+  if (path) {
     try {
-      await OpenFile(task.filePath)
+      await OpenFile(path)
     } catch (e: any) {
       message.error('打开文件失败')
     }
@@ -86,6 +97,17 @@ async function openDownloadFolder() {
 
     <!-- Content -->
     <div class="content flex-1 overflow-auto">
+      <NAlert
+        v-if="store.legacyDownloadNotice"
+        type="warning"
+        title="旧版下载记录未导入"
+        class="m-4 mb-0"
+      >
+        {{ store.legacyDownloadNotice.message }}
+        <div class="mt-1 text-xs break-all">
+          已保留：{{ store.legacyDownloadNotice.legacyPath }}
+        </div>
+      </NAlert>
       <NTabs type="line" :default-value="activeTab" class="downloads-tabs h-full" pane-class="h-full">
         <!-- Downloading Tab -->
         <NTabPane name="downloading" tab="下载中" class="h-full">
@@ -105,10 +127,12 @@ async function openDownloadFolder() {
                 v-for="task in store.pendingDownloads"
                 :key="task.id"
                 :task="task"
+                :stop-operation="store.downloadStopOperations[task.id]"
                 mode="downloading"
                 @pause="handlePause"
                 @resume="handleResume"
                 @cancel="handleCancel"
+                @remove="handleRemove"
               />
             </div>
           </div>
@@ -132,7 +156,9 @@ async function openDownloadFolder() {
                 v-for="task in store.problemDownloads"
                 :key="task.id"
                 :task="task"
+                :stop-operation="store.downloadStopOperations[task.id]"
                 mode="problem"
+                @retry="handleRetry"
                 @remove="handleRemove"
               />
             </div>
@@ -157,6 +183,7 @@ async function openDownloadFolder() {
                 v-for="task in store.completedDownloads"
                 :key="task.id"
                 :task="task"
+                :stop-operation="store.downloadStopOperations[task.id]"
                 mode="completed"
                 @open-file="handleOpenFile"
                 @remove="handleRemove"
